@@ -81,7 +81,10 @@ fn random_evicts_short_ttl_segment_when_full() {
         result.is_ok(),
         "inserting into a full cache of short-TTL items should succeed via eviction"
     );
-    assert!(cache.get(b"h").is_some(), "newly inserted item must be readable");
+    assert!(
+        cache.get(b"h").is_some(),
+        "newly inserted item must be readable"
+    );
 }
 
 // ── Bug: compare_fifo sorts by NEWEST first (LIFO) instead of OLDEST (FIFO) ──

@@ -28,7 +28,6 @@ use crate::sync::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 use clocksource::coarse::{AtomicInstant, Duration, Instant};
 use core::num::NonZeroU32;
 
-
 /// Segment lifecycle state.
 ///
 /// Replaces the old `accessible`/`evictable` boolean pair with a single

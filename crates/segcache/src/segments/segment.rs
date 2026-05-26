@@ -454,7 +454,14 @@ impl<'a> Segment<'a> {
             item.check_magic();
             let item_size = item.size();
 
+            // Fast path: item was explicitly deleted — no hashtable lookup needed.
+            if item.is_deleted() {
+                offset += item_size;
+                continue;
+            }
+
             let loc = pack_location(self.id(), offset as u64);
+            // Fallback for items deleted before is_deleted was introduced.
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if deleted {
                 offset += item_size;

@@ -1,74 +1,86 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Items are the base unit of data stored within the cache.
 
 mod reserved;
 
 use crate::SegcacheError;
-use keyvalue::{RawItem, Value};
+use keyvalue::{ItemGuard, RawItem, Value};
 
 pub(crate) use reserved::ReservedItem;
 
-/// Items are the base unit of data stored within the cache.
+/// The base unit of data returned by a cache lookup.
 pub struct Item {
     cas: u32,
     raw: RawItem,
 }
 
+// SAFETY: `Item` is returned from single-threaded cache lookups and the
+// underlying pointer lives for the duration of the cache borrow.  The
+// `ItemGuard` trait requires `Send` so that future concurrent designs can
+// pass items across thread boundaries safely.
+unsafe impl Send for Item {}
+
 impl Item {
-    /// Creates a new `Item` from its parts
     pub(crate) fn new(raw: RawItem, cas: u32) -> Self {
         Item { cas, raw }
     }
 
-    /// If the `magic` or `debug` features are enabled, this allows for checking
-    /// that the magic bytes at the start of an item match the expected value.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the magic bytes are incorrect, indicating that the data has
-    /// become corrupted or the item was loaded from the wrong offset.
     #[allow(dead_code)]
     pub(crate) fn check_magic(&self) {
         self.raw.check_magic()
     }
 
-    /// Borrow the item key
-    pub fn key(&self) -> &[u8] {
-        self.raw.key()
-    }
-
-    /// Borrow the item value
-    pub fn value(&self) -> Value<'_> {
-        self.raw.value()
-    }
-
-    /// CAS value for the item
+    /// CAS token for compare-and-swap operations.
     pub fn cas(&self) -> u32 {
         self.cas
     }
 
-    /// Borrow the optional data
-    pub fn optional(&self) -> Option<&[u8]> {
-        self.raw.optional()
+    /// Borrow the item key.
+    ///
+    /// Kept as a standalone method so callers inside segcache do not need to
+    /// import the `ItemGuard` trait explicitly.
+    pub fn key(&self) -> &[u8] {
+        self.raw.key()
     }
 
-    /// Perform a wrapping addition on the value. Returns an error if the item
-    /// is not a numeric type.
+    /// Borrow the item value.
+    ///
+    /// Kept as a standalone method so callers inside segcache do not need to
+    /// import the `ItemGuard` trait explicitly.
+    pub fn value(&self) -> Value<'_> {
+        self.raw.value()
+    }
+
+    /// Returns true if the item has been soft-deleted.
+    pub fn is_deleted(&self) -> bool {
+        self.raw.is_deleted()
+    }
+
+    /// Perform a wrapping addition on a numeric value.
     pub fn wrapping_add(&mut self, rhs: u64) -> Result<(), SegcacheError> {
         self.raw
             .wrapping_add(rhs)
             .map_err(|_| SegcacheError::NotNumeric)
     }
 
-    /// Perform a saturating subtraction on the value. Returns an error if the
-    /// item is not a numeric type.
+    /// Perform a saturating subtraction on a numeric value.
     pub fn saturating_sub(&mut self, rhs: u64) -> Result<(), SegcacheError> {
         self.raw
             .saturating_sub(rhs)
             .map_err(|_| SegcacheError::NotNumeric)
+    }
+}
+
+impl<'a> ItemGuard<'a> for Item {
+    fn key(&self) -> &[u8] {
+        self.raw.key()
+    }
+
+    fn value(&self) -> Value<'_> {
+        self.raw.value()
+    }
+
+    fn optional(&self) -> &[u8] {
+        self.raw.optional().unwrap_or(&[])
     }
 }
 

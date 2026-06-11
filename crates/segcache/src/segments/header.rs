@@ -12,19 +12,20 @@
 //! │   PREV SEG   │   NEXT SEG   │  CREATE AT   │  MERGE AT    │
 //! │  AtomicU32   │  AtomicU32   │ AtomicInstant│ AtomicInstant│
 //! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
-//! ├──────────────┼──┬──┬────────┴──────────────┴──────────────┤
-//! │     TTL      │ST│PL│             PADDING                  │
-//! │  AtomicU32   │8b│8b│             80 bit                   │
-//! ├──────────────┴──┴──┴──────────────────────────────────────┤
+//! ├──────────────┼──┬──┬──────┬─┴──────────────┴──────────────┤
+//! │     TTL      │ST│PL│ GEN  │            PADDING            │
+//! │  AtomicU32   │8b│8b│ 16b  │            64 bit             │
+//! ├──────────────┴──┴──┴──────┴───────────────────────────────┤
 //! │                        PADDING                            │
 //! │                       128 bit                             │
 //! └───────────────────────────────────────────────────────────┘
 //!
 //! ST = SegmentState (AtomicU8)   PL = SegmentPool (AtomicU8)
+//! GEN = generation (AtomicU16)
 //! Total: 512 bits = 64 bytes = 1 cache line
 //! ```
 
-use crate::sync::{AtomicI32, AtomicU32, AtomicU8, Ordering};
+use crate::sync::{AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use clocksource::coarse::{AtomicInstant, Duration, Instant};
 use core::num::NonZeroU32;
 
@@ -94,7 +95,8 @@ impl SegmentPool {
 /// 32       4    ttl           (AtomicU32, seconds)
 /// 36       1    state         (AtomicU8, SegmentState)
 /// 37       1    pool          (AtomicU8, SegmentPool)
-/// 38      26    _pad
+/// 38       2    generation    (AtomicU16, bumped on recycle)
+/// 40      24    _pad
 /// ```
 #[repr(C, align(64))]
 pub(crate) struct SegmentHeader {
@@ -109,7 +111,8 @@ pub(crate) struct SegmentHeader {
     ttl: AtomicU32,
     state: AtomicU8,
     pool: AtomicU8,
-    _pad: [u8; 26],
+    generation: AtomicU16,
+    _pad: [u8; 24],
 }
 
 // Loom atomics are larger than std atomics, so skip size check under loom.
@@ -133,7 +136,8 @@ impl SegmentHeader {
             ttl: AtomicU32::new(0),
             state: AtomicU8::new(SegmentState::Free as u8),
             pool: AtomicU8::new(SegmentPool::Main as u8),
-            _pad: [0; 26],
+            generation: AtomicU16::new(0),
+            _pad: [0; 24],
         }
     }
 
@@ -155,6 +159,10 @@ impl SegmentHeader {
 
     /// Reset the header when returning to the free queue.
     /// When the `magic` feature is enabled, preserves the magic byte offset.
+    ///
+    /// Bumps the generation counter so that CAS tokens issued against the
+    /// previous use of this segment can never match items written after it
+    /// is recycled.
     pub fn reset(&self) {
         let initial_offset = if cfg!(feature = "integrity") {
             std::mem::size_of::<u64>() as i32
@@ -164,6 +172,14 @@ impl SegmentHeader {
         self.write_offset.store(initial_offset, Ordering::Relaxed);
         self.live_bytes.store(initial_offset, Ordering::Relaxed);
         self.live_items.store(0, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the generation counter. Incremented each time the segment is
+    /// returned to the free queue; wraps at `u16::MAX`.
+    #[inline]
+    pub fn generation(&self) -> u16 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     // -- Identity --

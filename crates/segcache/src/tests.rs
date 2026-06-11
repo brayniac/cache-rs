@@ -24,6 +24,18 @@ fn sizes() {
 }
 
 #[test]
+fn segment_header_generation_bumps_on_reset() {
+    let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+    assert_eq!(header.generation(), 0);
+
+    header.reset();
+    assert_eq!(header.generation(), 1);
+
+    header.reset();
+    assert_eq!(header.generation(), 2);
+}
+
+#[test]
 fn init() {
     let mut cache = Segcache::builder()
         .segment_size(4096)

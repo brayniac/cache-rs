@@ -15,7 +15,6 @@ pub(crate) use guard::SegmentGuard;
 pub(crate) use header::{SegmentHeader, SegmentPool};
 pub(crate) use segment::Segment;
 pub(crate) use segments::Segments;
-#[cfg(test)]
 pub(crate) use state::State;
 
 #[cfg(test)]
@@ -30,16 +29,16 @@ mod test {
             .expect("failed to create segments");
         let mut used = Vec::new();
         for _i in 0..16 {
-            let id = segments.pop_free().unwrap();
+            let id = segments.reserve_free().unwrap();
             used.push(id);
             segments.print_headers();
         }
         for id in &used {
-            segments.push_free(*id);
+            segments.release_unused(*id);
             segments.print_headers();
         }
         for _i in 0..16 {
-            let id = segments.pop_free().unwrap();
+            let id = segments.reserve_free().unwrap();
             used.push(id);
             segments.print_headers();
         }

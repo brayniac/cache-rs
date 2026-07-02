@@ -107,8 +107,8 @@ impl TtlBucket {
                 if self.tail == Some(seg_id) {
                     self.tail = prev;
                 }
-                // push_free unlinks the segment, splicing its neighbors
-                segments.push_free(seg_id);
+                // recycle unlinks the segment, splicing its neighbors
+                segments.recycle(seg_id);
 
                 #[cfg(feature = "metrics")]
                 SEGMENT_EXPIRE.increment();
@@ -151,7 +151,7 @@ impl TtlBucket {
                 if self.tail == Some(seg_id) {
                     self.tail = prev;
                 }
-                segments.push_free(seg_id);
+                segments.recycle(seg_id);
 
                 #[cfg(feature = "metrics")]
                 SEGMENT_CLEAR.increment();
@@ -170,7 +170,9 @@ impl TtlBucket {
 
     /// Allocate a new segment and link it as the tail of this bucket.
     fn try_expand(&mut self, segments: &mut Segments) -> Result<(), TtlBucketsError> {
-        let id = segments.pop_free().ok_or(TtlBucketsError::NoFreeSegments)?;
+        let id = segments
+            .reserve_free()
+            .ok_or(TtlBucketsError::NoFreeSegments)?;
 
         // Link the new segment after the current tail.
         if let Some(tail_id) = self.tail {

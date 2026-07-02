@@ -24,14 +24,17 @@ fn sizes() {
 }
 
 #[test]
-fn segment_header_generation_bumps_on_reset() {
+fn segment_header_generation_bumps_on_reserve() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
     assert_eq!(header.generation(), 0);
 
-    header.reset();
+    // every Free -> Reserved reservation bumps the generation, so CAS
+    // tokens from a previous use of the segment can never match again
+    assert!(header.try_reserve());
     assert_eq!(header.generation(), 1);
 
-    header.reset();
+    assert!(header.try_release());
+    assert!(header.try_reserve());
     assert_eq!(header.generation(), 2);
 }
 
@@ -208,7 +211,7 @@ fn get_free_seg() {
         .expect("failed to create cache");
     assert_eq!(cache.items(), 0);
     assert_eq!(cache.segments.free(), 64);
-    let seg = cache.segments.pop_free();
+    let seg = cache.segments.reserve_free();
     assert_eq!(cache.segments.free(), 63);
     assert_eq!(seg, NonZeroU32::new(1));
 }
@@ -273,7 +276,10 @@ fn cas() {
 fn cas_stale_token_rejected_after_segment_recycle() {
     let ttl = Duration::ZERO;
     let segment_size = 4096;
-    let segments = 64;
+    // A single-segment heap forces recycling to reuse the same segment
+    // (the free queue is FIFO, so with more segments the next insert
+    // would land elsewhere and not reproduce the ABA scenario).
+    let segments = 1;
     let heap_size = segments * segment_size as usize;
 
     let mut cache = Segcache::builder()
@@ -285,10 +291,10 @@ fn cas_stale_token_rejected_after_segment_recycle() {
     assert!(cache.insert(b"coffee", b"hot", None, ttl).is_ok());
     let stale = cache.get(b"coffee").unwrap().cas();
 
-    // clear() frees the one used segment via push_free, which prepends it
-    // to the free queue (LIFO) and bumps its generation. The next insert
-    // pops the same segment and writes the same key at the same offset,
-    // reproducing the identical 44-bit location.
+    // clear() drains and frees the only segment, and the reservation on
+    // the next insert bumps its generation. The same key is then written
+    // at the same offset in the same segment, reproducing the identical
+    // 44-bit location.
     cache.clear();
     assert_eq!(cache.segments.free(), segments);
     assert!(cache.get(b"coffee").is_none());

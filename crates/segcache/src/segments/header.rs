@@ -132,24 +132,6 @@ impl SegmentHeader {
             .store(Metadata::new_free().pack(), Ordering::Relaxed);
     }
 
-    /// Reset the header when returning to the free queue.
-    /// When the `magic` feature is enabled, preserves the magic byte offset.
-    ///
-    /// Bumps the generation counter so that CAS tokens issued against the
-    /// previous use of this segment can never match items written after it
-    /// is recycled.
-    pub fn reset(&self) {
-        let initial_offset = if cfg!(feature = "integrity") {
-            std::mem::size_of::<u64>() as i32
-        } else {
-            0
-        };
-        self.write_offset.store(initial_offset, Ordering::Relaxed);
-        self.live_bytes.store(initial_offset, Ordering::Relaxed);
-        self.live_items.store(0, Ordering::Relaxed);
-        self.generation.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Get the generation counter. Incremented each time the segment is
     /// reserved from the free queue; wraps at `u16::MAX`.
     #[inline]
@@ -175,8 +157,6 @@ impl SegmentHeader {
     /// transitions that participate in a reader-handoff Dekker pair
     /// (Sealed/Live -> Draining, Draining -> AwaitingRelease,
     /// AwaitingRelease -> Free), `AcqRel` otherwise.
-    // TODO(state-machine port): wired up in the free-queue/drain commits
-    #[allow(dead_code)]
     pub fn cas_metadata(
         &self,
         expected_state: State,
@@ -238,8 +218,6 @@ impl SegmentHeader {
     /// times, and bumps the generation counter so that CAS tokens issued
     /// against the previous use of this segment can never match items
     /// written after it is recycled.
-    // TODO(state-machine port): wired up in the free-queue/drain commits
-    #[allow(dead_code)]
     pub fn try_reserve(&self) -> bool {
         if !self.cas_metadata(
             State::Free,
@@ -273,8 +251,7 @@ impl SegmentHeader {
 
     /// Return an unused segment to Free (Reserved|Linking -> Free).
     /// Used by allocation error paths before a segment becomes visible.
-    // TODO(state-machine port): wired up in the free-queue/drain commits
-    #[allow(dead_code)]
+    #[allow(dead_code)] // production callers arrive with the append-protocol error paths
     pub fn try_release(&self) -> bool {
         self.cas_metadata(
             State::Reserved,
@@ -567,7 +544,7 @@ impl SegmentHeader {
     pub fn set_accessible(&self, accessible: bool) {
         let state = self.state();
         if accessible {
-            if state == State::Free || state == State::Draining {
+            if matches!(state, State::Free | State::Reserved | State::Draining) {
                 self.set_state(State::Live);
             }
         } else if state != State::Free {
@@ -586,7 +563,7 @@ impl SegmentHeader {
     pub fn set_evictable(&self, evictable: bool) {
         if evictable {
             let state = self.state();
-            if state == State::Free || state == State::Draining {
+            if matches!(state, State::Free | State::Reserved | State::Draining) {
                 self.set_state(State::Live);
             }
             if self.state() == State::Live {

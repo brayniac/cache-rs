@@ -5,6 +5,7 @@
 use crate::eviction::*;
 use crate::segments::segment::SEG_MAGIC;
 use crate::segments::*;
+use crate::sync::Ordering;
 use crate::*;
 use core::hash::{BuildHasher, Hasher};
 use core::num::NonZeroU32;
@@ -25,12 +26,12 @@ pub(crate) struct Segments {
     data: memmap2::MmapMut,
     /// Segment size in bytes.
     segment_size: i32,
-    /// Number of free segments.
-    free: u32,
     /// Total number of segments.
     cap: u32,
-    /// Head of the free segment queue.
-    free_q: Option<NonZeroU32>,
+    /// Lock-free free segment queue. Boxed for a stable address: guards
+    /// hold a raw pointer to it so the AwaitingRelease handoff can return
+    /// segments without `&mut Segments`.
+    free_queue: Box<crossbeam_deque::Injector<u32>>,
     /// Eviction configuration and state.
     evict: Box<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
@@ -75,7 +76,10 @@ impl Segments {
         let heap_size = segments * segment_size as usize;
         let mut data = MmapOptions::new().populate().len(heap_size).map_anon()?;
 
-        // Initialize each segment and link the free queue.
+        // Initialize each segment and fill the free queue. Segments rest
+        // in the Free state with no chain links; the free queue itself is
+        // a lock-free Injector rather than an intrusive list.
+        let free_queue = Box::new(crossbeam_deque::Injector::new());
         for idx in 0..segments {
             let begin = segment_size as usize * idx;
             let end = begin + segment_size as usize;
@@ -83,11 +87,7 @@ impl Segments {
             let mut segment = Segment::from_raw_parts(&headers[idx], &mut data[begin..end]);
             segment.init();
 
-            let id = idx as u32 + 1; // segments are 1-indexed
-            headers[idx].set_prev_seg(NonZeroU32::new(id - 1));
-            if id < segments as u32 {
-                headers[idx].set_next_seg(NonZeroU32::new(id + 1));
-            }
+            free_queue.push(idx as u32 + 1); // segments are 1-indexed
         }
 
         #[cfg(feature = "metrics")]
@@ -106,8 +106,7 @@ impl Segments {
             headers,
             segment_size,
             cap: segments as u32,
-            free: segments as u32,
-            free_q: NonZeroU32::new(1),
+            free_queue,
             data,
             evict: Box::new(Eviction::new(segments, evict_policy)),
             admission_cap,
@@ -158,7 +157,7 @@ impl Segments {
     /// Returns the number of free segments.
     #[cfg(test)]
     pub fn free(&self) -> usize {
-        self.free as usize
+        self.free_queue.len()
     }
 
     /// Returns the generation counter for a segment. Bumped each time the
@@ -328,14 +327,10 @@ impl Segments {
 
     // ── Free queue ───────────────────────────────────────────────────
 
-    /// Return a segment to the free queue after it has been cleared.
-    pub(crate) fn push_free(&mut self, id: NonZeroU32) {
-        #[cfg(feature = "metrics")]
-        {
-            SEGMENT_RETURN.increment();
-            SEGMENT_FREE.increment();
-        }
-
+    /// Return a drained segment to the free queue. The segment must be in
+    /// the Draining state with no readers pinning it; its write statistics
+    /// are reset (and its generation bumped) at reserve time.
+    pub(crate) fn recycle(&mut self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
         debug_assert_eq!(
             self.headers[id_idx].ref_count(),
@@ -343,72 +338,69 @@ impl Segments {
             "freed a segment pinned by readers"
         );
 
-        // Unlink from current chain.
+        // Unlink from its chain first: this reads the segment's own
+        // prev/next to patch the neighbors, so it must happen before the
+        // transition below clears the links.
         self.unlink(id);
 
-        // Relink as the free queue head.
-        self.push_front(id, self.free_q);
-        self.free_q = Some(id);
-
-        assert!(!self.headers[id_idx].evictable());
-        self.headers[id_idx].set_accessible(false);
-
-        // Decrement pool counter before resetting to default.
+        // Pool membership ends when the segment leaves service.
         if self.headers[id_idx].pool() == SegmentPool::Admission {
             self.admission_count = self.admission_count.saturating_sub(1);
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 
-        self.headers[id_idx].reset();
+        let freed = self.headers[id_idx].cas_metadata(
+            State::Draining,
+            State::Free,
+            Some(None),
+            Some(None),
+            Ordering::AcqRel,
+        );
+        debug_assert!(freed, "recycled a segment that was not Draining");
 
-        self.free += 1;
+        self.free_queue.push(id.get());
+
+        #[cfg(feature = "metrics")]
+        {
+            SEGMENT_RETURN.increment();
+            SEGMENT_FREE.increment();
+        }
     }
 
-    /// Try to take a segment from the free queue. Returns the segment id which
-    /// must then be linked into a segment chain.
-    pub(crate) fn pop_free(&mut self) -> Option<NonZeroU32> {
-        assert!(self.free <= self.cap);
-
-        if self.free == 0 {
-            None
-        } else {
-            #[cfg(feature = "metrics")]
-            {
-                SEGMENT_REQUEST.increment();
-                SEGMENT_REQUEST_SUCCESS.increment();
-                SEGMENT_FREE.decrement();
+    /// Reserve a segment from the free queue. Returns the id of a
+    /// segment in the Reserved state (statistics reset, generation
+    /// bumped), which must then be linked into a segment chain.
+    pub(crate) fn reserve_free(&mut self) -> Option<NonZeroU32> {
+        loop {
+            match self.free_queue.steal() {
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return None,
+                crossbeam_deque::Steal::Success(raw) => {
+                    debug_assert!(raw >= 1 && raw <= self.cap);
+                    let id = NonZeroU32::new(raw)?;
+                    if self.headers[raw as usize - 1].try_reserve() {
+                        #[cfg(feature = "metrics")]
+                        {
+                            SEGMENT_REQUEST.increment();
+                            SEGMENT_REQUEST_SUCCESS.increment();
+                            SEGMENT_FREE.decrement();
+                        }
+                        return Some(id);
+                    }
+                    // Not actually Free (unreachable today with writers
+                    // serialized by &mut self) — put it back.
+                    self.free_queue.push(raw);
+                    return None;
+                }
             }
-
-            self.free -= 1;
-            let id = self.free_q;
-            assert!(id.is_some());
-
-            let id_idx = id.unwrap().get() as usize - 1;
-
-            if let Some(next) = self.headers[id_idx].next_seg() {
-                self.free_q = Some(next);
-                self.headers[next.get() as usize - 1].set_prev_seg(None);
-            } else {
-                self.free_q = None;
-            }
-
-            #[cfg(not(feature = "integrity"))]
-            assert_eq!(self.headers[id_idx].write_offset(), 0);
-
-            #[cfg(feature = "integrity")]
-            assert_eq!(
-                self.headers[id_idx].write_offset() as usize,
-                std::mem::size_of_val(&SEG_MAGIC),
-                "segment: ({}) in free queue has write_offset: ({})",
-                id.unwrap(),
-                self.headers[id_idx].write_offset()
-            );
-
-            self.headers[id_idx].mark_created();
-            self.headers[id_idx].mark_merged();
-
-            id
         }
+    }
+
+    /// Return a Reserved segment that was never linked into a chain.
+    #[cfg(test)]
+    pub(crate) fn release_unused(&mut self, id: NonZeroU32) {
+        assert!(self.headers[id.get() as usize - 1].try_release());
+        self.free_queue.push(id.get());
     }
 
     // ── Eviction ─────────────────────────────────────────────────────
@@ -438,7 +430,7 @@ impl Segments {
     }
 
     /// Perform eviction based on the configured eviction policy. A success
-    /// indicates that a segment was put onto the free queue and `pop_free()`
+    /// indicates that a segment was put onto the free queue and `reserve_free()`
     /// should return some segment id.
     pub fn evict(
         &mut self,
@@ -534,7 +526,7 @@ impl Segments {
                         let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
                         ttl_bucket.set_head(self.headers[id_idx].next_seg());
                     }
-                    self.push_free(id);
+                    self.recycle(id);
 
                     #[cfg(feature = "metrics")]
                     EVICT_TIME.add(now.elapsed().as_nanos() as _);
@@ -637,7 +629,7 @@ impl Segments {
                     let ttl_bucket = ttl_buckets.get_mut_bucket(segment.ttl());
                     ttl_bucket.set_head(segment.next_seg());
                 }
-                self.push_free(seg_id);
+                self.recycle(seg_id);
                 return Ok(());
             }
         }
@@ -847,7 +839,7 @@ impl Segments {
 
             next_id = src.next_seg();
             src.clear(hashtable, false);
-            self.push_free(src_id);
+            self.recycle(src_id);
             merged += 1;
         }
 
@@ -947,7 +939,7 @@ impl Segments {
 
             next_id = src.next_seg();
             src.clear(hashtable, false);
-            self.push_free(src_id);
+            self.recycle(src_id);
             merged += 1;
         }
 
@@ -1015,7 +1007,7 @@ impl Segments {
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // First pass: copy items with freq > 0 into a main-pool segment.
-        let target_id = self.pop_free();
+        let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
             self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
@@ -1047,7 +1039,7 @@ impl Segments {
             let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
             ttl_bucket.set_head(self.headers[id_idx].next_seg());
         }
-        self.push_free(seg_id);
+        self.recycle(seg_id);
 
         Ok(())
     }
@@ -1178,7 +1170,7 @@ impl Segments {
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Try to get a target segment for second-chance items.
-        let target_id = self.pop_free();
+        let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
             self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
@@ -1206,7 +1198,7 @@ impl Segments {
             let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
             ttl_bucket.set_head(self.headers[id_idx].next_seg());
         }
-        self.push_free(seg_id);
+        self.recycle(seg_id);
 
         Ok(())
     }

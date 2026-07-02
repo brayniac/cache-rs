@@ -247,6 +247,74 @@ fn seal_on_append() {
     assert!(!tail.can_evict(), "the write tail must never be evictable");
 }
 
+// cas() publishes by swapping the hashtable slot from the token-checked
+// location — so if the eviction triggered by cas's OWN reservation
+// relocates or evicts the checked item, the CAS fails with Exists
+// (fail-safe) instead of silently succeeding through a plain insert.
+#[test]
+fn cas_fails_when_own_reservation_evicts_checked_item() {
+    let segment_size = 4096;
+    let segments = 2;
+    let heap_size = segments * segment_size as usize;
+    let ttl = Duration::ZERO;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .eviction(Policy::Fifo)
+        .build()
+        .expect("failed to create cache");
+
+    // target lands in segment 1 — the oldest, Fifo's first victim
+    assert!(cache.insert(b"target", b"original", None, ttl).is_ok());
+    let token = cache.get(b"target").unwrap().cas();
+
+    // fill the heap so the next reservation must evict: keep inserting
+    // fillers until the Live tail can't fit another large item
+    let filler = [0xEEu8; 128];
+    // stop filling once the tail can no longer fit the cas item below
+    // (header 12 + key 6 + value 600, rounded up -> 624 bytes)
+    let needed = 624;
+    let mut i = 0u32;
+    loop {
+        let tail_free = {
+            let used = segments - cache.segments.free();
+            let tail = cache
+                .segments
+                .get_mut(NonZeroU32::new(used as u32).unwrap())
+                .unwrap();
+            segment_size as usize - tail.write_offset() as usize
+        };
+        if cache.segments.free() == 0 && tail_free < needed {
+            break;
+        }
+        let key = format!("filler_{i}");
+        cache
+            .insert(key.as_bytes(), &filler[..], None, ttl)
+            .expect("setup insert must succeed");
+        i += 1;
+    }
+
+    // the token is still valid right now
+    assert_eq!(cache.get(b"target").unwrap().cas(), token);
+
+    // cas must reserve, reservation must evict, Fifo evicts segment 1
+    // (the sealed oldest — where target lives) — the checked location no
+    // longer maps to the key, so the CAS fails closed
+    let big = [0xFFu8; 600];
+    assert_eq!(
+        cache.cas(b"target", &big[..], None, ttl, token),
+        Err(SegcacheError::Exists)
+    );
+
+    // the target was evicted, not replaced
+    assert!(cache.get(b"target").is_none());
+
+    // and the cache remains fully usable
+    assert!(cache.insert(b"after", b"ok", None, ttl).is_ok());
+    assert_eq!(cache.get(b"after").unwrap().value(), b"ok");
+}
+
 #[test]
 fn can_evict_respects_ref_count() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());

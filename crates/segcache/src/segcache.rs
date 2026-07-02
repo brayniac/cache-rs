@@ -280,7 +280,6 @@ impl Segcache {
     /// removed from its segment; if the entry no longer maps to
     /// `old_location`, the reservation is rolled back and `Exists` is
     /// returned.
-    #[allow(dead_code)] // wired up by the cas() linearization commit
     fn replace_at(
         &mut self,
         key: &[u8],
@@ -394,7 +393,21 @@ impl Segcache {
             return Err(SegcacheError::Exists);
         }
 
-        self.insert(key, value, optional, ttl)
+        let value: Value = value.into();
+        let optional = optional.unwrap_or(&[]);
+        let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
+
+        // Publish by swapping the hashtable slot only if it still holds
+        // the token-checked location — the linearization point. A plain
+        // insert would replace whatever entry is current, silently losing
+        // a write that landed between the token check and the publish.
+        //
+        // Behavior note: eviction triggered by this reservation can
+        // relocate or evict the checked item, in which case the CAS now
+        // fails with `Exists` (fail-safe) where it previously succeeded
+        // through the plain insert.
+        let reserved = self.reserve_and_define(key, value, optional, ttl)?;
+        self.replace_at(key, location, reserved)
     }
 
     /// Remove the item with the given key, returns a bool indicating if it was

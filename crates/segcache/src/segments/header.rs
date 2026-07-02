@@ -212,19 +212,24 @@ impl SegmentHeader {
             return false;
         }
 
-        // `Acquire` on the increment (not `Relaxed`) is load-bearing: it
-        // prevents the state re-check below from being reordered before
-        // the increment. With a relaxed RMW, the re-check load could be
-        // satisfied before the pin is visible, letting a concurrent
-        // writer observe ref_count == 0 after we validated the state —
-        // both sides would proceed. (The writer half of the handoff —
-        // transitioning state before checking the count — arrives with
-        // the state-machine port; see the invariant note above.)
-        self.ref_count.fetch_add(1, Ordering::Acquire);
+        // `SeqCst` on the increment and the re-check is load-bearing.
+        // This pair races the future concurrent writer's mirror image
+        // (store state, then load ref_count) — a store-buffering /
+        // Dekker pattern. Acquire/release does NOT forbid the outcome
+        // where the writer reads ref_count == 0 while our re-check
+        // still sees a readable state (both sides proceed); only the
+        // SeqCst total order does, and the writer side must use SeqCst
+        // too when the state-machine port introduces it. This matches
+        // crossbeam-epoch's SeqCst `pin()`, which exists for the same
+        // hazard. Note loom cannot verify this distinction: it reports
+        // the store-buffering outcome even for pure-SeqCst litmus
+        // tests, so the in-tree loom models cover the protocol shape,
+        // not this ordering requirement.
+        self.ref_count.fetch_add(1, Ordering::SeqCst);
 
         // Re-check after the increment: a writer that observed
         // ref_count == 0 may have transitioned the state concurrently.
-        if !readable(self.state.load(Ordering::Acquire)) {
+        if !readable(self.state.load(Ordering::SeqCst)) {
             self.ref_count.fetch_sub(1, Ordering::Release);
             return false;
         }

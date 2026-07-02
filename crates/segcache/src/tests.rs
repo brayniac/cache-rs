@@ -315,6 +315,167 @@ fn cas_fails_when_own_reservation_evicts_checked_item() {
     assert_eq!(cache.get(b"after").unwrap().value(), b"ok");
 }
 
+// Every increment writes a new item and bumps the key's CAS token —
+// matching memcached, where incr/decr assign a fresh cas unique. A
+// gets -> (incr) -> cas sequence must fail, not silently discard the
+// increment.
+#[test]
+fn incr_bumps_cas_token() {
+    let ttl = Duration::ZERO;
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"counter", 5, None, ttl).is_ok());
+    let stale = cache.get(b"counter").unwrap().cas();
+
+    let updated = cache.wrapping_add(b"counter", 1).unwrap();
+    assert_ne!(updated.cas(), stale, "increment must bump the CAS token");
+    drop(updated);
+
+    // the pre-increment token must not match anymore
+    assert_eq!(
+        cache.cas(b"counter", 100, None, ttl, stale),
+        Err(SegcacheError::Exists)
+    );
+    assert_eq!(cache.get(b"counter").unwrap().value(), 6);
+
+    // a fresh token works
+    let fresh = cache.get(b"counter").unwrap().cas();
+    assert_eq!(cache.cas(b"counter", 100, None, ttl, fresh), Ok(()));
+    assert_eq!(cache.get(b"counter").unwrap().value(), 100);
+}
+
+// Numeric updates land in the same TTL bucket as the existing item, and
+// optional data survives the rewrite.
+#[test]
+fn numeric_update_preserves_bucket_and_optional() {
+    let ttl = Duration::from_secs(300);
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"counter", 7, Some(b"flags"), ttl).is_ok());
+
+    let old_bucket_ttl = {
+        let verifier = cache.segments.verifier();
+        let (loc, _) = cache
+            .hashtable
+            .lookup_no_freq_update(b"counter", &verifier)
+            .unwrap();
+        let (seg, _) = unpack_location(loc);
+        cache
+            .segments
+            .get_mut(NonZeroU32::new(seg).unwrap())
+            .unwrap()
+            .ttl()
+    };
+
+    let updated = cache.wrapping_add(b"counter", 1).unwrap();
+    assert_eq!(updated.value(), 8);
+    assert_eq!(updated.optional(), Some(&b"flags"[..]));
+    drop(updated);
+
+    let new_bucket_ttl = {
+        let verifier = cache.segments.verifier();
+        let (loc, _) = cache
+            .hashtable
+            .lookup_no_freq_update(b"counter", &verifier)
+            .unwrap();
+        let (seg, _) = unpack_location(loc);
+        cache
+            .segments
+            .get_mut(NonZeroU32::new(seg).unwrap())
+            .unwrap()
+            .ttl()
+    };
+    assert_eq!(
+        new_bucket_ttl, old_bucket_ttl,
+        "numeric update must stay in the same TTL bucket"
+    );
+}
+
+#[test]
+fn try_into_numeric_arms() {
+    let ttl = Duration::ZERO;
+    let other_ttl = Duration::from_secs(60);
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    // arm 1: missing key -> created with initial and the caller's ttl
+    assert_eq!(cache.try_into_numeric(b"fresh", 42, ttl), Ok(()));
+    assert_eq!(cache.get(b"fresh").unwrap().value(), 42);
+    // and it is incrementable
+    assert_eq!(cache.wrapping_add(b"fresh", 1).unwrap().value(), 43);
+
+    // arm 2: existing numeric -> no-op (value and token untouched)
+    let before = cache.get(b"fresh").unwrap().cas();
+    assert_eq!(cache.try_into_numeric(b"fresh", 999, ttl), Ok(()));
+    assert_eq!(cache.get(b"fresh").unwrap().value(), 43);
+    assert_eq!(cache.get(b"fresh").unwrap().cas(), before);
+
+    // arm 3: simple-ASCII bytes -> converted with the SAME value, in the
+    // existing item's TTL bucket (caller ttl deliberately ignored),
+    // optional preserved
+    assert!(cache.insert(b"ascii", b"123", Some(b"opt"), ttl).is_ok());
+    let old_bucket_ttl = {
+        let verifier = cache.segments.verifier();
+        let (loc, _) = cache
+            .hashtable
+            .lookup_no_freq_update(b"ascii", &verifier)
+            .unwrap();
+        let (seg, _) = unpack_location(loc);
+        cache
+            .segments
+            .get_mut(NonZeroU32::new(seg).unwrap())
+            .unwrap()
+            .ttl()
+    };
+    assert_eq!(cache.try_into_numeric(b"ascii", 0, other_ttl), Ok(()));
+    let item = cache.get(b"ascii").unwrap();
+    assert_eq!(item.value(), 123);
+    assert_eq!(item.optional(), Some(&b"opt"[..]));
+    drop(item);
+    let new_bucket_ttl = {
+        let verifier = cache.segments.verifier();
+        let (loc, _) = cache
+            .hashtable
+            .lookup_no_freq_update(b"ascii", &verifier)
+            .unwrap();
+        let (seg, _) = unpack_location(loc);
+        cache
+            .segments
+            .get_mut(NonZeroU32::new(seg).unwrap())
+            .unwrap()
+            .ttl()
+    };
+    assert_eq!(new_bucket_ttl, old_bucket_ttl);
+    // converted key is incrementable
+    assert_eq!(cache.wrapping_add(b"ascii", 2).unwrap().value(), 125);
+
+    // arm 4: non-numeric bytes -> NotNumeric, item untouched
+    assert!(cache.insert(b"text", b"not a number", None, ttl).is_ok());
+    assert_eq!(
+        cache.try_into_numeric(b"text", 0, ttl),
+        Err(SegcacheError::NotNumeric)
+    );
+    assert_eq!(cache.get(b"text").unwrap().value(), b"not a number");
+
+    // non-canonical numerics are rejected too (leading zero)
+    assert!(cache.insert(b"zeroes", b"007", None, ttl).is_ok());
+    assert_eq!(
+        cache.try_into_numeric(b"zeroes", 0, ttl),
+        Err(SegcacheError::NotNumeric)
+    );
+}
+
 #[test]
 fn can_evict_respects_ref_count() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
@@ -824,22 +985,39 @@ fn wrapping_add() {
 
     let item = cache.get(b"coffee").unwrap();
     assert_eq!(item.value(), 0, "item is: {item:?}");
-    cache
+
+    // each op writes a new item and returns a fresh pin at the new
+    // location; the returned Item carries the updated value
+    let updated = cache
         .wrapping_add(b"coffee", 1)
         .expect("failed to increment");
-    assert_eq!(item.value(), 1, "item is: {item:?}");
-    cache
+    assert_eq!(updated.value(), 1, "item is: {updated:?}");
+
+    // a previously held Item keeps reading the OLD value at its pinned
+    // location — updates are new items, not in-place mutation
+    assert_eq!(item.value(), 0, "item is: {item:?}");
+    drop(item);
+    drop(updated);
+
+    let updated = cache
         .wrapping_add(b"coffee", u64::MAX - 1)
         .expect("failed to increment");
-    assert_eq!(item.value(), u64::MAX, "item is: {item:?}");
-    cache
+    assert_eq!(updated.value(), u64::MAX, "item is: {updated:?}");
+    drop(updated);
+
+    let updated = cache
         .wrapping_add(b"coffee", 1)
         .expect("failed to increment");
-    assert_eq!(item.value(), 0, "item is: {item:?}");
-    cache
+    assert_eq!(updated.value(), 0, "item is: {updated:?}");
+    drop(updated);
+
+    let updated = cache
         .wrapping_add(b"coffee", 2)
         .expect("failed to increment");
-    assert_eq!(item.value(), 2, "item is: {item:?}");
+    assert_eq!(updated.value(), 2, "item is: {updated:?}");
+
+    // the store agrees with the returned item
+    assert_eq!(cache.get(b"coffee").unwrap().value(), 2);
 }
 
 #[test]
@@ -863,18 +1041,26 @@ fn saturating_sub() {
 
     let item = cache.get(b"coffee").unwrap();
     assert_eq!(item.value(), 3, "item is: {item:?}");
-    cache
+    drop(item);
+
+    let updated = cache
         .saturating_sub(b"coffee", 2)
-        .expect("failed to increment");
-    assert_eq!(item.value(), 1, "item is: {item:?}");
-    cache
+        .expect("failed to decrement");
+    assert_eq!(updated.value(), 1, "item is: {updated:?}");
+    drop(updated);
+
+    let updated = cache
         .saturating_sub(b"coffee", 1)
-        .expect("failed to increment");
-    assert_eq!(item.value(), 0, "item is: {item:?}");
-    cache
+        .expect("failed to decrement");
+    assert_eq!(updated.value(), 0, "item is: {updated:?}");
+    drop(updated);
+
+    // saturates at zero
+    let updated = cache
         .saturating_sub(b"coffee", 1)
-        .expect("failed to increment");
-    assert_eq!(item.value(), 0, "item is: {item:?}");
+        .expect("failed to decrement");
+    assert_eq!(updated.value(), 0, "item is: {updated:?}");
+    assert_eq!(cache.get(b"coffee").unwrap().value(), 0);
 }
 
 #[test]

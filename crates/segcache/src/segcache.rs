@@ -514,42 +514,159 @@ impl Segcache {
     /// Perform a wrapping addition on the value stored at the supplied key.
     /// Returns an error if the key is invalid, the item is not found, or the
     /// stored value is not a numeric type.
+    ///
+    /// The updated value is written as a NEW item (in the same TTL bucket
+    /// as the existing one) and published by swapping the hashtable slot,
+    /// so every increment bumps the key's CAS token — matching memcached,
+    /// where incr/decr assign a fresh cas unique. The returned [`Item`]
+    /// is a fresh pin at the new location; previously held `Item`s keep
+    /// reading the old value at their pinned location.
     pub fn wrapping_add(&mut self, key: &[u8], rhs: u64) -> Result<Item, SegcacheError> {
-        let verifier = self.verifier();
-        let (location, _freq) = self
-            .hashtable
-            .lookup(key, &verifier)
-            .ok_or(SegcacheError::NotFound)?;
-        let (seg_id, offset) = unpack_location(location);
-        let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
-        let (raw, guard) = self
-            .segments
-            .acquire_item_at(seg_id, offset)
-            .ok_or(SegcacheError::NotFound)?;
-        let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        let mut item = Item::new(raw, cas, guard);
-        item.wrapping_add(rhs)?;
-        Ok(item)
+        self.numeric_update(key, |v| v.wrapping_add(rhs))
     }
 
     /// Perform a saturating subtraction on the value stored at the supplied
     /// key. Returns an error if the key is invalid, the item is not found, or
     /// the stored value is not a numeric type.
+    ///
+    /// See [`Self::wrapping_add`] for the update and CAS-token semantics.
     pub fn saturating_sub(&mut self, key: &[u8], rhs: u64) -> Result<Item, SegcacheError> {
+        self.numeric_update(key, |v| v.saturating_sub(rhs))
+    }
+
+    /// Shared read-compute-republish loop for the numeric operations.
+    ///
+    /// Reads the current value under a reader pin, snapshots the optional
+    /// data, computes the new value, writes it as a new item in the same
+    /// TTL bucket, and publishes via [`Self::replace_at`] (the slot swap
+    /// expecting the read location). A lost race — including the edge
+    /// where this operation's own reservation evicts the source key in a
+    /// tiny cache — retries from the lookup, surfacing `NotFound` if the
+    /// key is gone.
+    fn numeric_update(
+        &mut self,
+        key: &[u8],
+        op: impl Fn(u64) -> u64,
+    ) -> Result<Item, SegcacheError> {
+        loop {
+            let verifier = self.verifier();
+            let (location, _freq) = self
+                .hashtable
+                .lookup(key, &verifier)
+                .ok_or(SegcacheError::NotFound)?;
+            let (seg_id, offset) = unpack_location(location);
+            let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
+
+            // Read the current value and snapshot the optional data under
+            // a reader pin, then release the pin: reservation may need to
+            // evict, and a pinned segment is unevictable.
+            let (current, opt_buf, olen, seg_ttl) = {
+                let (raw, _guard) = self
+                    .segments
+                    .acquire_item_at(seg_id, offset)
+                    .ok_or(SegcacheError::NotFound)?;
+                let current = match raw.value() {
+                    Value::U64(v) => v,
+                    Value::Bytes(_) => return Err(SegcacheError::NotNumeric),
+                };
+                let mut opt_buf = [0u8; 63];
+                let olen = raw.optional().map_or(0, |o| {
+                    opt_buf[..o.len()].copy_from_slice(o);
+                    o.len()
+                });
+                let seg_ttl = self
+                    .segments
+                    .get_mut(seg_id)
+                    .map_err(|_| SegcacheError::NotFound)?
+                    .ttl();
+                (current, opt_buf, olen, seg_ttl)
+            };
+
+            let new_value = op(current);
+
+            // Write the new value into the same TTL bucket as the source
+            // item, then publish by swapping the slot from the read
+            // location.
+            let reserved =
+                self.reserve_and_define(key, Value::U64(new_value), &opt_buf[..olen], seg_ttl)?;
+            let new_seg = reserved.seg();
+            let new_offset = reserved.offset();
+
+            match self.replace_at(key, location, reserved) {
+                Ok(()) => {
+                    let new_location = pack_location(new_seg, new_offset as u64);
+                    let (raw, guard) = self
+                        .segments
+                        .acquire_item_at(new_seg, new_offset)
+                        .ok_or(SegcacheError::NotFound)?;
+                    let cas =
+                        CasToken::new(new_location, self.segments.generation(new_seg)).as_raw();
+                    return Ok(Item::new(raw, cas, guard));
+                }
+                // The key moved between the read and the publish (under
+                // &mut only via this operation's own eviction) — retry.
+                Err(SegcacheError::Exists) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Ensure the value stored at `key` is numeric.
+    ///
+    /// - key missing: creates a numeric item with `initial`, using `ttl`
+    /// - existing numeric value: no-op success (`ttl` unused)
+    /// - existing bytes value that is a canonical ASCII `u64` (see
+    ///   [`keyvalue::numeric::parse_simple_numeric`]): converts it to a
+    ///   numeric item with the SAME value, in the SAME TTL bucket as the
+    ///   existing item — the caller's `ttl` is deliberately unused
+    /// - any other value: `Err(NotNumeric)`, item untouched
+    ///
+    /// Composes with [`Self::wrapping_add`]/[`Self::saturating_sub`] to
+    /// implement memcached-style incr-with-initial at a protocol layer.
+    pub fn try_into_numeric(
+        &mut self,
+        key: &[u8],
+        initial: u64,
+        ttl: std::time::Duration,
+    ) -> Result<(), SegcacheError> {
         let verifier = self.verifier();
-        let (location, _freq) = self
-            .hashtable
-            .lookup(key, &verifier)
-            .ok_or(SegcacheError::NotFound)?;
+        let Some((location, _freq)) = self.hashtable.lookup_no_freq_update(key, &verifier) else {
+            // Missing: create with the caller's ttl. NOTE for the
+            // concurrent future: this publishes via plain insert, which
+            // would overwrite a concurrently created value; revisit with
+            // insert-if-absent when the API goes concurrent.
+            return self.insert(key, initial, None, ttl);
+        };
+
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
-        let (raw, guard) = self
-            .segments
-            .acquire_item_at(seg_id, offset)
-            .ok_or(SegcacheError::NotFound)?;
-        let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        let mut item = Item::new(raw, cas, guard);
-        item.saturating_sub(rhs)?;
-        Ok(item)
+
+        let (parsed, opt_buf, olen, seg_ttl) = {
+            let (raw, _guard) = self
+                .segments
+                .acquire_item_at(seg_id, offset)
+                .ok_or(SegcacheError::NotFound)?;
+            let parsed = match raw.value() {
+                Value::U64(_) => return Ok(()),
+                Value::Bytes(b) => {
+                    keyvalue::numeric::parse_simple_numeric(b).ok_or(SegcacheError::NotNumeric)?
+                }
+            };
+            let mut opt_buf = [0u8; 63];
+            let olen = raw.optional().map_or(0, |o| {
+                opt_buf[..o.len()].copy_from_slice(o);
+                o.len()
+            });
+            let seg_ttl = self
+                .segments
+                .get_mut(seg_id)
+                .map_err(|_| SegcacheError::NotFound)?
+                .ttl();
+            (parsed, opt_buf, olen, seg_ttl)
+        };
+
+        let reserved =
+            self.reserve_and_define(key, Value::U64(parsed), &opt_buf[..olen], seg_ttl)?;
+        self.replace_at(key, location, reserved)
     }
 }

@@ -4,7 +4,6 @@
 //! a packed buffer of `[ItemHeader][optional][key][value]`.
 
 use crate::item::*;
-use crate::NotNumericError;
 use crate::Value;
 
 /// The raw byte-level representation of an item.
@@ -227,48 +226,6 @@ impl RawItem {
         let raw =
             ITEM_HDR_SIZE + self.olen() as usize + self.klen() as usize + self.vlen() as usize;
         ((raw >> 3) + 1) << 3
-    }
-
-    /// Perform a wrapping addition on a numeric value.
-    pub fn wrapping_add(&mut self, rhs: u64) -> Result<(), NotNumericError> {
-        match self.value() {
-            Value::U64(v) => unsafe {
-                let new = v.wrapping_add(rhs);
-                std::ptr::copy_nonoverlapping(
-                    new.to_be_bytes().as_ptr(),
-                    self.data.add(self.value_offset()),
-                    core::mem::size_of::<u64>(),
-                );
-                #[cfg(feature = "integrity")]
-                {
-                    let crc = self.compute_crc();
-                    (*self.header_mut()).set_crc32(crc);
-                }
-                Ok(())
-            },
-            _ => Err(NotNumericError),
-        }
-    }
-
-    /// Perform a saturating subtraction on a numeric value.
-    pub fn saturating_sub(&mut self, rhs: u64) -> Result<(), NotNumericError> {
-        match self.value() {
-            Value::U64(v) => unsafe {
-                let new = v.saturating_sub(rhs);
-                std::ptr::copy_nonoverlapping(
-                    new.to_be_bytes().as_ptr(),
-                    self.data.add(self.value_offset()),
-                    core::mem::size_of::<u64>(),
-                );
-                #[cfg(feature = "integrity")]
-                {
-                    let crc = self.compute_crc();
-                    (*self.header_mut()).set_crc32(crc);
-                }
-                Ok(())
-            },
-            _ => Err(NotNumericError),
-        }
     }
 }
 

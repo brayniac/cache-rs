@@ -535,6 +535,12 @@ impl SegmentHeader {
     /// readers pinning it. The write tail is Live, so it is
     /// automatically excluded (the seal happens when a successor is
     /// appended).
+    ///
+    /// ADVISORY ONLY — this reads ref_count with plain Acquire and is
+    /// not part of the Dekker pair. Use it to select candidates, never
+    /// to justify touching segment memory: the authoritative check is
+    /// the SeqCst drain CAS + ref_count recheck inside clear_segment /
+    /// condemn / the merge revert, which fail closed if this was stale.
     #[inline]
     pub fn can_evict(&self) -> bool {
         self.state().is_evictable() && self.ref_count() == 0

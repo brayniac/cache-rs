@@ -15,6 +15,11 @@ use memmap2::MmapOptions;
 /// subslice of bytes from a contiguous anonymous mmap allocation.
 pub(crate) struct Segments {
     /// Segment metadata headers (one per segment, cache-line aligned).
+    ///
+    /// STABILITY: allocated once in `from_builder` and never reassigned
+    /// or resized. `SegmentGuard` (and `RawItem` for the data mmap
+    /// below) hold raw pointers into this allocation, valid because a
+    /// boxed slice's heap storage is stable even if `Segments` moves.
     headers: Box<[SegmentHeader]>,
     /// Anonymous mmap-backed heap for segment data.
     data: memmap2::MmapMut,
@@ -180,6 +185,31 @@ impl Segments {
         }))
     }
 
+    /// Like [`Self::get_item_at`], but pins the segment with a reader
+    /// guard first. While the guard is alive the segment cannot be
+    /// recycled, merged, or compacted. Returns `None` if the segment is
+    /// not in a readable state.
+    pub(crate) fn acquire_item_at(
+        &self,
+        seg_id: NonZeroU32,
+        offset: usize,
+    ) -> Option<(RawItem, SegmentGuard)> {
+        assert!(seg_id.get() <= self.cap);
+        let header = &self.headers[seg_id.get() as usize - 1];
+
+        if !header.try_acquire_reader() {
+            return None;
+        }
+        // SAFETY: the acquire above succeeded, and `headers` (a boxed
+        // slice owned by `self`) outlives any guard reachable through
+        // the public API.
+        let guard = unsafe { SegmentGuard::new(header) };
+
+        let byte_offset = self.segment_size() as usize * (seg_id.get() as usize - 1) + offset;
+        let raw = RawItem::from_ptr(unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) });
+        Some((raw, guard))
+    }
+
     // ── Segment views ────────────────────────────────────────────────
 
     /// Returns a `Segment` view for the segment with the specified id. The
@@ -307,6 +337,11 @@ impl Segments {
         }
 
         let id_idx = id.get() as usize - 1;
+        debug_assert_eq!(
+            self.headers[id_idx].ref_count(),
+            0,
+            "freed a segment pinned by readers"
+        );
 
         // Unlink from current chain.
         self.unlink(id);
@@ -387,6 +422,11 @@ impl Segments {
     ) -> Result<(), ()> {
         let mut segment = self.get_mut(id).unwrap();
         if segment.next_seg().is_none() && !expire {
+            Err(())
+        } else if segment.ref_count() != 0 {
+            // Pinned by readers — cannot be cleared this pass.
+            #[cfg(feature = "metrics")]
+            SEGMENT_PINNED_SKIP.increment();
             Err(())
         } else {
             assert!(segment.evictable(), "segment was not evictable");

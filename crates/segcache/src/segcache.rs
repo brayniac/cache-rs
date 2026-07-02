@@ -82,11 +82,11 @@ impl Segcache {
         let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id)?;
-        let raw = self.segments.get_item_at(Some(seg_id), offset)?;
+        let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
         raw.check_magic();
 
         let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        Some(Item::new(raw, cas))
+        Some(Item::new(raw, cas, guard))
     }
 
     /// Get the item in the `Segcache` with the provided key without
@@ -103,11 +103,11 @@ impl Segcache {
         let (location, _freq) = self.hashtable.lookup_no_freq_update(key, &verifier)?;
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id)?;
-        let raw = self.segments.get_item_at(Some(seg_id), offset)?;
+        let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
         raw.check_magic();
 
         let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        Some(Item::new(raw, cas))
+        Some(Item::new(raw, cas, guard))
     }
 
     /// Insert a new item into the cache. May return an error indicating that
@@ -390,11 +390,19 @@ impl Segcache {
     /// // And the expired item is not in the cache
     /// assert!(cache.get(b"coffee").is_none());
     /// ```
+    /// Returns the number of segments actually freed. Segments pinned by
+    /// outstanding [`Item`]s are drained from the hashtable but not freed
+    /// (and not counted) until a later pass runs after the pins drop.
     pub fn expire(&mut self) -> usize {
         self.time = Instant::now();
         self.ttl_buckets.expire(&self.hashtable, &mut self.segments)
     }
 
+    /// Clear the cache, draining every segment from the hashtable.
+    ///
+    /// Returns the number of segments actually freed. Segments pinned by
+    /// outstanding [`Item`]s are drained but not freed (and not counted)
+    /// until a later pass runs after the pins drop.
     pub fn clear(&mut self) -> usize {
         self.time = Instant::now();
         self.ttl_buckets.clear(&self.hashtable, &mut self.segments)
@@ -422,12 +430,12 @@ impl Segcache {
             .ok_or(SegcacheError::NotFound)?;
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
-        let raw = self
+        let (raw, guard) = self
             .segments
-            .get_item_at(Some(seg_id), offset)
+            .acquire_item_at(seg_id, offset)
             .ok_or(SegcacheError::NotFound)?;
         let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        let mut item = Item::new(raw, cas);
+        let mut item = Item::new(raw, cas, guard);
         item.wrapping_add(rhs)?;
         Ok(item)
     }
@@ -443,12 +451,12 @@ impl Segcache {
             .ok_or(SegcacheError::NotFound)?;
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
-        let raw = self
+        let (raw, guard) = self
             .segments
-            .get_item_at(Some(seg_id), offset)
+            .acquire_item_at(seg_id, offset)
             .ok_or(SegcacheError::NotFound)?;
         let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        let mut item = Item::new(raw, cas);
+        let mut item = Item::new(raw, cas, guard);
         item.saturating_sub(rhs)?;
         Ok(item)
     }

@@ -342,6 +342,36 @@ impl Segcache {
         }
     }
 
+    /// Remaining TTL for an item's segment — the time until its expiry
+    /// deadline. Numeric rewrites reserve with this so the item's
+    /// absolute expiration is preserved, matching memcached: incr/decr
+    /// keep the original exptime (do_add_delta passes `it->exptime` even
+    /// when it must reallocate). An already-elapsed deadline returns
+    /// `NotFound`, matching memcached's treatment of expired keys.
+    ///
+    /// Note there is no true "no expiry" in segcache: `Duration::ZERO`
+    /// maps to the last TTL bucket (representative TTL ~97 days), and a
+    /// large remaining TTL clamps back to that same bucket, so
+    /// effectively-non-expiring counters stay effectively non-expiring.
+    /// The zero check below is defensive (linked segments always carry a
+    /// bucket TTL >= 1s).
+    fn remaining_ttl(&mut self, seg_id: NonZeroU32) -> Result<Duration, SegcacheError> {
+        let segment = self
+            .segments
+            .get_mut(seg_id)
+            .map_err(|_| SegcacheError::NotFound)?;
+        let ttl = segment.ttl();
+        if ttl.as_secs() == 0 {
+            return Ok(Duration::from_secs(0));
+        }
+        let now = Instant::now();
+        let expires_at = segment.create_at() + ttl;
+        if expires_at <= now {
+            return Err(SegcacheError::NotFound);
+        }
+        Ok(expires_at - now)
+    }
+
     /// Performs a CAS operation, inserting the item only if the CAS value
     /// matches the current value for that item.
     ///
@@ -515,10 +545,14 @@ impl Segcache {
     /// Returns an error if the key is invalid, the item is not found, or the
     /// stored value is not a numeric type.
     ///
-    /// The updated value is written as a NEW item (in the same TTL bucket
-    /// as the existing one) and published by swapping the hashtable slot,
-    /// so every increment bumps the key's CAS token — matching memcached,
-    /// where incr/decr assign a fresh cas unique. The returned [`Item`]
+    /// The updated value is written as a NEW item and published by
+    /// swapping the hashtable slot, so every increment bumps the key's
+    /// CAS token — matching memcached, where incr/decr assign a fresh
+    /// cas unique (`do_add_delta`). The item's absolute expiration is
+    /// preserved: the rewrite reserves with the REMAINING TTL, matching
+    /// memcached's exptime preservation, so incrementing a counter never
+    /// extends its deadline (rate-limiter windows still reset). An
+    /// already-expired counter returns `NotFound`. The returned [`Item`]
     /// is a fresh pin at the new location; previously held `Item`s keep
     /// reading the old value at their pinned location.
     pub fn wrapping_add(&mut self, key: &[u8], rhs: u64) -> Result<Item, SegcacheError> {
@@ -537,8 +571,8 @@ impl Segcache {
     /// Shared read-compute-republish loop for the numeric operations.
     ///
     /// Reads the current value under a reader pin, snapshots the optional
-    /// data, computes the new value, writes it as a new item in the same
-    /// TTL bucket, and publishes via [`Self::replace_at`] (the slot swap
+    /// data, computes the new value, writes it as a new item with the
+    /// remaining TTL, and publishes via [`Self::replace_at`] (the slot swap
     /// expecting the read location). A lost race — including the edge
     /// where this operation's own reservation evicts the source key in a
     /// tiny cache — retries from the lookup, surfacing `NotFound` if the
@@ -574,11 +608,7 @@ impl Segcache {
                     opt_buf[..o.len()].copy_from_slice(o);
                     o.len()
                 });
-                let seg_ttl = self
-                    .segments
-                    .get_mut(seg_id)
-                    .map_err(|_| SegcacheError::NotFound)?
-                    .ttl();
+                let seg_ttl = self.remaining_ttl(seg_id)?;
                 (current, opt_buf, olen, seg_ttl)
             };
 
@@ -617,8 +647,9 @@ impl Segcache {
     /// - existing numeric value: no-op success (`ttl` unused)
     /// - existing bytes value that is a canonical ASCII `u64` (see
     ///   [`keyvalue::numeric::parse_simple_numeric`]): converts it to a
-    ///   numeric item with the SAME value, in the SAME TTL bucket as the
-    ///   existing item — the caller's `ttl` is deliberately unused
+    ///   numeric item with the SAME value and the REMAINING TTL of the
+    ///   existing item (its absolute expiration is preserved) — the
+    ///   caller's `ttl` is deliberately unused
     /// - any other value: `Err(NotNumeric)`, item untouched
     ///
     /// Composes with [`Self::wrapping_add`]/[`Self::saturating_sub`] to
@@ -657,11 +688,7 @@ impl Segcache {
                 opt_buf[..o.len()].copy_from_slice(o);
                 o.len()
             });
-            let seg_ttl = self
-                .segments
-                .get_mut(seg_id)
-                .map_err(|_| SegcacheError::NotFound)?
-                .ttl();
+            let seg_ttl = self.remaining_ttl(seg_id)?;
             (parsed, opt_buf, olen, seg_ttl)
         };
 

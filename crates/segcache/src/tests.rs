@@ -348,10 +348,13 @@ fn incr_bumps_cas_token() {
     assert_eq!(cache.get(b"counter").unwrap().value(), 100);
 }
 
-// Numeric updates land in the same TTL bucket as the existing item, and
-// optional data survives the rewrite.
+// Numeric updates preserve the item's ABSOLUTE expiration (memcached's
+// incr/decr keep the original exptime): the rewrite reserves with the
+// remaining TTL, so incrementing never extends the deadline — a
+// rate-limiter window still resets on schedule. Optional data survives
+// the rewrite too.
 #[test]
-fn numeric_update_preserves_bucket_and_optional() {
+fn numeric_update_preserves_expiry_and_optional() {
     let ttl = Duration::from_secs(300);
     let mut cache = Segcache::builder()
         .segment_size(4096)
@@ -361,30 +364,65 @@ fn numeric_update_preserves_bucket_and_optional() {
 
     assert!(cache.insert(b"counter", 7, Some(b"flags"), ttl).is_ok());
 
-    let old_bucket_ttl = {
+    let expiry_of = |cache: &mut Segcache, key: &[u8]| {
         let verifier = cache.segments.verifier();
         let (loc, _) = cache
             .hashtable
-            .lookup_no_freq_update(b"counter", &verifier)
+            .lookup_no_freq_update(key, &verifier)
             .unwrap();
         let (seg, _) = unpack_location(loc);
-        cache
+        let segment = cache
             .segments
             .get_mut(NonZeroU32::new(seg).unwrap())
-            .unwrap()
-            .ttl()
+            .unwrap();
+        segment.create_at() + segment.ttl()
     };
+
+    let old_expiry = expiry_of(&mut cache, b"counter");
+
+    // let the coarse clock advance so "remaining" is observably less
+    // than the full TTL
+    std::thread::sleep(std::time::Duration::from_secs(3));
 
     let updated = cache.wrapping_add(b"counter", 1).unwrap();
     assert_eq!(updated.value(), 8);
     assert_eq!(updated.optional(), Some(&b"flags"[..]));
     drop(updated);
 
-    let new_bucket_ttl = {
+    let new_expiry = expiry_of(&mut cache, b"counter");
+
+    // the deadline must never move later...
+    assert!(
+        new_expiry <= old_expiry,
+        "increment must not extend the expiration deadline"
+    );
+    // ...and only earlier by the TTL-bucket floor granularity (8s in
+    // tier 1) plus coarse-clock slop
+    let drift = old_expiry - new_expiry;
+    assert!(
+        drift.as_secs() <= 11,
+        "expiry drifted too far: {}s",
+        drift.as_secs()
+    );
+}
+
+// A counter inserted with Duration::ZERO lands in the last TTL bucket
+// (representative TTL ~97 days — segcache's "effectively no expiry").
+// Increments must keep it there: the remaining TTL stays in tier 4 and
+// clamps back to the same last bucket.
+#[test]
+fn numeric_update_keeps_max_ttl_bucket() {
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    let seg_ttl_of = |cache: &mut Segcache, key: &[u8]| {
         let verifier = cache.segments.verifier();
         let (loc, _) = cache
             .hashtable
-            .lookup_no_freq_update(b"counter", &verifier)
+            .lookup_no_freq_update(key, &verifier)
             .unwrap();
         let (seg, _) = unpack_location(loc);
         cache
@@ -393,10 +431,41 @@ fn numeric_update_preserves_bucket_and_optional() {
             .unwrap()
             .ttl()
     };
+
+    assert!(cache.insert(b"counter", 1, None, Duration::ZERO).is_ok());
+    let before = seg_ttl_of(&mut cache, b"counter");
+
+    assert_eq!(cache.wrapping_add(b"counter", 1).unwrap().value(), 2);
+
+    let after = seg_ttl_of(&mut cache, b"counter");
     assert_eq!(
-        new_bucket_ttl, old_bucket_ttl,
-        "numeric update must stay in the same TTL bucket"
+        after, before,
+        "a max-bucket counter must stay in the last TTL bucket"
     );
+}
+
+// Incrementing a counter whose deadline has already passed returns
+// NotFound, matching memcached's treatment of expired keys — even if
+// the segment has not been reclaimed by expire() yet.
+#[test]
+fn numeric_update_expired_counter_not_found() {
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    // 2s requests the first tier-1 bucket, whose floor TTL is 1s
+    assert!(cache
+        .insert(b"counter", 5, None, Duration::from_secs(2))
+        .is_ok());
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    assert!(matches!(
+        cache.wrapping_add(b"counter", 1),
+        Err(SegcacheError::NotFound)
+    ));
 }
 
 #[test]

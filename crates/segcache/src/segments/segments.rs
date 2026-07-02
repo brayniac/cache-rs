@@ -5,6 +5,7 @@
 use crate::eviction::*;
 use crate::segments::segment::SEG_MAGIC;
 use crate::segments::*;
+use crate::sync::Ordering;
 use crate::*;
 use core::hash::{BuildHasher, Hasher};
 use core::num::NonZeroU32;
@@ -25,18 +26,27 @@ pub(crate) struct Segments {
     data: memmap2::MmapMut,
     /// Segment size in bytes.
     segment_size: i32,
-    /// Number of free segments.
-    free: u32,
     /// Total number of segments.
     cap: u32,
-    /// Head of the free segment queue.
-    free_q: Option<NonZeroU32>,
+    /// Lock-free free segment queue. Boxed for a stable address: guards
+    /// hold a raw pointer to it so the AwaitingRelease handoff can return
+    /// segments without `&mut Segments`.
+    free_queue: Box<crossbeam_deque::Injector<u32>>,
     /// Eviction configuration and state.
     evict: Box<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
     admission_cap: u32,
     /// Current number of segments in the admission pool.
     admission_count: u32,
+}
+
+/// Result of draining a segment: `Freed` means it was returned to the
+/// free queue; `Deferred` means it was condemned to AwaitingRelease and
+/// the last reader's guard drop will free it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClearOutcome {
+    Freed,
+    Deferred,
 }
 
 impl Segments {
@@ -75,7 +85,10 @@ impl Segments {
         let heap_size = segments * segment_size as usize;
         let mut data = MmapOptions::new().populate().len(heap_size).map_anon()?;
 
-        // Initialize each segment and link the free queue.
+        // Initialize each segment and fill the free queue. Segments rest
+        // in the Free state with no chain links; the free queue itself is
+        // a lock-free Injector rather than an intrusive list.
+        let free_queue = Box::new(crossbeam_deque::Injector::new());
         for idx in 0..segments {
             let begin = segment_size as usize * idx;
             let end = begin + segment_size as usize;
@@ -83,11 +96,7 @@ impl Segments {
             let mut segment = Segment::from_raw_parts(&headers[idx], &mut data[begin..end]);
             segment.init();
 
-            let id = idx as u32 + 1; // segments are 1-indexed
-            headers[idx].set_prev_seg(NonZeroU32::new(id - 1));
-            if id < segments as u32 {
-                headers[idx].set_next_seg(NonZeroU32::new(id + 1));
-            }
+            free_queue.push(idx as u32 + 1); // segments are 1-indexed
         }
 
         #[cfg(feature = "metrics")]
@@ -106,8 +115,7 @@ impl Segments {
             headers,
             segment_size,
             cap: segments as u32,
-            free: segments as u32,
-            free_q: NonZeroU32::new(1),
+            free_queue,
             data,
             evict: Box::new(Eviction::new(segments, evict_policy)),
             admission_cap,
@@ -158,7 +166,7 @@ impl Segments {
     /// Returns the number of free segments.
     #[cfg(test)]
     pub fn free(&self) -> usize {
-        self.free as usize
+        self.free_queue.len()
     }
 
     /// Returns the generation counter for a segment. Bumped each time the
@@ -200,10 +208,10 @@ impl Segments {
         if !header.try_acquire_reader() {
             return None;
         }
-        // SAFETY: the acquire above succeeded, and `headers` (a boxed
-        // slice owned by `self`) outlives any guard reachable through
-        // the public API.
-        let guard = unsafe { SegmentGuard::new(header) };
+        // SAFETY: the acquire above succeeded, and both `headers` (a
+        // boxed slice owned by `self`) and the boxed Injector outlive
+        // any guard reachable through the public API.
+        let guard = unsafe { SegmentGuard::new(header, &*self.free_queue) };
 
         let byte_offset = self.segment_size() as usize * (seg_id.get() as usize - 1) + offset;
         let raw = RawItem::from_ptr(unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) });
@@ -313,29 +321,43 @@ impl Segments {
         }
     }
 
-    /// Push a segment onto the front of a chain.
-    fn push_front(&mut self, this: NonZeroU32, head: Option<NonZeroU32>) {
+    /// Link a Reserved segment at the front of a chain and publish it as
+    /// Sealed (readable + evictable, never the write tail): Reserved ->
+    /// Linking carries the next pointer, the old head's prev is patched,
+    /// then Linking -> Sealed publishes.
+    fn link_at_head(&mut self, this: NonZeroU32, head: Option<NonZeroU32>) {
         let this_idx = this.get() as usize - 1;
-        self.headers[this_idx].set_next_seg(head);
-        self.headers[this_idx].set_prev_seg(None);
+        let linking = self.headers[this_idx].cas_metadata(
+            State::Reserved,
+            State::Linking,
+            Some(head),
+            Some(None),
+            Ordering::AcqRel,
+        );
+        debug_assert!(linking, "head insert requires a Reserved segment");
 
         if let Some(head_id) = head {
             let head_idx = head_id.get() as usize - 1;
             debug_assert!(self.headers[head_idx].prev_seg().is_none());
-            self.headers[head_idx].set_prev_seg(Some(this));
+            self.headers[head_idx].update_links(None, Some(Some(this)));
         }
+
+        let sealed = self.headers[this_idx].cas_metadata(
+            State::Linking,
+            State::Sealed,
+            None,
+            None,
+            Ordering::AcqRel,
+        );
+        debug_assert!(sealed, "linking segment must publish as Sealed");
     }
 
     // ── Free queue ───────────────────────────────────────────────────
 
-    /// Return a segment to the free queue after it has been cleared.
-    pub(crate) fn push_free(&mut self, id: NonZeroU32) {
-        #[cfg(feature = "metrics")]
-        {
-            SEGMENT_RETURN.increment();
-            SEGMENT_FREE.increment();
-        }
-
+    /// Return a drained segment to the free queue. The segment must be in
+    /// the Draining state with no readers pinning it; its write statistics
+    /// are reset (and its generation bumped) at reserve time.
+    pub(crate) fn recycle(&mut self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
         debug_assert_eq!(
             self.headers[id_idx].ref_count(),
@@ -343,102 +365,190 @@ impl Segments {
             "freed a segment pinned by readers"
         );
 
-        // Unlink from current chain.
+        // Unlink from its chain first: this reads the segment's own
+        // prev/next to patch the neighbors, so it must happen before the
+        // transition below clears the links.
         self.unlink(id);
 
-        // Relink as the free queue head.
-        self.push_front(id, self.free_q);
-        self.free_q = Some(id);
-
-        assert!(!self.headers[id_idx].evictable());
-        self.headers[id_idx].set_accessible(false);
-
-        // Decrement pool counter before resetting to default.
+        // Pool membership ends when the segment leaves service.
         if self.headers[id_idx].pool() == SegmentPool::Admission {
             self.admission_count = self.admission_count.saturating_sub(1);
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 
-        self.headers[id_idx].reset();
+        let freed = self.headers[id_idx].cas_metadata(
+            State::Draining,
+            State::Free,
+            Some(None),
+            Some(None),
+            Ordering::AcqRel,
+        );
+        debug_assert!(freed, "recycled a segment that was not Draining");
 
-        self.free += 1;
+        self.free_queue.push(id.get());
+
+        #[cfg(feature = "metrics")]
+        {
+            SEGMENT_RETURN.increment();
+            SEGMENT_FREE.increment();
+        }
     }
 
-    /// Try to take a segment from the free queue. Returns the segment id which
-    /// must then be linked into a segment chain.
-    pub(crate) fn pop_free(&mut self) -> Option<NonZeroU32> {
-        assert!(self.free <= self.cap);
-
-        if self.free == 0 {
-            None
-        } else {
-            #[cfg(feature = "metrics")]
-            {
-                SEGMENT_REQUEST.increment();
-                SEGMENT_REQUEST_SUCCESS.increment();
-                SEGMENT_FREE.decrement();
+    /// Reserve a segment from the free queue. Returns the id of a
+    /// segment in the Reserved state (statistics reset, generation
+    /// bumped), which must then be linked into a segment chain.
+    pub(crate) fn reserve_free(&mut self) -> Option<NonZeroU32> {
+        loop {
+            match self.free_queue.steal() {
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return None,
+                crossbeam_deque::Steal::Success(raw) => {
+                    debug_assert!(raw >= 1 && raw <= self.cap);
+                    let id = NonZeroU32::new(raw)?;
+                    if self.headers[raw as usize - 1].try_reserve() {
+                        #[cfg(feature = "metrics")]
+                        {
+                            SEGMENT_REQUEST.increment();
+                            SEGMENT_REQUEST_SUCCESS.increment();
+                            SEGMENT_FREE.decrement();
+                        }
+                        return Some(id);
+                    }
+                    // Not actually Free (unreachable today with writers
+                    // serialized by &mut self) — put it back.
+                    self.free_queue.push(raw);
+                    return None;
+                }
             }
-
-            self.free -= 1;
-            let id = self.free_q;
-            assert!(id.is_some());
-
-            let id_idx = id.unwrap().get() as usize - 1;
-
-            if let Some(next) = self.headers[id_idx].next_seg() {
-                self.free_q = Some(next);
-                self.headers[next.get() as usize - 1].set_prev_seg(None);
-            } else {
-                self.free_q = None;
-            }
-
-            #[cfg(not(feature = "integrity"))]
-            assert_eq!(self.headers[id_idx].write_offset(), 0);
-
-            #[cfg(feature = "integrity")]
-            assert_eq!(
-                self.headers[id_idx].write_offset() as usize,
-                std::mem::size_of_val(&SEG_MAGIC),
-                "segment: ({}) in free queue has write_offset: ({})",
-                id.unwrap(),
-                self.headers[id_idx].write_offset()
-            );
-
-            self.headers[id_idx].mark_created();
-            self.headers[id_idx].mark_merged();
-
-            id
         }
+    }
+
+    /// Return a Reserved segment that was never linked into a chain.
+    #[cfg(test)]
+    pub(crate) fn release_unused(&mut self, id: NonZeroU32) {
+        assert!(self.headers[id.get() as usize - 1].try_release());
+        self.free_queue.push(id.get());
     }
 
     // ── Eviction ─────────────────────────────────────────────────────
 
-    /// Tries to clear a segment by id.
+    /// Drain a Sealed segment and return it to the free queue, or
+    /// condemn it to the last reader if it is pinned.
+    ///
+    /// Crucible's order: transition to Draining FIRST (the exclusivity
+    /// CAS — fails cleanly on the Live tail or a concurrently drained
+    /// segment), drain the hashtable, THEN check the reader count. A
+    /// drained segment leaves its chain either way; the caller must do
+    /// bucket head fixup using links captured before this call.
+    ///
+    /// `Deferred` means the segment was drained and condemned but its
+    /// memory is not yet reclaimable — the last reader's guard drop will
+    /// free it.
     fn clear_segment(
         &mut self,
         id: NonZeroU32,
         hashtable: &MultiChoiceHashtable,
         expire: bool,
-    ) -> Result<(), ()> {
-        let mut segment = self.get_mut(id).unwrap();
-        if segment.next_seg().is_none() && !expire {
-            Err(())
-        } else if segment.ref_count() != 0 {
-            // Pinned by readers — cannot be cleared this pass.
-            #[cfg(feature = "metrics")]
-            SEGMENT_PINNED_SKIP.increment();
-            Err(())
-        } else {
-            assert!(segment.evictable(), "segment was not evictable");
-            segment.set_evictable(false);
-            segment.set_accessible(false);
+    ) -> Result<ClearOutcome, ()> {
+        let id_idx = id.get() as usize - 1;
+
+        // SeqCst: writer half of the Dekker pair with try_acquire_reader
+        // (transition the state, then observe the reader count).
+        if !self.headers[id_idx].cas_metadata(
+            State::Sealed,
+            State::Draining,
+            None,
+            None,
+            Ordering::SeqCst,
+        ) {
+            return Err(());
+        }
+
+        // Capture the links before condemn clears them.
+        let meta = self.headers[id_idx].metadata(Ordering::Acquire);
+        let (next, prev) = (meta.next, meta.prev);
+
+        {
+            let mut segment = self.get_mut(id).unwrap();
             segment.clear(hashtable, expire);
-            Ok(())
+        }
+
+        if self.headers[id_idx].ref_count_seqcst() == 0 {
+            self.recycle(id);
+            Ok(ClearOutcome::Freed)
+        } else {
+            Ok(self.condemn(id, next, prev))
+        }
+    }
+
+    /// Condemn a drained, pinned segment: transition it to
+    /// AwaitingRelease (chain-free) and hand reclamation to the last
+    /// reader's guard drop. The hashtable must already be fully drained —
+    /// that is what guarantees no NEW reader can pin an AwaitingRelease
+    /// segment (no hashtable location routes to it), even though the
+    /// state remains readable for in-flight pins.
+    ///
+    /// Returns `Freed` if the race-fix recheck discovered the last
+    /// reader already dropped (this caller then reclaimed the segment),
+    /// `Deferred` otherwise.
+    pub(crate) fn condemn(
+        &mut self,
+        id: NonZeroU32,
+        next: Option<NonZeroU32>,
+        prev: Option<NonZeroU32>,
+    ) -> ClearOutcome {
+        let id_idx = id.get() as usize - 1;
+
+        // Pool membership ends at condemn time (the guard drop has no
+        // access to the pool bookkeeping).
+        if self.headers[id_idx].pool() == SegmentPool::Admission {
+            self.admission_count = self.admission_count.saturating_sub(1);
+        }
+        self.headers[id_idx].set_pool(SegmentPool::Main);
+
+        let condemned = self.headers[id_idx].cas_metadata(
+            State::Draining,
+            State::AwaitingRelease,
+            Some(None),
+            Some(None),
+            Ordering::SeqCst,
+        );
+        debug_assert!(condemned, "condemned a segment that was not Draining");
+
+        // Splice the neighbors using the captured links (this segment's
+        // own links were just cleared).
+        if let Some(p) = prev {
+            self.headers[p.get() as usize - 1].update_links(Some(next), None);
+        }
+        if let Some(n) = next {
+            self.headers[n.get() as usize - 1].update_links(None, Some(prev));
+        }
+
+        // Race fix (crucible fifo_layer): if the last reader dropped
+        // between the earlier ref_count check and the condemn CAS above,
+        // the segment is AwaitingRelease with no readers and nobody will
+        // free it. Recheck (SeqCst) and reclaim it ourselves; the CAS in
+        // try_release_condemned keeps this exactly-one-free against a
+        // racing guard drop.
+        if self.headers[id_idx].ref_count_seqcst() == 0
+            && self.headers[id_idx].try_release_condemned()
+        {
+            self.free_queue.push(id.get());
+
+            #[cfg(feature = "metrics")]
+            {
+                SEGMENT_RETURN.increment();
+                SEGMENT_FREE.increment();
+            }
+
+            ClearOutcome::Freed
+        } else {
+            ClearOutcome::Deferred
         }
     }
 
     /// Perform eviction based on the configured eviction policy. A success
-    /// indicates that a segment was put onto the free queue and `pop_free()`
+    /// indicates that a segment was put onto the free queue and `reserve_free()`
     /// should return some segment id.
     pub fn evict(
         &mut self,
@@ -518,28 +628,37 @@ impl Segments {
                 SEGMENT_EVICT.increment();
 
                 if let Some(id) = self.least_valuable_seg(ttl_buckets) {
-                    let result = self
-                        .clear_segment(id, hashtable, false)
-                        .map_err(|_| SegmentsError::EvictFailure);
-
-                    if result.is_err() {
-                        #[cfg(feature = "metrics")]
-                        EVICT_TIME.add(now.elapsed().as_nanos() as _);
-
-                        return result;
-                    }
-
+                    // Capture the links before the drain (condemn clears
+                    // them) for the bucket head fixup below.
                     let id_idx = id.get() as usize - 1;
-                    if self.headers[id_idx].prev_seg().is_none() {
-                        let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
-                        ttl_bucket.set_head(self.headers[id_idx].next_seg());
-                    }
-                    self.push_free(id);
+                    let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
+
+                    let outcome = self.clear_segment(id, hashtable, false);
 
                     #[cfg(feature = "metrics")]
                     EVICT_TIME.add(now.elapsed().as_nanos() as _);
 
-                    Ok(())
+                    match outcome {
+                        Err(()) => Err(SegmentsError::EvictFailure),
+                        Ok(outcome) => {
+                            // The segment left its chain either way.
+                            if meta.prev.is_none() {
+                                let ttl_bucket =
+                                    ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+                                ttl_bucket.set_head(meta.next);
+                            }
+                            match outcome {
+                                ClearOutcome::Freed => Ok(()),
+                                // Drained and condemned, but no free
+                                // segment was produced this pass.
+                                ClearOutcome::Deferred => {
+                                    #[cfg(feature = "metrics")]
+                                    SEGMENT_PINNED_SKIP.increment();
+                                    Err(SegmentsError::EvictFailure)
+                                }
+                            }
+                        }
+                    }
                 } else {
                     #[cfg(feature = "metrics")]
                     {
@@ -586,7 +705,7 @@ impl Segments {
 
                 for i in 0..self.cap {
                     let idx = (start + i) % self.cap;
-                    if self.headers[idx as usize].accessible() {
+                    if self.headers[idx as usize].state().is_readable() {
                         let ttl = self.headers[idx as usize].ttl();
                         let ttl_bucket = ttl_buckets.get_mut_bucket(ttl);
                         return ttl_bucket.head();
@@ -625,19 +744,19 @@ impl Segments {
     ) -> Result<(), SegmentsError> {
         // Remove the item.
         {
-            let mut segment = self.get_mut(seg_id)?;
+            let segment = self.get_mut(seg_id)?;
             segment.remove_item_at(offset);
 
-            // If the segment is now empty and evictable, free it immediately.
+            // If the segment is now empty and evictable, free it
+            // immediately via the drain/condemn protocol.
             if segment.live_items() == 0 && segment.can_evict() {
-                segment.clear(hashtable, false);
+                let meta = segment.header_metadata();
 
-                segment.set_evictable(false);
-                if segment.prev_seg().is_none() {
-                    let ttl_bucket = ttl_buckets.get_mut_bucket(segment.ttl());
-                    ttl_bucket.set_head(segment.next_seg());
+                if self.clear_segment(seg_id, hashtable, false).is_ok() && meta.prev.is_none() {
+                    let id_idx = seg_id.get() as usize - 1;
+                    let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+                    ttl_bucket.set_head(meta.next);
                 }
-                self.push_free(seg_id);
                 return Ok(());
             }
         }
@@ -792,6 +911,12 @@ impl Segments {
             cutoff = dst.prune(hashtable, cutoff, target_ratio);
             trace!("cutoff is now: {cutoff}");
 
+            // SCOPE: the destination stays Sealed (readable) during this
+            // in-place compaction, which is incompatible with concurrent
+            // readers — sound today only because reads and eviction are
+            // serialized by &mut. The eviction drain-protocol work
+            // (roadmap item 5) replaces in-place compaction; do not
+            // attempt to fix it here.
             dst.compact(hashtable)?;
 
             let dst_new_size = dst.live_bytes();
@@ -814,6 +939,42 @@ impl Segments {
                 return Ok(None);
             }
 
+            // Take exclusivity of the source before moving any bytes out
+            // of it (SeqCst: Dekker pair with try_acquire_reader), then
+            // re-check the reader count. A pin that raced in between the
+            // can_evict gate and the CAS must abort the merge before
+            // copy_into relocates data a reader is looking at — revert
+            // to Sealed and stop the pass (a port-local transition;
+            // crucible's merge runs behind Relinking machinery we have
+            // not ported).
+            {
+                let src_hdr = &self.headers[src_id.get() as usize - 1];
+                if !src_hdr.cas_metadata(
+                    State::Sealed,
+                    State::Draining,
+                    None,
+                    None,
+                    Ordering::SeqCst,
+                ) {
+                    trace!("stop merge: source not sealed");
+                    return Ok(None);
+                }
+                if src_hdr.ref_count_seqcst() != 0 {
+                    let reverted = src_hdr.cas_metadata(
+                        State::Draining,
+                        State::Sealed,
+                        None,
+                        None,
+                        Ordering::AcqRel,
+                    );
+                    debug_assert!(reverted);
+                    trace!("stop merge: source pinned by readers");
+                    #[cfg(feature = "metrics")]
+                    SEGMENT_PINNED_SKIP.increment();
+                    return Ok(None);
+                }
+            }
+
             let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
 
             let dst_start_size = dst.live_bytes();
@@ -821,6 +982,9 @@ impl Segments {
 
             if dst_start_size >= stop_bytes {
                 trace!("stop merge: target segment is full");
+                let reverted =
+                    src.cas_metadata(State::Draining, State::Sealed, None, None, Ordering::AcqRel);
+                debug_assert!(reverted);
                 break;
             }
 
@@ -847,7 +1011,7 @@ impl Segments {
 
             next_id = src.next_seg();
             src.clear(hashtable, false);
-            self.push_free(src_id);
+            self.recycle(src_id);
             merged += 1;
         }
 
@@ -892,6 +1056,8 @@ impl Segments {
             let mut dst = self.get_mut(start)?;
             let dst_old_size = dst.live_bytes();
 
+            // SCOPE: in-place compaction of a readable segment — see the
+            // note in merge_evict; replaced by roadmap item 5.
             dst.compact(hashtable)?;
 
             let dst_new_size = dst.live_bytes();
@@ -913,17 +1079,46 @@ impl Segments {
                 return Ok(None);
             }
 
+            // Same drain-with-revert protocol as merge_evict: exclusivity
+            // before bytes move, reader recheck, revert on pin.
+            {
+                let src_hdr = &self.headers[src_id.get() as usize - 1];
+                if !src_hdr.cas_metadata(
+                    State::Sealed,
+                    State::Draining,
+                    None,
+                    None,
+                    Ordering::SeqCst,
+                ) {
+                    trace!("stop merge: source not sealed");
+                    return Ok(None);
+                }
+                if src_hdr.ref_count_seqcst() != 0 {
+                    let reverted = src_hdr.cas_metadata(
+                        State::Draining,
+                        State::Sealed,
+                        None,
+                        None,
+                        Ordering::AcqRel,
+                    );
+                    debug_assert!(reverted);
+                    trace!("stop merge: source pinned by readers");
+                    #[cfg(feature = "metrics")]
+                    SEGMENT_PINNED_SKIP.increment();
+                    return Ok(None);
+                }
+            }
+
             let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
 
             let dst_start_size = dst.live_bytes();
             let src_start_size = src.live_bytes();
 
-            if dst_start_size >= stop_bytes {
+            if dst_start_size >= stop_bytes || dst_start_size + src_start_size > seg_size {
                 trace!("stop merge: target segment is full");
-                break;
-            }
-
-            if dst_start_size + src_start_size > seg_size {
+                let reverted =
+                    src.cas_metadata(State::Draining, State::Sealed, None, None, Ordering::AcqRel);
+                debug_assert!(reverted);
                 break;
             }
 
@@ -947,7 +1142,7 @@ impl Segments {
 
             next_id = src.next_seg();
             src.clear(hashtable, false);
-            self.push_free(src_id);
+            self.recycle(src_id);
             merged += 1;
         }
 
@@ -1015,21 +1210,22 @@ impl Segments {
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // First pass: copy items with freq > 0 into a main-pool segment.
-        let target_id = self.pop_free();
+        let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
             self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
 
             let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
-            self.headers[tid.get() as usize - 1].set_accessible(true);
-            self.headers[tid.get() as usize - 1].set_evictable(true);
-
-            // Link target into the TTL bucket.
+            // Link the target at the head of the TTL bucket, then publish
+            // it as Sealed: the target is readable and evictable
+            // immediately, but is never the write tail, so it must not
+            // pass through Live (Live == the bucket tail reserve()
+            // writes into).
             let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
             let old_head = ttl_bucket.head();
+            self.link_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
-            self.push_front(tid, old_head);
 
             self.s3fifo_promote_from(seg_id, tid, hashtable);
         }
@@ -1038,18 +1234,27 @@ impl Segments {
         // Add hashes of remaining (freq == 0) items to ghost queue.
         self.s3fifo_ghost_remaining(seg_id, hashtable);
 
-        // Clear and free the source segment.
-        self.clear_segment(seg_id, hashtable, false)
+        // Drain the source; clear_segment frees or condemns it.
+        let id_idx = seg_id.get() as usize - 1;
+        let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
+        let outcome = self
+            .clear_segment(seg_id, hashtable, false)
             .map_err(|_| SegmentsError::EvictFailure)?;
 
-        let id_idx = seg_id.get() as usize - 1;
-        if self.headers[id_idx].prev_seg().is_none() {
+        // The segment left its chain either way.
+        if meta.prev.is_none() {
             let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
-            ttl_bucket.set_head(self.headers[id_idx].next_seg());
+            ttl_bucket.set_head(meta.next);
         }
-        self.push_free(seg_id);
 
-        Ok(())
+        match outcome {
+            ClearOutcome::Freed => Ok(()),
+            ClearOutcome::Deferred => {
+                #[cfg(feature = "metrics")]
+                SEGMENT_PINNED_SKIP.increment();
+                Err(SegmentsError::EvictFailure)
+            }
+        }
     }
 
     /// Copy items with freq > 0 from src to dst (promotion).
@@ -1178,37 +1383,44 @@ impl Segments {
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Try to get a target segment for second-chance items.
-        let target_id = self.pop_free();
+        let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
             self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
 
             let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
-            self.headers[tid.get() as usize - 1].set_accessible(true);
-            self.headers[tid.get() as usize - 1].set_evictable(true);
-
+            // Head insert + publish as Sealed (see s3fifo_evict_admission).
             let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
             let old_head = ttl_bucket.head();
+            self.link_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
-            self.push_front(tid, old_head);
 
             // Copy freq > 0 items (same promote logic, but no ghost).
             self.s3fifo_promote_from(seg_id, tid, hashtable);
         }
 
-        // Clear and free the source.
-        self.clear_segment(seg_id, hashtable, false)
+        // Drain the source; clear_segment frees or condemns it.
+        let id_idx = seg_id.get() as usize - 1;
+        let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
+        let outcome = self
+            .clear_segment(seg_id, hashtable, false)
             .map_err(|_| SegmentsError::EvictFailure)?;
 
-        let id_idx = seg_id.get() as usize - 1;
-        if self.headers[id_idx].prev_seg().is_none() {
+        // The segment left its chain either way.
+        if meta.prev.is_none() {
             let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
-            ttl_bucket.set_head(self.headers[id_idx].next_seg());
+            ttl_bucket.set_head(meta.next);
         }
-        self.push_free(seg_id);
 
-        Ok(())
+        match outcome {
+            ClearOutcome::Freed => Ok(()),
+            ClearOutcome::Deferred => {
+                #[cfg(feature = "metrics")]
+                SEGMENT_PINNED_SKIP.increment();
+                Err(SegmentsError::EvictFailure)
+            }
+        }
     }
 
     // ── Ghost queue ──────────────────────────────────────────────────

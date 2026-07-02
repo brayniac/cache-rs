@@ -24,14 +24,17 @@ fn sizes() {
 }
 
 #[test]
-fn segment_header_generation_bumps_on_reset() {
+fn segment_header_generation_bumps_on_reserve() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
     assert_eq!(header.generation(), 0);
 
-    header.reset();
+    // every Free -> Reserved reservation bumps the generation, so CAS
+    // tokens from a previous use of the segment can never match again
+    assert!(header.try_reserve());
     assert_eq!(header.generation(), 1);
 
-    header.reset();
+    assert!(header.try_release());
+    assert!(header.try_reserve());
     assert_eq!(header.generation(), 2);
 }
 
@@ -82,7 +85,7 @@ fn pinned_segment_survives_eviction_churn() {
 
 // clear() must always drain the hashtable, but a pinned segment is not
 // freed until its readers drop; the held Item keeps reading its bytes,
-// and a later clear() reclaims the segment.
+// and the guard drop itself frees the condemned segment.
 #[test]
 fn pinned_segment_survives_clear() {
     let segment_size = 4096;
@@ -105,13 +108,18 @@ fn pinned_segment_survives_clear() {
     assert_eq!(item.value(), b"strong");
     assert!(cache.get(b"coffee").is_none());
 
-    // inserting with a drained (inaccessible) tail must expand past it
-    // rather than spin
+    // the condemned tail was unlinked; inserting must expand into a
+    // fresh segment rather than spin
     assert!(cache.insert(b"tea", b"green", None, ttl).is_ok());
     assert!(cache.get(b"tea").is_some());
+    assert_eq!(cache.segments.free(), segments - 2);
 
-    // once the pin drops, the next clear reclaims everything
+    // the guard drop completes the AwaitingRelease handoff: the
+    // condemned segment returns to the free queue immediately, with no
+    // further expire/clear/eviction pass
     drop(item);
+    assert_eq!(cache.segments.free(), segments - 1);
+
     cache.clear();
     assert_eq!(cache.segments.free(), segments);
 }
@@ -142,17 +150,113 @@ fn numeric_op_item_pins_segment() {
     assert_eq!(cache.segments.free(), segments - 1);
     assert_eq!(held.value(), 2);
 
+    // guard drop frees the condemned segment directly
     drop(held);
-    cache.clear();
     assert_eq!(cache.segments.free(), segments);
+}
+
+// The AwaitingRelease handoff end to end: a pinned segment condemned by
+// clear() is freed by the last guard drop — no second pass required —
+// and exactly once (the free count returns to full, not beyond).
+#[test]
+fn guard_drop_frees_segment() {
+    let segment_size = 4096;
+    let segments = 64;
+    let heap_size = segments * segment_size as usize;
+    let ttl = Duration::ZERO;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"coffee", b"strong", None, ttl).is_ok());
+
+    // two pins on the same segment
+    let first = cache.get(b"coffee").unwrap();
+    let second = cache.get(b"coffee").unwrap();
+
+    assert_eq!(cache.clear(), 0);
+    assert_eq!(cache.segments.free(), segments - 1);
+
+    // dropping the first pin must NOT free (a reader remains)
+    drop(first);
+    assert_eq!(cache.segments.free(), segments - 1);
+    assert_eq!(second.value(), b"strong");
+
+    // dropping the LAST pin frees, exactly once
+    drop(second);
+    assert_eq!(cache.segments.free(), segments);
+
+    // and the recycled segment is fully reusable
+    assert!(cache.insert(b"tea", b"green", None, ttl).is_ok());
+    assert_eq!(cache.get(b"tea").unwrap().value(), b"green");
+}
+
+// The seal happens on append: while a segment is the bucket tail it is
+// Live (writable, never evictable); the moment a successor is linked it
+// becomes Sealed (readable, evictable). This replaces the old
+// "has a next segment" eviction guard.
+#[test]
+fn seal_on_append() {
+    let segment_size = 4096;
+    let segments = 8;
+    let heap_size = segments * segment_size as usize;
+    let ttl = Duration::ZERO;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .build()
+        .expect("failed to create cache");
+
+    // fill past one segment so the bucket has at least two
+    let filler = [0xCDu8; 256];
+    for i in 0..30u32 {
+        let key = format!("key_{i}");
+        assert!(cache.insert(key.as_bytes(), &filler[..], None, ttl).is_ok());
+    }
+    assert!(
+        cache.segments.free() <= segments - 2,
+        "need two used segments"
+    );
+
+    // FIFO reservation hands out ids 1, 2, 3, ... in order, so the
+    // highest used id is the current tail and every earlier segment was
+    // sealed when its successor was appended.
+    let used = segments - cache.segments.free();
+    for id in 1..used as u32 {
+        let seg = cache
+            .segments
+            .get_mut(NonZeroU32::new(id).unwrap())
+            .unwrap();
+        assert_eq!(
+            seg.state(),
+            State::Sealed,
+            "predecessor {id} must be sealed"
+        );
+        assert!(seg.can_evict());
+    }
+
+    let tail = cache
+        .segments
+        .get_mut(NonZeroU32::new(used as u32).unwrap())
+        .unwrap();
+    assert_eq!(tail.state(), State::Live);
+    assert!(!tail.can_evict(), "the write tail must never be evictable");
 }
 
 #[test]
 fn can_evict_respects_ref_count() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
-    header.set_state(SegmentState::Active);
-    header.set_next_seg(NonZeroU32::new(2));
+    header.set_state(State::Sealed);
     assert!(header.can_evict());
+
+    // only Sealed is evictable — the Live tail never is
+    header.set_state(State::Live);
+    assert!(!header.can_evict());
+    header.set_state(State::Sealed);
 
     assert!(header.try_acquire_reader());
     assert!(!header.can_evict());
@@ -166,7 +270,7 @@ fn reader_pin_acquire_release() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
 
     // acquisition succeeds in readable states and counts pins
-    header.set_state(SegmentState::Filling);
+    header.set_state(State::Live);
     assert!(header.try_acquire_reader());
     assert!(header.try_acquire_reader());
     assert_eq!(header.ref_count(), 2);
@@ -176,11 +280,11 @@ fn reader_pin_acquire_release() {
     assert_eq!(header.ref_count(), 0);
 
     // acquisition fails in non-readable states and leaves no pin
-    header.set_state(SegmentState::Draining);
+    header.set_state(State::Draining);
     assert!(!header.try_acquire_reader());
     assert_eq!(header.ref_count(), 0);
 
-    header.set_state(SegmentState::Free);
+    header.set_state(State::Free);
     assert!(!header.try_acquire_reader());
     assert_eq!(header.ref_count(), 0);
 }
@@ -208,7 +312,7 @@ fn get_free_seg() {
         .expect("failed to create cache");
     assert_eq!(cache.items(), 0);
     assert_eq!(cache.segments.free(), 64);
-    let seg = cache.segments.pop_free();
+    let seg = cache.segments.reserve_free();
     assert_eq!(cache.segments.free(), 63);
     assert_eq!(seg, NonZeroU32::new(1));
 }
@@ -273,7 +377,10 @@ fn cas() {
 fn cas_stale_token_rejected_after_segment_recycle() {
     let ttl = Duration::ZERO;
     let segment_size = 4096;
-    let segments = 64;
+    // A single-segment heap forces recycling to reuse the same segment
+    // (the free queue is FIFO, so with more segments the next insert
+    // would land elsewhere and not reproduce the ABA scenario).
+    let segments = 1;
     let heap_size = segments * segment_size as usize;
 
     let mut cache = Segcache::builder()
@@ -285,10 +392,10 @@ fn cas_stale_token_rejected_after_segment_recycle() {
     assert!(cache.insert(b"coffee", b"hot", None, ttl).is_ok());
     let stale = cache.get(b"coffee").unwrap().cas();
 
-    // clear() frees the one used segment via push_free, which prepends it
-    // to the free queue (LIFO) and bumps its generation. The next insert
-    // pops the same segment and writes the same key at the same offset,
-    // reproducing the identical 44-bit location.
+    // clear() drains and frees the only segment, and the reservation on
+    // the next insert bumps its generation. The same key is then written
+    // at the same offset in the same segment, reproducing the identical
+    // 44-bit location.
     cache.clear();
     assert_eq!(cache.segments.free(), segments);
     assert!(cache.get(b"coffee").is_none());

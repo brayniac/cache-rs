@@ -24,6 +24,7 @@
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 
+use crate::sync::Ordering;
 use crate::*;
 use core::num::NonZeroU32;
 
@@ -75,127 +76,177 @@ impl TtlBucket {
     /// Expire segments whose TTL has elapsed.
     ///
     /// Walks the chain from head, draining segments whose
-    /// `create_at + ttl <= now` and freeing the unpinned ones. A segment
-    /// pinned by readers is drained from the hashtable but stays linked
-    /// in the chain; a later `expire()` or `clear()` pass reclaims it
-    /// once the pins drop (`Segment::clear` is idempotent). Returns the
-    /// number of segments actually freed.
+    /// `create_at + ttl <= now`. Unpinned segments are freed; a segment
+    /// pinned by readers is condemned (AwaitingRelease) and unlinked
+    /// immediately — the last reader's guard drop frees it. Returns the
+    /// number of segments actually freed by this pass.
     pub(super) fn expire(
         &mut self,
         hashtable: &MultiChoiceHashtable,
         segments: &mut Segments,
     ) -> usize {
-        let mut expired = 0;
         let now = Instant::now();
-        let mut cursor = self.head;
-
-        while let Some(seg_id) = cursor {
-            let mut segment = segments.get_mut(seg_id).unwrap();
-            // the chain is oldest-first: stop at the first live segment
-            if segment.create_at() + segment.ttl() > now {
-                break;
-            }
-            let next = segment.next_seg();
-            let prev = segment.prev_seg();
-
-            segment.clear(hashtable, true);
-
-            if segment.ref_count() == 0 {
-                if self.head == Some(seg_id) {
-                    self.head = next;
-                }
-                if self.tail == Some(seg_id) {
-                    self.tail = prev;
-                }
-                // push_free unlinks the segment, splicing its neighbors
-                segments.push_free(seg_id);
-
-                #[cfg(feature = "metrics")]
-                SEGMENT_EXPIRE.increment();
-
-                expired += 1;
-            } else {
-                #[cfg(feature = "metrics")]
-                SEGMENT_PINNED_SKIP.increment();
-            }
-
-            cursor = next;
-        }
-
-        expired
+        self.drain_chain(hashtable, segments, Some(now))
     }
 
     /// Clear all segments in this bucket, draining every one from the
-    /// hashtable and freeing those not pinned by readers. Pinned segments
-    /// stay linked and are reclaimed by a later pass once the pins drop.
-    /// Returns the number of segments actually freed.
+    /// hashtable. Unpinned segments are freed; pinned ones are condemned
+    /// and freed by the last reader's guard drop. Returns the number of
+    /// segments actually freed by this pass.
     pub(super) fn clear(
         &mut self,
         hashtable: &MultiChoiceHashtable,
         segments: &mut Segments,
     ) -> usize {
-        let mut cleared = 0;
+        self.drain_chain(hashtable, segments, None)
+    }
+
+    /// Shared drain walk for expire (with an age cutoff) and clear.
+    fn drain_chain(
+        &mut self,
+        hashtable: &MultiChoiceHashtable,
+        segments: &mut Segments,
+        expire_cutoff: Option<Instant>,
+    ) -> usize {
+        let mut freed = 0;
         let mut cursor = self.head;
 
         while let Some(seg_id) = cursor {
             let mut segment = segments.get_mut(seg_id).unwrap();
-            let next = segment.next_seg();
-            let prev = segment.prev_seg();
+
+            if let Some(now) = expire_cutoff {
+                // the chain is oldest-first: stop at the first live segment
+                if segment.create_at() + segment.ttl() > now {
+                    break;
+                }
+            }
+
+            let meta = segment.header_metadata();
+            let next = meta.next;
+            let prev = meta.prev;
+
+            // Take exclusivity: interior segments are Sealed, the tail is
+            // Live (SeqCst: Dekker pair with try_acquire_reader).
+            let drained =
+                segment.cas_metadata(State::Sealed, State::Draining, None, None, Ordering::SeqCst)
+                    || segment.cas_metadata(
+                        State::Live,
+                        State::Draining,
+                        None,
+                        None,
+                        Ordering::SeqCst,
+                    );
+            debug_assert!(drained, "chain segment was neither Sealed nor Live");
+            if !drained {
+                cursor = next;
+                continue;
+            }
 
             segment.clear(hashtable, true);
 
-            if segment.ref_count() == 0 {
-                if self.head == Some(seg_id) {
-                    self.head = next;
-                }
-                if self.tail == Some(seg_id) {
-                    self.tail = prev;
-                }
-                segments.push_free(seg_id);
+            // The segment leaves the chain either way.
+            if self.head == Some(seg_id) {
+                self.head = next;
+            }
+            if self.tail == Some(seg_id) {
+                self.tail = prev;
+            }
+
+            if segment.header_ref_count_seqcst() == 0 {
+                // recycle unlinks the segment, splicing its neighbors
+                segments.recycle(seg_id);
 
                 #[cfg(feature = "metrics")]
-                SEGMENT_CLEAR.increment();
+                if expire_cutoff.is_some() {
+                    SEGMENT_EXPIRE.increment();
+                } else {
+                    SEGMENT_CLEAR.increment();
+                }
 
-                cleared += 1;
+                freed += 1;
             } else {
-                #[cfg(feature = "metrics")]
-                SEGMENT_PINNED_SKIP.increment();
+                // Condemn: unlinked immediately, freed by the last
+                // reader's guard drop (or by the race-fix recheck).
+                match segments.condemn(seg_id, next, prev) {
+                    ClearOutcome::Freed => freed += 1,
+                    ClearOutcome::Deferred => {
+                        #[cfg(feature = "metrics")]
+                        SEGMENT_PINNED_SKIP.increment();
+                    }
+                }
             }
 
             cursor = next;
         }
 
-        cleared
+        freed
     }
 
-    /// Allocate a new segment and link it as the tail of this bucket.
+    /// Allocate a new segment and link it as the tail of this bucket,
+    /// following crucible's append protocol: seal the old tail (in the
+    /// same CAS that sets its `next` pointer), link the new segment,
+    /// then publish it as the writable Live tail.
     fn try_expand(&mut self, segments: &mut Segments) -> Result<(), TtlBucketsError> {
-        let id = segments.pop_free().ok_or(TtlBucketsError::NoFreeSegments)?;
+        let id = segments
+            .reserve_free()
+            .ok_or(TtlBucketsError::NoFreeSegments)?;
 
-        // Link the new segment after the current tail.
-        if let Some(tail_id) = self.tail {
-            let tail = segments.get_mut(tail_id).unwrap();
-            tail.set_next_seg(Some(id));
+        {
+            let segment = segments.get_mut(id).unwrap();
+            segment.set_ttl(Duration::from_secs(self.ttl as u32));
         }
 
-        let segment = segments.get_mut(id).unwrap();
-        segment.set_prev_seg(self.tail);
-        segment.set_next_seg(None);
-        segment.set_ttl(Duration::from_secs(self.ttl as u32));
+        if let Some(tail_id) = self.tail {
+            // THE SEAL: the old tail stops accepting writes and becomes
+            // evictable at the exact moment its successor exists — one
+            // CAS carries both the state transition and the next pointer.
+            let tail = segments.get_mut(tail_id).unwrap();
+            let sealed = tail.cas_metadata(
+                State::Live,
+                State::Sealed,
+                Some(Some(id)),
+                None,
+                Ordering::AcqRel,
+            );
+            if !sealed {
+                // Condemned segments are unlinked immediately, so the
+                // bucket tail is always Live (or None). Surface a broken
+                // invariant in tests; degrade to a link-only patch in
+                // release builds.
+                debug_assert!(false, "bucket tail was not Live at seal time");
+                tail.update_links(Some(Some(id)), None);
+            }
 
-        if self.head.is_none() {
-            debug_assert!(self.tail.is_none());
+            let segment = segments.get_mut(id).unwrap();
+            let linked = segment.cas_metadata(
+                State::Reserved,
+                State::Linking,
+                Some(None),
+                Some(Some(tail_id)),
+                Ordering::AcqRel,
+            );
+            debug_assert!(linked, "freshly reserved segment must be Reserved");
+        } else {
+            debug_assert!(self.head.is_none());
+            let segment = segments.get_mut(id).unwrap();
+            let linked = segment.cas_metadata(
+                State::Reserved,
+                State::Linking,
+                Some(None),
+                Some(None),
+                Ordering::AcqRel,
+            );
+            debug_assert!(linked, "freshly reserved segment must be Reserved");
             self.head = Some(id);
         }
+
         self.tail = Some(id);
         self.nseg += 1;
 
-        debug_assert!(
-            !segment.evictable(),
-            "fresh segment should not be evictable"
-        );
-        segment.set_evictable(true);
-        segment.set_accessible(true);
+        // Publish the new tail as the writable segment.
+        let segment = segments.get_mut(id).unwrap();
+        let live = segment.cas_metadata(State::Linking, State::Live, None, None, Ordering::AcqRel);
+        debug_assert!(live, "linking segment must publish as Live");
         Ok(())
     }
 
@@ -218,11 +269,11 @@ impl TtlBucket {
         loop {
             if let Some(id) = self.tail {
                 if let Ok(segment) = segments.get_mut(id) {
-                    // An inaccessible tail (e.g. drained while pinned by a
-                    // reader) falls through to expansion: a fresh segment
-                    // is linked after it. Spinning here would never make
-                    // the tail accessible again.
-                    if segment.accessible() {
+                    // A non-writable tail (sealed, or drained while pinned
+                    // by a reader) falls through to expansion: a fresh
+                    // segment is linked after it. Spinning here would
+                    // never make the tail writable again.
+                    if segment.state().is_writable() {
                         let offset = segment.write_offset() as usize;
                         if offset + size <= seg_size {
                             let item = segment.alloc_item(size as i32);

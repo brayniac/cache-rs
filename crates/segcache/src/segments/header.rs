@@ -9,55 +9,33 @@
 //! │     u32      │  AtomicI32   │  AtomicI32   │  AtomicI32   │
 //! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
 //! ├──────────────┼──────────────┼──────────────┼──────────────┤
-//! │   PREV SEG   │   NEXT SEG   │  CREATE AT   │  MERGE AT    │
-//! │  AtomicU32   │  AtomicU32   │ AtomicInstant│ AtomicInstant│
+//! │  CREATE AT   │   MERGE AT   │     TTL      │  REF COUNT   │
+//! │ AtomicInstant│ AtomicInstant│  AtomicU32   │  AtomicU32   │
 //! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
-//! ├──────────────┼──┬──┬──────┬─┴────────────┬─┴──────────────┤
-//! │     TTL      │ST│PL│ GEN  │  REF COUNT   │    PADDING     │
-//! │  AtomicU32   │8b│8b│ 16b  │  AtomicU32   │     32 bit     │
-//! ├──────────────┴──┴──┴──────┴──────────────┴────────────────┤
+//! ├──────────────┴──────────────┼──────┬──┬────┴──────────────┤
+//! │          METADATA           │ GEN  │PL│      PADDING      │
+//! │          AtomicU64          │ 16b  │8b│       40 bit      │
+//! ├─────────────────────────────┴──────┴──┴───────────────────┤
 //! │                        PADDING                            │
-//! │                       128 bit                             │
+//! │                        128 bit                            │
 //! └───────────────────────────────────────────────────────────┘
 //!
-//! ST = SegmentState (AtomicU8)   PL = SegmentPool (AtomicU8)
-//! GEN = generation (AtomicU16)
+//! METADATA = [8 unused][8 state][24 prev][24 next] (see segments::state)
+//! GEN = generation (AtomicU16)   PL = SegmentPool (AtomicU8)
 //! Total: 512 bits = 64 bytes = 1 cache line
 //! ```
+//!
+//! The state, prev, and next fields share one atomic word so that a chain
+//! mutation and its state transition are a single CAS — the property
+//! concurrent linking requires (ported from crucible). `ref_count` and
+//! `generation` deliberately stay separate atomics: the reader-pinning
+//! protocol pairs a `ref_count` RMW against a state load (SeqCst Dekker
+//! pair), and the generation feeds the CAS-token ABA protection.
 
-use crate::sync::{AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering};
+use crate::segments::state::{Metadata, State};
+use crate::sync::{AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use clocksource::coarse::{AtomicInstant, Duration, Instant};
 use core::num::NonZeroU32;
-
-/// Segment lifecycle state.
-///
-/// Replaces the old `accessible`/`evictable` boolean pair with a single
-/// enum that can be extended to more states (e.g. crucible's 9-state
-/// machine) when concurrent access is implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum SegmentState {
-    /// On the free queue, not accessible or evictable.
-    Free = 0,
-    /// Tail of a TTL bucket chain, accepting writes, not yet evictable.
-    Filling = 1,
-    /// Accessible and evictable (sealed for writes, eligible for eviction).
-    Active = 2,
-    /// Being cleared or evicted, not accessible.
-    Draining = 3,
-}
-
-impl SegmentState {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::Free,
-            1 => Self::Filling,
-            2 => Self::Active,
-            3 => Self::Draining,
-            _ => Self::Free,
-        }
-    }
-}
 
 /// Which pool a segment belongs to (for S3-FIFO eviction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,16 +66,14 @@ impl SegmentPool {
 ///  4       4    write_offset  (AtomicI32)
 ///  8       4    live_bytes    (AtomicI32)
 /// 12       4    live_items    (AtomicI32)
-/// 16       4    prev_seg      (AtomicU32, 0=None)
-/// 20       4    next_seg      (AtomicU32, 0=None)
-/// 24       4    create_at     (AtomicInstant)
-/// 28       4    merge_at      (AtomicInstant)
-/// 32       4    ttl           (AtomicU32, seconds)
-/// 36       1    state         (AtomicU8, SegmentState)
-/// 37       1    pool          (AtomicU8, SegmentPool)
-/// 38       2    generation    (AtomicU16, bumped on recycle)
-/// 40       4    ref_count     (AtomicU32, active readers)
-/// 44      20    _pad
+/// 16       4    create_at     (AtomicInstant)
+/// 20       4    merge_at      (AtomicInstant)
+/// 24       4    ttl           (AtomicU32, seconds)
+/// 28       4    ref_count     (AtomicU32, active readers)
+/// 32       8    metadata      (AtomicU64: state + prev + next)
+/// 40       2    generation    (AtomicU16, bumped on reserve)
+/// 42       1    pool          (AtomicU8, SegmentPool)
+/// 43      21    _pad
 /// ```
 #[repr(C, align(64))]
 pub(crate) struct SegmentHeader {
@@ -105,16 +81,14 @@ pub(crate) struct SegmentHeader {
     write_offset: AtomicI32,
     live_bytes: AtomicI32,
     live_items: AtomicI32,
-    prev_seg: AtomicU32,
-    next_seg: AtomicU32,
     create_at: AtomicInstant,
     merge_at: AtomicInstant,
     ttl: AtomicU32,
-    state: AtomicU8,
-    pool: AtomicU8,
-    generation: AtomicU16,
     ref_count: AtomicU32,
-    _pad: [u8; 20],
+    metadata: AtomicU64,
+    generation: AtomicU16,
+    pool: AtomicU8,
+    _pad: [u8; 21],
 }
 
 // Loom atomics are larger than std atomics, so skip size check under loom.
@@ -124,23 +98,27 @@ const _: () = assert!(std::mem::size_of::<SegmentHeader>() == 64);
 const _: () = assert!(std::mem::align_of::<SegmentHeader>() == 64);
 
 impl SegmentHeader {
-    /// Create a new header for the given segment id.
+    /// Create a new header for the given segment id. Write statistics
+    /// start at the integrity-aware initial offset, matching `init()`.
     pub fn new(id: NonZeroU32) -> Self {
+        let initial_offset = if cfg!(feature = "integrity") {
+            std::mem::size_of::<u64>() as i32
+        } else {
+            0
+        };
         Self {
             id: id.get(),
-            write_offset: AtomicI32::new(0),
-            live_bytes: AtomicI32::new(0),
+            write_offset: AtomicI32::new(initial_offset),
+            live_bytes: AtomicI32::new(initial_offset),
             live_items: AtomicI32::new(0),
-            prev_seg: AtomicU32::new(0),
-            next_seg: AtomicU32::new(0),
             create_at: AtomicInstant::new(Instant::default()),
             merge_at: AtomicInstant::new(Instant::default()),
             ttl: AtomicU32::new(0),
-            state: AtomicU8::new(SegmentState::Free as u8),
-            pool: AtomicU8::new(SegmentPool::Main as u8),
-            generation: AtomicU16::new(0),
             ref_count: AtomicU32::new(0),
-            _pad: [0; 20],
+            metadata: AtomicU64::new(Metadata::new_free().pack()),
+            generation: AtomicU16::new(0),
+            pool: AtomicU8::new(SegmentPool::Main as u8),
+            _pad: [0; 21],
         }
     }
 
@@ -156,33 +134,176 @@ impl SegmentHeader {
         self.write_offset.store(initial_offset, Ordering::Relaxed);
         self.live_bytes.store(initial_offset, Ordering::Relaxed);
         self.live_items.store(0, Ordering::Relaxed);
-        self.state
-            .store(SegmentState::Free as u8, Ordering::Relaxed);
+        self.metadata
+            .store(Metadata::new_free().pack(), Ordering::Relaxed);
     }
 
-    /// Reset the header when returning to the free queue.
-    /// When the `magic` feature is enabled, preserves the magic byte offset.
+    /// Get the generation counter. Incremented each time the segment is
+    /// reserved from the free queue; wraps at `u16::MAX`.
+    #[inline]
+    pub fn generation(&self) -> u16 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    // -- Metadata word (state + chain pointers) --
+
+    /// Load and unpack the metadata word.
+    #[inline]
+    pub fn metadata(&self, order: Ordering) -> Metadata {
+        Metadata::unpack(self.metadata.load(order))
+    }
+
+    /// Single-shot CAS transition of the metadata word.
     ///
-    /// Bumps the generation counter so that CAS tokens issued against the
-    /// previous use of this segment can never match items written after it
-    /// is recycled.
-    pub fn reset(&self) {
+    /// Fails (returns false) if the current state is not `expected_state`
+    /// or if the word changed concurrently. For the link parameters,
+    /// `None` keeps the current value and `Some(x)` (including
+    /// `Some(None)`) replaces it. `success` is the success ordering
+    /// (failure ordering is always `Acquire`): use `SeqCst` for
+    /// transitions that participate in a reader-handoff Dekker pair
+    /// (Sealed/Live -> Draining, Draining -> AwaitingRelease,
+    /// AwaitingRelease -> Free), `AcqRel` otherwise.
+    pub fn cas_metadata(
+        &self,
+        expected_state: State,
+        new_state: State,
+        new_next: Option<Option<NonZeroU32>>,
+        new_prev: Option<Option<NonZeroU32>>,
+        success: Ordering,
+    ) -> bool {
+        let current = self.metadata.load(Ordering::Acquire);
+        let meta = Metadata::unpack(current);
+        if meta.state != expected_state {
+            return false;
+        }
+        let new = Metadata {
+            state: new_state,
+            next: new_next.unwrap_or(meta.next),
+            prev: new_prev.unwrap_or(meta.prev),
+        };
+        self.metadata
+            .compare_exchange(current, new.pack(), success, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Patch chain pointers while preserving the current state.
+    ///
+    /// A CAS loop rather than a store because the same word carries the
+    /// state, which a concurrent transition may change. Today all chain
+    /// writers are serialized by `&mut Segments` (the analogue of
+    /// crucible's chain mutex), so the loop is belt-and-braces for the
+    /// concurrent future.
+    pub fn update_links(
+        &self,
+        new_next: Option<Option<NonZeroU32>>,
+        new_prev: Option<Option<NonZeroU32>>,
+    ) {
+        let mut current = self.metadata.load(Ordering::Acquire);
+        loop {
+            let meta = Metadata::unpack(current);
+            let new = Metadata {
+                state: meta.state,
+                next: new_next.unwrap_or(meta.next),
+                prev: new_prev.unwrap_or(meta.prev),
+            };
+            match self.metadata.compare_exchange(
+                current,
+                new.pack(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Reserve a Free segment for reuse (Free -> Reserved, links cleared).
+    ///
+    /// On success, resets the write statistics, stamps creation/merge
+    /// times, and bumps the generation counter so that CAS tokens issued
+    /// against the previous use of this segment can never match items
+    /// written after it is recycled.
+    pub fn try_reserve(&self) -> bool {
+        if !self.cas_metadata(
+            State::Free,
+            State::Reserved,
+            Some(None),
+            Some(None),
+            Ordering::AcqRel,
+        ) {
+            return false;
+        }
+
         let initial_offset = if cfg!(feature = "integrity") {
             std::mem::size_of::<u64>() as i32
         } else {
             0
         };
+        debug_assert_eq!(
+            self.write_offset.load(Ordering::Relaxed),
+            initial_offset,
+            "segment {} reserved with unreset write_offset",
+            self.id
+        );
         self.write_offset.store(initial_offset, Ordering::Relaxed);
         self.live_bytes.store(initial_offset, Ordering::Relaxed);
         self.live_items.store(0, Ordering::Relaxed);
+        self.mark_created();
+        self.mark_merged();
         self.generation.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
-    /// Get the generation counter. Incremented each time the segment is
-    /// returned to the free queue; wraps at `u16::MAX`.
-    #[inline]
-    pub fn generation(&self) -> u16 {
-        self.generation.load(Ordering::Relaxed)
+    /// Return an unused segment to Free (Reserved|Linking -> Free).
+    /// Used by allocation error paths before a segment becomes visible.
+    #[allow(dead_code)] // production callers arrive with the append-protocol error paths
+    pub fn try_release(&self) -> bool {
+        self.cas_metadata(
+            State::Reserved,
+            State::Free,
+            Some(None),
+            Some(None),
+            Ordering::AcqRel,
+        ) || self.cas_metadata(
+            State::Linking,
+            State::Free,
+            Some(None),
+            Some(None),
+            Ordering::AcqRel,
+        )
+    }
+
+    /// Try to free a condemned segment (AwaitingRelease -> Free).
+    ///
+    /// Returns true iff this caller won the transition — the CAS
+    /// uniqueness is what guarantees exactly-one-free between the last
+    /// reader's guard drop and the condemner's race-fix recheck. The
+    /// caller that wins must return the segment to the free queue.
+    ///
+    /// SeqCst: this participates in the release-side Dekker pair (guard
+    /// drop decrements ref_count SeqCst, then loads the state; the
+    /// condemner CASes to AwaitingRelease SeqCst, then loads ref_count).
+    pub fn try_release_condemned(&self) -> bool {
+        let current = self.metadata.load(Ordering::SeqCst);
+        if Metadata::unpack(current).state != State::AwaitingRelease {
+            return false;
+        }
+        let new = Metadata {
+            state: State::Free,
+            next: None,
+            prev: None,
+        };
+        self.metadata
+            .compare_exchange(current, new.pack(), Ordering::SeqCst, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Test-only escape hatch to place a header in an arbitrary state.
+    #[cfg(test)]
+    #[allow(dead_code)] // used by loom models; dead in non-loom test builds
+    pub fn store_metadata_for_test(&self, m: Metadata) {
+        self.metadata.store(m.pack(), Ordering::SeqCst);
     }
 
     // -- Reader pinning --
@@ -194,42 +315,31 @@ impl SegmentHeader {
     ///
     /// While the reader count is non-zero the segment must not be
     /// recycled, merged, or compacted. Every successful acquire must be
-    /// paired with exactly one [`Self::release_reader`].
-    ///
-    /// Uses explicit `Acquire` loads on the state (rather than the
-    /// `Relaxed` loads in [`Self::accessible`]) so the protocol is sound
-    /// once concurrent writers exist.
+    /// paired with exactly one [`Self::release_reader`] (or a
+    /// `SegmentGuard` drop).
     #[inline]
     pub fn try_acquire_reader(&self) -> bool {
-        let readable = |s: u8| {
-            matches!(
-                SegmentState::from_u8(s),
-                SegmentState::Filling | SegmentState::Active
-            )
-        };
-
-        if !readable(self.state.load(Ordering::Acquire)) {
+        if !self.metadata(Ordering::Acquire).state.is_readable() {
             return false;
         }
 
         // `SeqCst` on the increment and the re-check is load-bearing.
-        // This pair races the future concurrent writer's mirror image
-        // (store state, then load ref_count) — a store-buffering /
-        // Dekker pattern. Acquire/release does NOT forbid the outcome
-        // where the writer reads ref_count == 0 while our re-check
-        // still sees a readable state (both sides proceed); only the
-        // SeqCst total order does, and the writer side must use SeqCst
-        // too when the state-machine port introduces it. This matches
-        // crossbeam-epoch's SeqCst `pin()`, which exists for the same
-        // hazard. Note loom cannot verify this distinction: it reports
-        // the store-buffering outcome even for pure-SeqCst litmus
-        // tests, so the in-tree loom models cover the protocol shape,
-        // not this ordering requirement.
+        // This pair races the writer's mirror image (CAS the state, then
+        // load ref_count) — a store-buffering / Dekker pattern.
+        // Acquire/release does NOT forbid the outcome where the writer
+        // reads ref_count == 0 while our re-check still sees a readable
+        // state (both sides proceed); only the SeqCst total order does,
+        // which is why the drain/condemn transitions use SeqCst as well.
+        // This matches crossbeam-epoch's SeqCst `pin()`, which exists
+        // for the same hazard. Note loom cannot verify this distinction:
+        // it reports the store-buffering outcome even for pure-SeqCst
+        // litmus tests, so the in-tree loom models cover the protocol
+        // shape, not this ordering requirement.
         self.ref_count.fetch_add(1, Ordering::SeqCst);
 
         // Re-check after the increment: a writer that observed
         // ref_count == 0 may have transitioned the state concurrently.
-        if !readable(self.state.load(Ordering::SeqCst)) {
+        if !self.metadata(Ordering::SeqCst).state.is_readable() {
             self.ref_count.fetch_sub(1, Ordering::Release);
             return false;
         }
@@ -237,17 +347,38 @@ impl SegmentHeader {
         true
     }
 
-    /// Release a reader pin taken with [`Self::try_acquire_reader`].
+    /// Release a reader pin taken with [`Self::try_acquire_reader`]
+    /// without the AwaitingRelease handoff. Production pins always ride
+    /// in a `SegmentGuard` (whose drop uses the SeqCst path); this plain
+    /// path serves the acquire-failure backout and tests.
+    #[cfg(test)]
     #[inline]
     pub fn release_reader(&self) {
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
         debug_assert!(prev > 0, "release_reader without matching acquire");
     }
 
+    /// Decrement the reader count for a guard drop, returning the
+    /// previous count. SeqCst: participates in the release-side Dekker
+    /// pair with the condemner (see [`Self::try_release_condemned`]).
+    #[inline]
+    pub fn release_reader_for_guard(&self) -> u32 {
+        let prev = self.ref_count.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(prev > 0, "guard release without matching acquire");
+        prev
+    }
+
     /// Number of active readers pinning this segment.
     #[inline]
     pub fn ref_count(&self) -> u32 {
         self.ref_count.load(Ordering::Acquire)
+    }
+
+    /// Number of active readers, ordered after a preceding SeqCst
+    /// drain/condemn transition (the writer half of the Dekker pair).
+    #[inline]
+    pub fn ref_count_seqcst(&self) -> u32 {
+        self.ref_count.load(Ordering::SeqCst)
     }
 
     // -- Identity --
@@ -318,28 +449,26 @@ impl SegmentHeader {
         self.decr_live_bytes(size);
     }
 
-    // -- Chain pointers --
+    // -- Chain pointers (views of the metadata word) --
 
     #[inline]
     pub fn prev_seg(&self) -> Option<NonZeroU32> {
-        NonZeroU32::new(self.prev_seg.load(Ordering::Relaxed))
+        self.metadata(Ordering::Acquire).prev
     }
 
     #[inline]
     pub fn set_prev_seg(&self, id: Option<NonZeroU32>) {
-        self.prev_seg
-            .store(id.map_or(0, |v| v.get()), Ordering::Relaxed);
+        self.update_links(None, Some(id));
     }
 
     #[inline]
     pub fn next_seg(&self) -> Option<NonZeroU32> {
-        NonZeroU32::new(self.next_seg.load(Ordering::Relaxed))
+        self.metadata(Ordering::Acquire).next
     }
 
     #[inline]
     pub fn set_next_seg(&self, id: Option<NonZeroU32>) {
-        self.next_seg
-            .store(id.map_or(0, |v| v.get()), Ordering::Relaxed);
+        self.update_links(Some(id), None);
     }
 
     // -- Timestamps --
@@ -377,76 +506,44 @@ impl SegmentHeader {
     }
 
     // -- State --
-    //
-    // INVARIANT: state transitions are plain stores, not CAS. This is
-    // sound only because every caller holds `&mut Segments` (directly or
-    // through a `Segment<'_>` view obtained from `Segments::get_mut`),
-    // so writers are serialized by Rust's exclusivity — the two-phase
-    // reader protocol in `try_acquire_reader` races only against one
-    // writer at a time. Before segments gain concurrent writers (the
-    // planned state-machine port), these stores must become CAS
-    // transitions that check the reader count (e.g. Active -> Draining
-    // only if ref_count == 0), as crucible does.
 
     #[inline]
-    pub fn state(&self) -> SegmentState {
-        SegmentState::from_u8(self.state.load(Ordering::Relaxed))
+    pub fn state(&self) -> State {
+        self.metadata(Ordering::Acquire).state
     }
 
-    #[inline]
-    pub fn set_state(&self, state: SegmentState) {
-        self.state.store(state as u8, Ordering::Relaxed);
-    }
-
-    /// Returns true if the segment is accessible (Filling or Active).
-    #[inline]
-    pub fn accessible(&self) -> bool {
-        matches!(self.state(), SegmentState::Filling | SegmentState::Active)
-    }
-
-    /// Set the segment as accessible. Maps to `Filling` if not already
-    /// `Active`, preserving the evictable distinction.
-    #[inline]
-    pub fn set_accessible(&self, accessible: bool) {
-        if accessible {
-            if self.state() == SegmentState::Free || self.state() == SegmentState::Draining {
-                self.set_state(SegmentState::Filling);
+    /// Test-only helper: store a state while preserving the chain links.
+    #[cfg(test)]
+    pub fn set_state(&self, state: State) {
+        let mut current = self.metadata.load(Ordering::Acquire);
+        loop {
+            let meta = Metadata::unpack(current);
+            let new = Metadata { state, ..meta };
+            match self.metadata.compare_exchange(
+                current,
+                new.pack(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
             }
-        } else if self.state() != SegmentState::Free {
-            self.set_state(SegmentState::Draining);
         }
     }
 
-    /// Returns true if the segment is evictable (Active state).
-    #[inline]
-    pub fn evictable(&self) -> bool {
-        self.state() == SegmentState::Active
-    }
-
-    /// Set the segment as evictable. Transitions to Active when setting
-    /// true, ensuring the segment is at least Filling first. This makes
-    /// the call order-independent with `set_accessible`.
-    #[inline]
-    pub fn set_evictable(&self, evictable: bool) {
-        if evictable {
-            let state = self.state();
-            if state == SegmentState::Free || state == SegmentState::Draining {
-                self.set_state(SegmentState::Filling);
-            }
-            if self.state() == SegmentState::Filling {
-                self.set_state(SegmentState::Active);
-            }
-        } else if self.state() == SegmentState::Active {
-            self.set_state(SegmentState::Filling);
-        }
-    }
-
-    /// Check if the segment can actually be evicted.
-    /// Requires: Active state, has a next segment (not the current write
-    /// target), and no readers pinning it.
+    /// Check if the segment can actually be evicted: Sealed with no
+    /// readers pinning it. The write tail is Live, so it is
+    /// automatically excluded (the seal happens when a successor is
+    /// appended).
+    ///
+    /// ADVISORY ONLY — this reads ref_count with plain Acquire and is
+    /// not part of the Dekker pair. Use it to select candidates, never
+    /// to justify touching segment memory: the authoritative check is
+    /// the SeqCst drain CAS + ref_count recheck inside clear_segment /
+    /// condemn / the merge revert, which fail closed if this was stale.
     #[inline]
     pub fn can_evict(&self) -> bool {
-        self.evictable() && self.next_seg().is_some() && self.ref_count() == 0
+        self.state().is_evictable() && self.ref_count() == 0
     }
 
     // -- Pool --
@@ -464,15 +561,16 @@ impl SegmentHeader {
 
 impl std::fmt::Debug for SegmentHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let meta = self.metadata(Ordering::Relaxed);
         f.debug_struct("SegmentHeader")
             .field("id", &self.id)
             .field("write_offset", &self.write_offset())
             .field("live_bytes", &self.live_bytes())
             .field("live_items", &self.live_items())
-            .field("state", &self.state())
+            .field("state", &meta.state)
             .field("pool", &self.pool())
-            .field("prev_seg", &self.prev_seg())
-            .field("next_seg", &self.next_seg())
+            .field("prev_seg", &meta.prev)
+            .field("next_seg", &meta.next)
             .field("ttl", &self.ttl())
             .finish()
     }
@@ -481,34 +579,54 @@ impl std::fmt::Debug for SegmentHeader {
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
     use super::*;
+    use crate::segments::state::State;
     use core::num::NonZeroU32;
+    use loom::sync::atomic::AtomicU32 as LoomAtomicU32;
     use loom::sync::Arc;
     use loom::thread;
 
-    // Two readers race a writer that mirrors the production eviction gate
-    // (check ref_count == 0 and evictable, then store Draining). The store
-    // is not a CAS because production writers run under `&mut Segments`
-    // exclusivity today; there is a benign interleaving where a reader
-    // passes its re-check just before the writer's store, which is only
-    // safe because of that exclusivity. The AwaitingRelease state-machine
-    // port must replace the plain store with a CAS transition
-    // (Active -> Draining only if ref_count == 0) before real concurrent
-    // writers exist, at which point this model gains strong assertions.
+    // NOTE on what these models can and cannot verify: loom reports the
+    // store-buffering outcome even for pure-SeqCst litmus tests (its
+    // modeling lacks the SC global total order). That has two
+    // consequences here. First, the SeqCst-vs-AcqRel distinction on the
+    // Dekker-paired transitions is not checkable. Second, the halves of
+    // the protocol invariants that DEPEND on the SC total order — "a
+    // committed drain is never observed by a pinned reader" and "a
+    // condemned segment never leaks" — show false violations under
+    // loom, because it explores the store-buffering interleaving that
+    // SeqCst forbids on real hardware. The models therefore assert only
+    // the SC-independent halves (CAS uniqueness -> no double-free;
+    // revert consistency); the SC-dependent halves are pinned by the
+    // single-threaded behavioral tests, where store buffering cannot
+    // occur.
+
+    // Two readers race a drain that mirrors the merge-source gate: take
+    // Draining exclusivity via CAS, re-check the reader count, and
+    // revert if a pin raced in. Only after the recheck passes is it
+    // safe to move bytes ("commit"). Strong invariant: no reader ever
+    // holds a pin while the drain has committed.
     #[test]
-    fn loom_two_readers_one_writer_refcount() {
+    fn loom_readers_vs_cas_gated_drain() {
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = Some(3);
         builder.check(|| {
             let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
-            header.set_state(SegmentState::Active);
+            header.set_state(State::Sealed);
+            let committed = Arc::new(LoomAtomicU32::new(0));
 
             let readers: Vec<_> = (0..2)
                 .map(|_| {
                     let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
                     thread::spawn(move || {
                         if h.try_acquire_reader() {
-                            // simulate a read while pinned
-                            let _ = h.state();
+                            // The strong invariant — a pinned reader
+                            // never observes a committed drain — is the
+                            // SC-total-order property loom cannot model
+                            // (see module note); it is NOT asserted
+                            // here. Record the observation instead so
+                            // the model still exercises the code path.
+                            let _ = c.load(Ordering::SeqCst);
                             h.release_reader();
                         }
                     })
@@ -517,10 +635,22 @@ mod loom_tests {
 
             let writer = {
                 let h = Arc::clone(&header);
+                let c = Arc::clone(&committed);
                 thread::spawn(move || {
-                    // mirrors can_evict() + drain in production
-                    if h.ref_count() == 0 && h.evictable() {
-                        h.set_state(SegmentState::Draining);
+                    if h.cas_metadata(State::Sealed, State::Draining, None, None, Ordering::SeqCst)
+                    {
+                        if h.ref_count_seqcst() != 0 {
+                            // a pin raced in: revert before touching bytes
+                            assert!(h.cas_metadata(
+                                State::Draining,
+                                State::Sealed,
+                                None,
+                                None,
+                                Ordering::AcqRel,
+                            ));
+                        } else {
+                            c.store(1, Ordering::SeqCst);
+                        }
                     }
                 })
             };
@@ -530,28 +660,105 @@ mod loom_tests {
             }
             writer.join().unwrap();
 
-            // all pins released; state is one of the two valid outcomes
             assert_eq!(header.ref_count(), 0);
-            assert!(matches!(
-                header.state(),
-                SegmentState::Active | SegmentState::Draining
-            ));
         });
     }
 
-    // Once a segment is Draining, acquisition must fail in every
-    // interleaving, and a failed acquire must leave no pin behind.
+    // The AwaitingRelease handoff: an evictor condemns a drained, pinned
+    // segment (with the race-fix recheck) while the reader's guard drop
+    // decrements and maybe reclaims. Exactly one side must free the
+    // segment in every interleaving — no double-free, no leak.
     #[test]
-    fn loom_acquire_fails_after_drain() {
+    fn loom_awaiting_release_exactly_one_free() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            // a drained segment with one outstanding pin
+            header.set_state(State::Draining);
+            header.ref_count.store(1, Ordering::SeqCst);
+            // stand-in for the injector push (loom cannot model the
+            // crossbeam Injector)
+            let freed = Arc::new(LoomAtomicU32::new(0));
+
+            let evictor = {
+                let h = Arc::clone(&header);
+                let f = Arc::clone(&freed);
+                thread::spawn(move || {
+                    // condemn (mirrors Segments::condemn)
+                    assert!(h.cas_metadata(
+                        State::Draining,
+                        State::AwaitingRelease,
+                        Some(None),
+                        Some(None),
+                        Ordering::SeqCst,
+                    ));
+                    // race fix: the pin may have dropped before the CAS
+                    if h.ref_count_seqcst() == 0 && h.try_release_condemned() {
+                        f.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            let reader = {
+                let h = Arc::clone(&header);
+                let f = Arc::clone(&freed);
+                thread::spawn(move || {
+                    // mirrors SegmentGuard::drop
+                    let prev = h.release_reader_for_guard();
+                    if prev == 1 && h.try_release_condemned() {
+                        f.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            evictor.join().unwrap();
+            reader.join().unwrap();
+
+            // Exactly-one-free has two halves. "At most once" is pure
+            // CAS uniqueness on try_release_condemned and holds in every
+            // interleaving loom explores. "At least once" (no leak)
+            // depends on the SeqCst total order of the decrement/CAS
+            // Dekker pair, which loom cannot model (see module note) —
+            // it reports the store-buffering leak that real SeqCst
+            // hardware forbids, so it is not asserted here; the
+            // guard_drop_frees_segment behavioral test pins it.
+            let freed = freed.load(Ordering::SeqCst);
+            assert!(freed <= 1, "condemned segment freed more than once");
+            if freed == 1 {
+                assert_eq!(header.state(), State::Free);
+            }
+            assert_eq!(header.ref_count(), 0);
+        });
+    }
+
+    // Acquisition must fail in every interleaving for non-readable
+    // states, leaving no pin behind — and AwaitingRelease must remain
+    // acquirable for in-flight readers.
+    #[test]
+    fn loom_acquire_by_state() {
         loom::model(|| {
             let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
-            header.set_state(SegmentState::Draining);
 
-            let h = Arc::clone(&header);
-            let reader = thread::spawn(move || h.try_acquire_reader());
-
-            assert!(!reader.join().unwrap());
-            assert_eq!(header.ref_count(), 0);
+            for (state, acquirable) in [
+                (State::Free, false),
+                (State::Reserved, false),
+                (State::Draining, false),
+                (State::AwaitingRelease, true),
+            ] {
+                header.set_state(state);
+                let h = Arc::clone(&header);
+                let reader = thread::spawn(move || {
+                    if h.try_acquire_reader() {
+                        h.release_reader();
+                        true
+                    } else {
+                        false
+                    }
+                });
+                assert_eq!(reader.join().unwrap(), acquirable, "state {state:?}");
+                assert_eq!(header.ref_count(), 0);
+            }
         });
     }
 }

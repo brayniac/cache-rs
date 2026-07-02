@@ -965,6 +965,7 @@ dependencies = [
  "ahash",
  "clocksource",
  "criterion",
+ "crossbeam-deque",
  "keyvalue",
  "log",
  "loom",

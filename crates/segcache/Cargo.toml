@@ -33,6 +33,7 @@ default = ["metrics"]
 [dependencies]
 ahash = { workspace = true }
 clocksource = { workspace = true }
+crossbeam-deque = { workspace = true }
 keyvalue = { workspace = true, features = [] }
 log = { workspace = true }
 metriken = { workspace = true, optional = true }

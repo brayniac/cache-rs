@@ -6,6 +6,7 @@
 //! length, and optional metadata.
 
 pub mod item;
+pub mod numeric;
 pub mod tiny;
 mod value;
 

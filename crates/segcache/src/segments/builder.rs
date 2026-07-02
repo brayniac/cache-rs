@@ -55,6 +55,13 @@ impl SegmentsBuilder {
             return Err(SegmentsError::SegmentTooSmall);
         }
 
+        // Items are placed at 8-byte-aligned offsets and locations encode
+        // `offset >> 3` (see pack_location), so segment bases must be
+        // 8-aligned for absolute item addresses to be.
+        if self.segment_size % 8 != 0 {
+            return Err(SegmentsError::SegmentSizeUnaligned);
+        }
+
         let seg_size = self.segment_size as usize;
         if self.heap_size == 0 || !self.heap_size.is_multiple_of(seg_size) {
             return Err(SegmentsError::InvalidHeapSize {

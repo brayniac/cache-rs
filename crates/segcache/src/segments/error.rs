@@ -14,6 +14,8 @@ pub enum SegmentsError {
     EvictFailure,
     #[error("segment size must be greater than item header overhead")]
     SegmentTooSmall,
+    #[error("segment size must be a multiple of 8 bytes")]
+    SegmentSizeUnaligned,
     #[error(
         "heap size ({heap_size}) must be a non-zero multiple of segment size ({segment_size})"
     )]

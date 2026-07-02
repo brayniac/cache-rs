@@ -139,93 +139,9 @@ impl Segcache {
         // default optional data is empty
         let optional = optional.unwrap_or(&[]);
 
-        // calculate size for item
-        let size = (((ITEM_HDR_SIZE + key.len() + size_of(&value) + optional.len()) >> 3) + 1) << 3;
-
         let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
 
-        // For S3-FIFO: determine target pool based on ghost queue
-        let target_pool = if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. }) {
-            let hash = {
-                let mut hasher = self.hashtable.hash_builder().build_hasher();
-                hasher.write(key);
-                hasher.finish()
-            };
-            if self.segments.ghost_contains(hash) {
-                self.segments.ghost_remove(hash);
-                SegmentPool::Main
-            } else {
-                SegmentPool::Admission
-            }
-        } else {
-            SegmentPool::Main
-        };
-
-        // For S3-FIFO: ensure the target pool has room by evicting from it
-        // if it's at capacity. This enforces the small/main ratio computed
-        // at construction time.
-        if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. })
-            && !self.segments.pool_has_room(target_pool)
-        {
-            let _ = self.segments.evict(&mut self.ttl_buckets, &self.hashtable);
-        }
-
-        // try to get a `ReservedItem`
-        let mut retries = RESERVE_RETRIES;
-        let reserved;
-        loop {
-            match self
-                .ttl_buckets
-                .get_mut_bucket(ttl)
-                .reserve(size, &mut self.segments)
-            {
-                Ok(mut reserved_item) => {
-                    reserved_item.define(key, value, optional);
-                    // Set the segment pool for S3-FIFO (only transitions
-                    // Main→Admission need a counter update; fresh segments
-                    // default to Main)
-                    if let Ok(seg) = self.segments.get_mut(reserved_item.seg()) {
-                        if target_pool == SegmentPool::Admission
-                            && seg.pool() != SegmentPool::Admission
-                        {
-                            seg.set_pool(target_pool);
-                            self.segments.incr_pool(SegmentPool::Admission);
-                        }
-                    }
-                    reserved = reserved_item;
-                    break;
-                }
-                Err(TtlBucketsError::ItemOversized { size }) => {
-                    return Err(SegcacheError::ItemOversized { size });
-                }
-                Err(TtlBucketsError::NoFreeSegments) => {
-                    if self
-                        .segments
-                        .evict(&mut self.ttl_buckets, &self.hashtable)
-                        .is_err()
-                    {
-                        retries -= 1;
-                    } else {
-                        // we successfully evicted a segment, return to start of
-                        // loop to reserve the item
-                        continue;
-                    }
-                }
-            }
-            if retries == 0 {
-                // segment acquire failed, increment the stats and return with
-                // an error
-
-                #[cfg(feature = "metrics")]
-                {
-                    SEGMENT_REQUEST.increment();
-                    SEGMENT_REQUEST_FAILURE.increment();
-                }
-
-                return Err(SegcacheError::NoFreeSegments);
-            }
-            retries -= 1;
-        }
+        let reserved = self.reserve_and_define(key, value, optional, ttl)?;
 
         let location = pack_location(reserved.seg(), reserved.offset() as u64);
         let verifier = self.verifier();
@@ -261,6 +177,169 @@ impl Segcache {
                 );
                 Err(SegcacheError::HashTableInsertEx)
             }
+        }
+    }
+
+    /// Reserve segment space for an item and write its bytes, without
+    /// publishing it in the hashtable. Handles S3-FIFO pool targeting and
+    /// runs eviction (with retries) when no free segment is available.
+    fn reserve_and_define(
+        &mut self,
+        key: &[u8],
+        value: Value,
+        optional: &[u8],
+        ttl: Duration,
+    ) -> Result<ReservedItem, SegcacheError> {
+        // calculate size for item
+        let size = (((ITEM_HDR_SIZE + key.len() + size_of(&value) + optional.len()) >> 3) + 1) << 3;
+
+        // For S3-FIFO: determine target pool based on ghost queue
+        let target_pool = if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. }) {
+            let hash = {
+                let mut hasher = self.hashtable.hash_builder().build_hasher();
+                hasher.write(key);
+                hasher.finish()
+            };
+            if self.segments.ghost_contains(hash) {
+                self.segments.ghost_remove(hash);
+                SegmentPool::Main
+            } else {
+                SegmentPool::Admission
+            }
+        } else {
+            SegmentPool::Main
+        };
+
+        // For S3-FIFO: ensure the target pool has room by evicting from it
+        // if it's at capacity. This enforces the small/main ratio computed
+        // at construction time.
+        if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. })
+            && !self.segments.pool_has_room(target_pool)
+        {
+            let _ = self.segments.evict(&mut self.ttl_buckets, &self.hashtable);
+        }
+
+        let mut retries = RESERVE_RETRIES;
+        loop {
+            match self
+                .ttl_buckets
+                .get_mut_bucket(ttl)
+                .reserve(size, &mut self.segments)
+            {
+                Ok(mut reserved_item) => {
+                    reserved_item.define(key, value, optional);
+                    // Set the segment pool for S3-FIFO (only transitions
+                    // Main→Admission need a counter update; fresh segments
+                    // default to Main)
+                    if let Ok(seg) = self.segments.get_mut(reserved_item.seg()) {
+                        if target_pool == SegmentPool::Admission
+                            && seg.pool() != SegmentPool::Admission
+                        {
+                            seg.set_pool(target_pool);
+                            self.segments.incr_pool(SegmentPool::Admission);
+                        }
+                    }
+                    return Ok(reserved_item);
+                }
+                Err(TtlBucketsError::ItemOversized { size }) => {
+                    return Err(SegcacheError::ItemOversized { size });
+                }
+                Err(TtlBucketsError::NoFreeSegments) => {
+                    if self
+                        .segments
+                        .evict(&mut self.ttl_buckets, &self.hashtable)
+                        .is_err()
+                    {
+                        retries -= 1;
+                    } else {
+                        // we successfully evicted a segment, return to start of
+                        // loop to reserve the item
+                        continue;
+                    }
+                }
+            }
+            if retries == 0 {
+                // segment acquire failed, increment the stats and return with
+                // an error
+
+                #[cfg(feature = "metrics")]
+                {
+                    SEGMENT_REQUEST.increment();
+                    SEGMENT_REQUEST_FAILURE.increment();
+                }
+
+                return Err(SegcacheError::NoFreeSegments);
+            }
+            retries -= 1;
+        }
+    }
+
+    /// Publish a reserved item by swapping the hashtable slot from
+    /// `old_location` to the reserved item's location — the linearization
+    /// point for CAS-style replacement. On success the old item is
+    /// removed from its segment; if the entry no longer maps to
+    /// `old_location`, the reservation is rolled back and `Exists` is
+    /// returned.
+    #[allow(dead_code)] // wired up by the cas() linearization commit
+    fn replace_at(
+        &mut self,
+        key: &[u8],
+        old_location: Location,
+        reserved: ReservedItem,
+    ) -> Result<(), SegcacheError> {
+        let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
+        let (old_seg_id, old_offset) = unpack_location(old_location);
+        let old_seg_id = match NonZeroU32::new(old_seg_id) {
+            Some(id) => id,
+            None => {
+                // invalid old location: roll back the reservation
+                let _ = self.segments.remove_at(
+                    reserved.seg(),
+                    reserved.offset(),
+                    &mut self.ttl_buckets,
+                    &self.hashtable,
+                );
+                return Err(SegcacheError::NotFound);
+            }
+        };
+
+        loop {
+            if self
+                .hashtable
+                .cas_location(key, old_location, new_location, true)
+            {
+                #[cfg(feature = "metrics")]
+                ITEM_REPLACE.increment();
+
+                let _ = self.segments.remove_at(
+                    old_seg_id,
+                    old_offset,
+                    &mut self.ttl_buckets,
+                    &self.hashtable,
+                );
+                return Ok(());
+            }
+
+            if self
+                .hashtable
+                .get_item_frequency(key, old_location)
+                .is_none()
+            {
+                // The entry genuinely no longer maps to old_location
+                // (replaced, relocated, or removed) — roll back.
+                let _ = self.segments.remove_at(
+                    reserved.seg(),
+                    reserved.offset(),
+                    &mut self.ttl_buckets,
+                    &self.hashtable,
+                );
+                return Err(SegcacheError::Exists);
+            }
+
+            // The entry is still at old_location: the exchange failed
+            // spuriously (a concurrent reader bumped the frequency bits
+            // in the packed slot mid-exchange). Unreachable under &mut
+            // today; retry for the concurrent future.
         }
     }
 

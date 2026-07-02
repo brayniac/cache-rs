@@ -24,6 +24,7 @@
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 
+use crate::sync::Ordering;
 use crate::*;
 use core::num::NonZeroU32;
 
@@ -168,36 +169,71 @@ impl TtlBucket {
         cleared
     }
 
-    /// Allocate a new segment and link it as the tail of this bucket.
+    /// Allocate a new segment and link it as the tail of this bucket,
+    /// following crucible's append protocol: seal the old tail (in the
+    /// same CAS that sets its `next` pointer), link the new segment,
+    /// then publish it as the writable Live tail.
     fn try_expand(&mut self, segments: &mut Segments) -> Result<(), TtlBucketsError> {
         let id = segments
             .reserve_free()
             .ok_or(TtlBucketsError::NoFreeSegments)?;
 
-        // Link the new segment after the current tail.
-        if let Some(tail_id) = self.tail {
-            let tail = segments.get_mut(tail_id).unwrap();
-            tail.set_next_seg(Some(id));
+        {
+            let segment = segments.get_mut(id).unwrap();
+            segment.set_ttl(Duration::from_secs(self.ttl as u32));
         }
 
-        let segment = segments.get_mut(id).unwrap();
-        segment.set_prev_seg(self.tail);
-        segment.set_next_seg(None);
-        segment.set_ttl(Duration::from_secs(self.ttl as u32));
+        if let Some(tail_id) = self.tail {
+            // THE SEAL: the old tail stops accepting writes and becomes
+            // evictable at the exact moment its successor exists — one
+            // CAS carries both the state transition and the next pointer.
+            let tail = segments.get_mut(tail_id).unwrap();
+            let sealed = tail.cas_metadata(
+                State::Live,
+                State::Sealed,
+                Some(Some(id)),
+                None,
+                Ordering::AcqRel,
+            );
+            if !sealed {
+                // The tail can be a drained-but-pinned segment left
+                // linked by expire()/clear(); link past it without
+                // sealing. TODO(drain/condemn port): condemned segments
+                // are unlinked immediately, restoring the "tail is Live
+                // or None" invariant — upgrade this to a debug_assert.
+                tail.update_links(Some(Some(id)), None);
+            }
 
-        if self.head.is_none() {
-            debug_assert!(self.tail.is_none());
+            let segment = segments.get_mut(id).unwrap();
+            let linked = segment.cas_metadata(
+                State::Reserved,
+                State::Linking,
+                Some(None),
+                Some(Some(tail_id)),
+                Ordering::AcqRel,
+            );
+            debug_assert!(linked, "freshly reserved segment must be Reserved");
+        } else {
+            debug_assert!(self.head.is_none());
+            let segment = segments.get_mut(id).unwrap();
+            let linked = segment.cas_metadata(
+                State::Reserved,
+                State::Linking,
+                Some(None),
+                Some(None),
+                Ordering::AcqRel,
+            );
+            debug_assert!(linked, "freshly reserved segment must be Reserved");
             self.head = Some(id);
         }
+
         self.tail = Some(id);
         self.nseg += 1;
 
-        debug_assert!(
-            !segment.evictable(),
-            "fresh segment should not be evictable"
-        );
-        segment.set_evictable(true);
-        segment.set_accessible(true);
+        // Publish the new tail as the writable segment.
+        let segment = segments.get_mut(id).unwrap();
+        let live = segment.cas_metadata(State::Linking, State::Live, None, None, Ordering::AcqRel);
+        debug_assert!(live, "linking segment must publish as Live");
         Ok(())
     }
 
@@ -220,11 +256,11 @@ impl TtlBucket {
         loop {
             if let Some(id) = self.tail {
                 if let Ok(segment) = segments.get_mut(id) {
-                    // An inaccessible tail (e.g. drained while pinned by a
-                    // reader) falls through to expansion: a fresh segment
-                    // is linked after it. Spinning here would never make
-                    // the tail accessible again.
-                    if segment.accessible() {
+                    // A non-writable tail (sealed, or drained while pinned
+                    // by a reader) falls through to expansion: a fresh
+                    // segment is linked after it. Spinning here would
+                    // never make the tail writable again.
+                    if segment.state().is_writable() {
                         let offset = segment.write_offset() as usize;
                         if offset + size <= seg_size {
                             let item = segment.alloc_item(size as i32);

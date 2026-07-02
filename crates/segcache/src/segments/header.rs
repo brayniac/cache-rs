@@ -574,13 +574,13 @@ impl SegmentHeader {
         }
     }
 
-    /// Check if the segment can actually be evicted.
-    /// COMPAT: still requires a next segment until the seal protocol
-    /// lands (then: Sealed && ref_count == 0, with the Live tail
-    /// automatically excluded).
+    /// Check if the segment can actually be evicted: Sealed with no
+    /// readers pinning it. The write tail is Live, so it is
+    /// automatically excluded (the seal happens when a successor is
+    /// appended).
     #[inline]
     pub fn can_evict(&self) -> bool {
-        self.evictable() && self.next_seg().is_some() && self.ref_count() == 0
+        self.state().is_evictable() && self.ref_count() == 0
     }
 
     // -- Pool --

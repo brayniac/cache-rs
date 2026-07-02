@@ -151,8 +151,30 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
-    pub fn accessible(&self) -> bool {
-        self.header.accessible()
+    pub fn state(&self) -> State {
+        self.header.state()
+    }
+
+    #[inline]
+    pub fn cas_metadata(
+        &self,
+        expected_state: State,
+        new_state: State,
+        new_next: Option<Option<NonZeroU32>>,
+        new_prev: Option<Option<NonZeroU32>>,
+        success: crate::sync::Ordering,
+    ) -> bool {
+        self.header
+            .cas_metadata(expected_state, new_state, new_next, new_prev, success)
+    }
+
+    #[inline]
+    pub fn update_links(
+        &self,
+        new_next: Option<Option<NonZeroU32>>,
+        new_prev: Option<Option<NonZeroU32>>,
+    ) {
+        self.header.update_links(new_next, new_prev);
     }
 
     #[inline]
@@ -206,18 +228,8 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
-    pub fn set_prev_seg(&self, id: Option<NonZeroU32>) {
-        self.header.set_prev_seg(id);
-    }
-
-    #[inline]
     pub fn next_seg(&self) -> Option<NonZeroU32> {
         self.header.next_seg()
-    }
-
-    #[inline]
-    pub fn set_next_seg(&self, id: Option<NonZeroU32>) {
-        self.header.set_next_seg(id);
     }
 
     #[inline]

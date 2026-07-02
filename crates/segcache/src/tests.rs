@@ -150,12 +150,69 @@ fn numeric_op_item_pins_segment() {
     assert_eq!(cache.segments.free(), segments);
 }
 
+// The seal happens on append: while a segment is the bucket tail it is
+// Live (writable, never evictable); the moment a successor is linked it
+// becomes Sealed (readable, evictable). This replaces the old
+// "has a next segment" eviction guard.
+#[test]
+fn seal_on_append() {
+    let segment_size = 4096;
+    let segments = 8;
+    let heap_size = segments * segment_size as usize;
+    let ttl = Duration::ZERO;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .build()
+        .expect("failed to create cache");
+
+    // fill past one segment so the bucket has at least two
+    let filler = [0xCDu8; 256];
+    for i in 0..30u32 {
+        let key = format!("key_{i}");
+        assert!(cache.insert(key.as_bytes(), &filler[..], None, ttl).is_ok());
+    }
+    assert!(
+        cache.segments.free() <= segments - 2,
+        "need two used segments"
+    );
+
+    // FIFO reservation hands out ids 1, 2, 3, ... in order, so the
+    // highest used id is the current tail and every earlier segment was
+    // sealed when its successor was appended.
+    let used = segments - cache.segments.free();
+    for id in 1..used as u32 {
+        let seg = cache
+            .segments
+            .get_mut(NonZeroU32::new(id).unwrap())
+            .unwrap();
+        assert_eq!(
+            seg.state(),
+            State::Sealed,
+            "predecessor {id} must be sealed"
+        );
+        assert!(seg.can_evict());
+    }
+
+    let tail = cache
+        .segments
+        .get_mut(NonZeroU32::new(used as u32).unwrap())
+        .unwrap();
+    assert_eq!(tail.state(), State::Live);
+    assert!(!tail.can_evict(), "the write tail must never be evictable");
+}
+
 #[test]
 fn can_evict_respects_ref_count() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
     header.set_state(State::Sealed);
-    header.set_next_seg(NonZeroU32::new(2));
     assert!(header.can_evict());
+
+    // only Sealed is evictable — the Live tail never is
+    header.set_state(State::Live);
+    assert!(!header.can_evict());
+    header.set_state(State::Sealed);
 
     assert!(header.try_acquire_reader());
     assert!(!header.can_evict());

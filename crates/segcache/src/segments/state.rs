@@ -109,16 +109,12 @@ impl State {
 
     /// Check if the segment is writable (allows append operations).
     #[inline]
-    // TODO(state-machine port): wired up in the append/drain commits
-    #[allow(dead_code)]
     pub fn is_writable(self) -> bool {
         matches!(self, State::Live)
     }
 
     /// Check if the segment can be evicted.
     #[inline]
-    // TODO(state-machine port): wired up in the append/drain commits
-    #[allow(dead_code)]
     pub fn is_evictable(self) -> bool {
         matches!(self, State::Sealed)
     }

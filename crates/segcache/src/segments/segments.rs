@@ -312,17 +312,35 @@ impl Segments {
         }
     }
 
-    /// Push a segment onto the front of a chain.
-    fn push_front(&mut self, this: NonZeroU32, head: Option<NonZeroU32>) {
+    /// Link a Reserved segment at the front of a chain and publish it as
+    /// Sealed (readable + evictable, never the write tail): Reserved ->
+    /// Linking carries the next pointer, the old head's prev is patched,
+    /// then Linking -> Sealed publishes.
+    fn link_at_head(&mut self, this: NonZeroU32, head: Option<NonZeroU32>) {
         let this_idx = this.get() as usize - 1;
-        self.headers[this_idx].set_next_seg(head);
-        self.headers[this_idx].set_prev_seg(None);
+        let linking = self.headers[this_idx].cas_metadata(
+            State::Reserved,
+            State::Linking,
+            Some(head),
+            Some(None),
+            Ordering::AcqRel,
+        );
+        debug_assert!(linking, "head insert requires a Reserved segment");
 
         if let Some(head_id) = head {
             let head_idx = head_id.get() as usize - 1;
             debug_assert!(self.headers[head_idx].prev_seg().is_none());
-            self.headers[head_idx].set_prev_seg(Some(this));
+            self.headers[head_idx].update_links(None, Some(Some(this)));
         }
+
+        let sealed = self.headers[this_idx].cas_metadata(
+            State::Linking,
+            State::Sealed,
+            None,
+            None,
+            Ordering::AcqRel,
+        );
+        debug_assert!(sealed, "linking segment must publish as Sealed");
     }
 
     // ── Free queue ───────────────────────────────────────────────────
@@ -1014,14 +1032,15 @@ impl Segments {
 
             let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
-            self.headers[tid.get() as usize - 1].set_accessible(true);
-            self.headers[tid.get() as usize - 1].set_evictable(true);
-
-            // Link target into the TTL bucket.
+            // Link the target at the head of the TTL bucket, then publish
+            // it as Sealed: the target is readable and evictable
+            // immediately, but is never the write tail, so it must not
+            // pass through Live (Live == the bucket tail reserve()
+            // writes into).
             let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
             let old_head = ttl_bucket.head();
+            self.link_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
-            self.push_front(tid, old_head);
 
             self.s3fifo_promote_from(seg_id, tid, hashtable);
         }
@@ -1177,13 +1196,11 @@ impl Segments {
 
             let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
-            self.headers[tid.get() as usize - 1].set_accessible(true);
-            self.headers[tid.get() as usize - 1].set_evictable(true);
-
+            // Head insert + publish as Sealed (see s3fifo_evict_admission).
             let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
             let old_head = ttl_bucket.head();
+            self.link_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
-            self.push_front(tid, old_head);
 
             // Copy freq > 0 items (same promote logic, but no ghost).
             self.s3fifo_promote_from(seg_id, tid, hashtable);

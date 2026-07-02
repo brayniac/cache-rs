@@ -390,11 +390,19 @@ impl Segcache {
     /// // And the expired item is not in the cache
     /// assert!(cache.get(b"coffee").is_none());
     /// ```
+    /// Returns the number of segments actually freed. Segments pinned by
+    /// outstanding [`Item`]s are drained from the hashtable but not freed
+    /// (and not counted) until a later pass runs after the pins drop.
     pub fn expire(&mut self) -> usize {
         self.time = Instant::now();
         self.ttl_buckets.expire(&self.hashtable, &mut self.segments)
     }
 
+    /// Clear the cache, draining every segment from the hashtable.
+    ///
+    /// Returns the number of segments actually freed. Segments pinned by
+    /// outstanding [`Item`]s are drained but not freed (and not counted)
+    /// until a later pass runs after the pins drop.
     pub fn clear(&mut self) -> usize {
         self.time = Instant::now();
         self.ttl_buckets.clear(&self.hashtable, &mut self.segments)

@@ -15,6 +15,11 @@ use memmap2::MmapOptions;
 /// subslice of bytes from a contiguous anonymous mmap allocation.
 pub(crate) struct Segments {
     /// Segment metadata headers (one per segment, cache-line aligned).
+    ///
+    /// STABILITY: allocated once in `from_builder` and never reassigned
+    /// or resized. `SegmentGuard` (and `RawItem` for the data mmap
+    /// below) hold raw pointers into this allocation, valid because a
+    /// boxed slice's heap storage is stable even if `Segments` moves.
     headers: Box<[SegmentHeader]>,
     /// Anonymous mmap-backed heap for segment data.
     data: memmap2::MmapMut,

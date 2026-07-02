@@ -212,6 +212,14 @@ impl SegmentHeader {
             return false;
         }
 
+        // `Acquire` on the increment (not `Relaxed`) is load-bearing: it
+        // prevents the state re-check below from being reordered before
+        // the increment. With a relaxed RMW, the re-check load could be
+        // satisfied before the pin is visible, letting a concurrent
+        // writer observe ref_count == 0 after we validated the state —
+        // both sides would proceed. (The writer half of the handoff —
+        // transitioning state before checking the count — arrives with
+        // the state-machine port; see the invariant note above.)
         self.ref_count.fetch_add(1, Ordering::Acquire);
 
         // Re-check after the increment: a writer that observed
@@ -364,6 +372,16 @@ impl SegmentHeader {
     }
 
     // -- State --
+    //
+    // INVARIANT: state transitions are plain stores, not CAS. This is
+    // sound only because every caller holds `&mut Segments` (directly or
+    // through a `Segment<'_>` view obtained from `Segments::get_mut`),
+    // so writers are serialized by Rust's exclusivity — the two-phase
+    // reader protocol in `try_acquire_reader` races only against one
+    // writer at a time. Before segments gain concurrent writers (the
+    // planned state-machine port), these stores must become CAS
+    // transitions that check the reader count (e.g. Active -> Draining
+    // only if ref_count == 0), as crucible does.
 
     #[inline]
     pub fn state(&self) -> SegmentState {

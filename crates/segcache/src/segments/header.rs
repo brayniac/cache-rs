@@ -98,12 +98,18 @@ const _: () = assert!(std::mem::size_of::<SegmentHeader>() == 64);
 const _: () = assert!(std::mem::align_of::<SegmentHeader>() == 64);
 
 impl SegmentHeader {
-    /// Create a new header for the given segment id.
+    /// Create a new header for the given segment id. Write statistics
+    /// start at the integrity-aware initial offset, matching `init()`.
     pub fn new(id: NonZeroU32) -> Self {
+        let initial_offset = if cfg!(feature = "integrity") {
+            std::mem::size_of::<u64>() as i32
+        } else {
+            0
+        };
         Self {
             id: id.get(),
-            write_offset: AtomicI32::new(0),
-            live_bytes: AtomicI32::new(0),
+            write_offset: AtomicI32::new(initial_offset),
+            live_bytes: AtomicI32::new(initial_offset),
             live_items: AtomicI32::new(0),
             create_at: AtomicInstant::new(Instant::default()),
             merge_at: AtomicInstant::new(Instant::default()),
@@ -343,11 +349,11 @@ impl SegmentHeader {
         true
     }
 
-    /// Release a reader pin taken with [`Self::try_acquire_reader`].
-    ///
-    /// This is the plain path used when the pin never left the cache's
-    /// own call frame; `SegmentGuard::drop` uses the SeqCst decrement
-    /// path with the AwaitingRelease handoff instead.
+    /// Release a reader pin taken with [`Self::try_acquire_reader`]
+    /// without the AwaitingRelease handoff. Production pins always ride
+    /// in a `SegmentGuard` (whose drop uses the SeqCst path); this plain
+    /// path serves the acquire-failure backout and tests.
+    #[cfg(test)]
     #[inline]
     pub fn release_reader(&self) {
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
@@ -512,8 +518,8 @@ impl SegmentHeader {
         self.metadata(Ordering::Acquire).state
     }
 
-    /// COMPAT SHIM (removal planned with the drain/condemn port): store a
-    /// state while preserving the chain links.
+    /// Test-only helper: store a state while preserving the chain links.
+    #[cfg(test)]
     pub fn set_state(&self, state: State) {
         let mut current = self.metadata.load(Ordering::Acquire);
         loop {
@@ -528,49 +534,6 @@ impl SegmentHeader {
                 Ok(_) => return,
                 Err(observed) => current = observed,
             }
-        }
-    }
-
-    /// COMPAT SHIM: true if readable. Old Filling maps to Live, old
-    /// Active maps to Sealed; both were "accessible".
-    #[inline]
-    pub fn accessible(&self) -> bool {
-        matches!(self.state(), State::Live | State::Sealed)
-    }
-
-    /// COMPAT SHIM: old set_accessible mapped onto the new states
-    /// (Filling -> Live, Active -> Sealed).
-    #[inline]
-    pub fn set_accessible(&self, accessible: bool) {
-        let state = self.state();
-        if accessible {
-            if matches!(state, State::Free | State::Reserved | State::Draining) {
-                self.set_state(State::Live);
-            }
-        } else if state != State::Free {
-            self.set_state(State::Draining);
-        }
-    }
-
-    /// COMPAT SHIM: true if evictable (old Active == new Sealed).
-    #[inline]
-    pub fn evictable(&self) -> bool {
-        self.state() == State::Sealed
-    }
-
-    /// COMPAT SHIM: old set_evictable mapped onto the new states.
-    #[inline]
-    pub fn set_evictable(&self, evictable: bool) {
-        if evictable {
-            let state = self.state();
-            if matches!(state, State::Free | State::Reserved | State::Draining) {
-                self.set_state(State::Live);
-            }
-            if self.state() == State::Live {
-                self.set_state(State::Sealed);
-            }
-        } else if self.state() == State::Sealed {
-            self.set_state(State::Live);
         }
     }
 
@@ -652,7 +615,7 @@ mod loom_tests {
                 let h = Arc::clone(&header);
                 thread::spawn(move || {
                     // mirrors can_evict() + drain in production
-                    if h.ref_count() == 0 && h.evictable() {
+                    if h.ref_count() == 0 && h.state().is_evictable() {
                         h.set_state(State::Draining);
                     }
                 })

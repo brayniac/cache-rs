@@ -156,6 +156,11 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
+    pub fn header_metadata(&self) -> crate::segments::state::Metadata {
+        self.header.metadata(crate::sync::Ordering::Acquire)
+    }
+
+    #[inline]
     pub fn cas_metadata(
         &self,
         expected_state: State,
@@ -178,28 +183,13 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
-    pub fn set_accessible(&self, accessible: bool) {
-        self.header.set_accessible(accessible);
-    }
-
-    #[inline]
-    pub fn evictable(&self) -> bool {
-        self.header.evictable()
-    }
-
-    #[inline]
-    pub fn set_evictable(&self, evictable: bool) {
-        self.header.set_evictable(evictable);
-    }
-
-    #[inline]
     pub fn can_evict(&self) -> bool {
         self.header.can_evict()
     }
 
     #[inline]
-    pub fn ref_count(&self) -> u32 {
-        self.header.ref_count()
+    pub fn header_ref_count_seqcst(&self) -> u32 {
+        self.header.ref_count_seqcst()
     }
 
     #[inline]
@@ -220,11 +210,6 @@ impl<'a> Segment<'a> {
     #[inline]
     pub fn mark_merged(&self) {
         self.header.mark_merged();
-    }
-
-    #[inline]
-    pub fn prev_seg(&self) -> Option<NonZeroU32> {
-        self.header.prev_seg()
     }
 
     #[inline]
@@ -538,8 +523,11 @@ impl<'a> Segment<'a> {
 
     /// Clear all items from the segment, unlinking them from the hashtable.
     pub(crate) fn clear(&mut self, hashtable: &MultiChoiceHashtable, expire: bool) {
-        self.set_accessible(false);
-        self.set_evictable(false);
+        debug_assert_eq!(
+            self.state(),
+            State::Draining,
+            "callers own the Draining transition before clearing"
+        );
 
         let max_offset = self.max_item_offset();
         let mut offset = if cfg!(feature = "integrity") {

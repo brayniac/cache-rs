@@ -6,14 +6,21 @@ use crate::segments::SegmentHeader;
 ///
 /// While a `SegmentGuard` is alive, the pinned segment cannot be
 /// recycled, merged, or compacted — eviction, expiration, and clear all
-/// skip segments with a non-zero reader count. The guard is released on
-/// drop.
+/// skip segments with a non-zero reader count, condemning them to
+/// AwaitingRelease instead of freeing them.
 ///
-/// Holds a raw pointer rather than a borrow so that the guard (and the
+/// The guard completes that handoff: when the LAST pin drops on a
+/// condemned segment, the guard's drop transitions it AwaitingRelease ->
+/// Free and returns it to the free queue directly — no `&mut Segments`
+/// pass required. The transition CAS guarantees exactly-one-free between
+/// a racing last-guard drop and the condemner's recheck.
+///
+/// Holds raw pointers rather than borrows so that the guard (and the
 /// [`crate::Item`] carrying it) is not lifetime-tied to the cache; this
 /// is the same contract `RawItem` already has with the segment data.
 pub(crate) struct SegmentGuard {
     header: *const SegmentHeader,
+    free_queue: *const crossbeam_deque::Injector<u32>,
 }
 
 impl SegmentGuard {
@@ -23,17 +30,42 @@ impl SegmentGuard {
     ///
     /// - `SegmentHeader::try_acquire_reader` must have returned `true`
     ///   on `header`, and ownership of that pin transfers to this guard.
-    /// - `header` must point into the `Segments` headers allocation,
-    ///   which must outlive the guard.
-    pub(crate) unsafe fn new(header: *const SegmentHeader) -> Self {
-        Self { header }
+    /// - `header` must point into the `Segments` headers allocation and
+    ///   `free_queue` at the `Segments`-owned boxed Injector; both must
+    ///   outlive the guard.
+    pub(crate) unsafe fn new(
+        header: *const SegmentHeader,
+        free_queue: *const crossbeam_deque::Injector<u32>,
+    ) -> Self {
+        Self { header, free_queue }
     }
 }
 
 impl Drop for SegmentGuard {
     fn drop(&mut self) {
-        // SAFETY: per the constructor contract, the header outlives the
-        // guard and holds a pin we own.
-        unsafe { (*self.header).release_reader() }
+        // SAFETY: per the constructor contract, the header and the free
+        // queue outlive the guard, and the guard owns one pin.
+        let header = unsafe { &*self.header };
+
+        // SeqCst decrement: the release-side Dekker pair. The condemner
+        // CASes to AwaitingRelease (SeqCst) and then re-reads ref_count;
+        // we decrement and then read the state. Weaker orderings permit
+        // the interleaving where both sides see the other's old value —
+        // the condemner sees a pin and defers, we see a not-yet-condemned
+        // state and walk away, and the segment leaks.
+        let prev = header.release_reader_for_guard();
+
+        if prev == 1 && header.try_release_condemned() {
+            // We were the last reader of a condemned segment and won the
+            // AwaitingRelease -> Free transition: return it to the free
+            // queue ourselves.
+            unsafe { (*self.free_queue).push(header.id().get()) };
+
+            #[cfg(feature = "metrics")]
+            {
+                crate::SEGMENT_RETURN.increment();
+                crate::SEGMENT_FREE.increment();
+            }
+        }
     }
 }

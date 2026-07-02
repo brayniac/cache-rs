@@ -150,7 +150,7 @@ fn numeric_op_item_pins_segment() {
 #[test]
 fn can_evict_respects_ref_count() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
-    header.set_state(SegmentState::Active);
+    header.set_state(State::Sealed);
     header.set_next_seg(NonZeroU32::new(2));
     assert!(header.can_evict());
 
@@ -166,7 +166,7 @@ fn reader_pin_acquire_release() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
 
     // acquisition succeeds in readable states and counts pins
-    header.set_state(SegmentState::Filling);
+    header.set_state(State::Live);
     assert!(header.try_acquire_reader());
     assert!(header.try_acquire_reader());
     assert_eq!(header.ref_count(), 2);
@@ -176,11 +176,11 @@ fn reader_pin_acquire_release() {
     assert_eq!(header.ref_count(), 0);
 
     // acquisition fails in non-readable states and leaves no pin
-    header.set_state(SegmentState::Draining);
+    header.set_state(State::Draining);
     assert!(!header.try_acquire_reader());
     assert_eq!(header.ref_count(), 0);
 
-    header.set_state(SegmentState::Free);
+    header.set_state(State::Free);
     assert!(!header.try_acquire_reader());
     assert_eq!(header.ref_count(), 0);
 }

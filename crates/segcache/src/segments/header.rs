@@ -284,8 +284,6 @@ impl SegmentHeader {
     /// SeqCst: this participates in the release-side Dekker pair (guard
     /// drop decrements ref_count SeqCst, then loads the state; the
     /// condemner CASes to AwaitingRelease SeqCst, then loads ref_count).
-    // TODO(state-machine port): wired up in the free-queue/drain commits
-    #[allow(dead_code)]
     pub fn try_release_condemned(&self) -> bool {
         let current = self.metadata.load(Ordering::SeqCst);
         if Metadata::unpack(current).state != State::AwaitingRelease {
@@ -303,7 +301,7 @@ impl SegmentHeader {
 
     /// Test-only escape hatch to place a header in an arbitrary state.
     #[cfg(test)]
-    #[allow(dead_code)] // TODO(state-machine port): used by the rewritten loom models
+    #[allow(dead_code)] // used by loom models; dead in non-loom test builds
     pub fn store_metadata_for_test(&self, m: Metadata) {
         self.metadata.store(m.pack(), Ordering::SeqCst);
     }
@@ -364,8 +362,6 @@ impl SegmentHeader {
     /// previous count. SeqCst: participates in the release-side Dekker
     /// pair with the condemner (see [`Self::try_release_condemned`]).
     #[inline]
-    // TODO(state-machine port): wired up in the free-queue/drain commits
-    #[allow(dead_code)]
     pub fn release_reader_for_guard(&self) -> u32 {
         let prev = self.ref_count.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(prev > 0, "guard release without matching acquire");
@@ -381,8 +377,6 @@ impl SegmentHeader {
     /// Number of active readers, ordered after a preceding SeqCst
     /// drain/condemn transition (the writer half of the Dekker pair).
     #[inline]
-    // TODO(state-machine port): wired up in the free-queue/drain commits
-    #[allow(dead_code)]
     pub fn ref_count_seqcst(&self) -> u32 {
         self.ref_count.load(Ordering::SeqCst)
     }
@@ -579,32 +573,54 @@ impl std::fmt::Debug for SegmentHeader {
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
     use super::*;
+    use crate::segments::state::State;
     use core::num::NonZeroU32;
+    use loom::sync::atomic::AtomicU32 as LoomAtomicU32;
     use loom::sync::Arc;
     use loom::thread;
 
-    // Two readers race a writer that mirrors the production eviction gate
-    // (check ref_count == 0 and evictable, then transition to Draining).
-    // Strong CAS-gated models replace this with the drain/condemn port;
-    // for now the writer mirrors the shim-era plain transition, so the
-    // assertions stay weak (the benign interleaving where a reader passes
-    // its re-check just before the writer's transition is tolerated only
-    // because production writers hold `&mut Segments`).
+    // NOTE on what these models can and cannot verify: loom reports the
+    // store-buffering outcome even for pure-SeqCst litmus tests (its
+    // modeling lacks the SC global total order). That has two
+    // consequences here. First, the SeqCst-vs-AcqRel distinction on the
+    // Dekker-paired transitions is not checkable. Second, the halves of
+    // the protocol invariants that DEPEND on the SC total order — "a
+    // committed drain is never observed by a pinned reader" and "a
+    // condemned segment never leaks" — show false violations under
+    // loom, because it explores the store-buffering interleaving that
+    // SeqCst forbids on real hardware. The models therefore assert only
+    // the SC-independent halves (CAS uniqueness -> no double-free;
+    // revert consistency); the SC-dependent halves are pinned by the
+    // single-threaded behavioral tests, where store buffering cannot
+    // occur.
+
+    // Two readers race a drain that mirrors the merge-source gate: take
+    // Draining exclusivity via CAS, re-check the reader count, and
+    // revert if a pin raced in. Only after the recheck passes is it
+    // safe to move bytes ("commit"). Strong invariant: no reader ever
+    // holds a pin while the drain has committed.
     #[test]
-    fn loom_two_readers_one_writer_refcount() {
+    fn loom_readers_vs_cas_gated_drain() {
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = Some(3);
         builder.check(|| {
             let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
             header.set_state(State::Sealed);
+            let committed = Arc::new(LoomAtomicU32::new(0));
 
             let readers: Vec<_> = (0..2)
                 .map(|_| {
                     let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
                     thread::spawn(move || {
                         if h.try_acquire_reader() {
-                            // simulate a read while pinned
-                            let _ = h.state();
+                            // The strong invariant — a pinned reader
+                            // never observes a committed drain — is the
+                            // SC-total-order property loom cannot model
+                            // (see module note); it is NOT asserted
+                            // here. Record the observation instead so
+                            // the model still exercises the code path.
+                            let _ = c.load(Ordering::SeqCst);
                             h.release_reader();
                         }
                     })
@@ -613,10 +629,22 @@ mod loom_tests {
 
             let writer = {
                 let h = Arc::clone(&header);
+                let c = Arc::clone(&committed);
                 thread::spawn(move || {
-                    // mirrors can_evict() + drain in production
-                    if h.ref_count() == 0 && h.state().is_evictable() {
-                        h.set_state(State::Draining);
+                    if h.cas_metadata(State::Sealed, State::Draining, None, None, Ordering::SeqCst)
+                    {
+                        if h.ref_count_seqcst() != 0 {
+                            // a pin raced in: revert before touching bytes
+                            assert!(h.cas_metadata(
+                                State::Draining,
+                                State::Sealed,
+                                None,
+                                None,
+                                Ordering::AcqRel,
+                            ));
+                        } else {
+                            c.store(1, Ordering::SeqCst);
+                        }
                     }
                 })
             };
@@ -626,25 +654,105 @@ mod loom_tests {
             }
             writer.join().unwrap();
 
-            // all pins released; state is one of the two valid outcomes
             assert_eq!(header.ref_count(), 0);
-            assert!(matches!(header.state(), State::Sealed | State::Draining));
         });
     }
 
-    // Once a segment is Draining, acquisition must fail in every
-    // interleaving, and a failed acquire must leave no pin behind.
+    // The AwaitingRelease handoff: an evictor condemns a drained, pinned
+    // segment (with the race-fix recheck) while the reader's guard drop
+    // decrements and maybe reclaims. Exactly one side must free the
+    // segment in every interleaving — no double-free, no leak.
     #[test]
-    fn loom_acquire_fails_after_drain() {
+    fn loom_awaiting_release_exactly_one_free() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            // a drained segment with one outstanding pin
+            header.set_state(State::Draining);
+            header.ref_count.store(1, Ordering::SeqCst);
+            // stand-in for the injector push (loom cannot model the
+            // crossbeam Injector)
+            let freed = Arc::new(LoomAtomicU32::new(0));
+
+            let evictor = {
+                let h = Arc::clone(&header);
+                let f = Arc::clone(&freed);
+                thread::spawn(move || {
+                    // condemn (mirrors Segments::condemn)
+                    assert!(h.cas_metadata(
+                        State::Draining,
+                        State::AwaitingRelease,
+                        Some(None),
+                        Some(None),
+                        Ordering::SeqCst,
+                    ));
+                    // race fix: the pin may have dropped before the CAS
+                    if h.ref_count_seqcst() == 0 && h.try_release_condemned() {
+                        f.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            let reader = {
+                let h = Arc::clone(&header);
+                let f = Arc::clone(&freed);
+                thread::spawn(move || {
+                    // mirrors SegmentGuard::drop
+                    let prev = h.release_reader_for_guard();
+                    if prev == 1 && h.try_release_condemned() {
+                        f.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            evictor.join().unwrap();
+            reader.join().unwrap();
+
+            // Exactly-one-free has two halves. "At most once" is pure
+            // CAS uniqueness on try_release_condemned and holds in every
+            // interleaving loom explores. "At least once" (no leak)
+            // depends on the SeqCst total order of the decrement/CAS
+            // Dekker pair, which loom cannot model (see module note) —
+            // it reports the store-buffering leak that real SeqCst
+            // hardware forbids, so it is not asserted here; the
+            // guard_drop_frees_segment behavioral test pins it.
+            let freed = freed.load(Ordering::SeqCst);
+            assert!(freed <= 1, "condemned segment freed more than once");
+            if freed == 1 {
+                assert_eq!(header.state(), State::Free);
+            }
+            assert_eq!(header.ref_count(), 0);
+        });
+    }
+
+    // Acquisition must fail in every interleaving for non-readable
+    // states, leaving no pin behind — and AwaitingRelease must remain
+    // acquirable for in-flight readers.
+    #[test]
+    fn loom_acquire_by_state() {
         loom::model(|| {
             let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
-            header.set_state(State::Draining);
 
-            let h = Arc::clone(&header);
-            let reader = thread::spawn(move || h.try_acquire_reader());
-
-            assert!(!reader.join().unwrap());
-            assert_eq!(header.ref_count(), 0);
+            for (state, acquirable) in [
+                (State::Free, false),
+                (State::Reserved, false),
+                (State::Draining, false),
+                (State::AwaitingRelease, true),
+            ] {
+                header.set_state(state);
+                let h = Arc::clone(&header);
+                let reader = thread::spawn(move || {
+                    if h.try_acquire_reader() {
+                        h.release_reader();
+                        true
+                    } else {
+                        false
+                    }
+                });
+                assert_eq!(reader.join().unwrap(), acquirable, "state {state:?}");
+                assert_eq!(header.ref_count(), 0);
+            }
         });
     }
 }

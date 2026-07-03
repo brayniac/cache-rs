@@ -71,6 +71,18 @@ impl CasToken {
     }
 }
 
+/// Fold a numeric item's seqlock version into its CAS token.
+///
+/// The multiplicative spread (odd constant, bijective over u64) keeps
+/// distinct versions from colliding on low bits; the same (location,
+/// generation, version) triple always produces the same token, and any
+/// in-place update changes the version — so tokens observe increments,
+/// matching memcached's do_add_delta assigning a fresh cas unique.
+#[inline]
+pub(crate) fn mix_version(raw: u64, version: u64) -> u64 {
+    raw ^ version.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 impl fmt::Debug for CasToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

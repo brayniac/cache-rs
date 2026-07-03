@@ -194,8 +194,10 @@ impl Segcache {
         optional: &[u8],
         ttl: Duration,
     ) -> Result<ReservedItem, SegcacheError> {
-        // calculate size for item
-        let size = (((ITEM_HDR_SIZE + key.len() + size_of(&value) + optional.len()) >> 3) + 1) << 3;
+        // calculate size for item (numeric items carry an alignment pad
+        // and a seqlock version word — reservation and the segment scan
+        // must agree, so both use keyvalue's item_size)
+        let size = keyvalue::item_size(key.len(), &value, optional.len());
 
         // For S3-FIFO: determine target pool based on ghost queue
         let target_pool = if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. }) {

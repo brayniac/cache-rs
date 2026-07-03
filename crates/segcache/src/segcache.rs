@@ -360,16 +360,12 @@ impl Segcache {
     /// The zero check below is defensive (linked segments always carry a
     /// bucket TTL >= 1s).
     fn remaining_ttl(&mut self, seg_id: NonZeroU32) -> Result<Duration, SegcacheError> {
-        let segment = self
-            .segments
-            .get_mut(seg_id)
-            .map_err(|_| SegcacheError::NotFound)?;
-        let ttl = segment.ttl();
+        let (create_at, ttl) = self.segments.expiry_info(seg_id);
         if ttl.as_secs() == 0 {
             return Ok(Duration::from_secs(0));
         }
         let now = Instant::now();
-        let expires_at = segment.create_at() + ttl;
+        let expires_at = create_at + ttl;
         if expires_at <= now {
             return Err(SegcacheError::NotFound);
         }
@@ -556,10 +552,11 @@ impl Segcache {
     /// preserved: the rewrite reserves with the REMAINING TTL, matching
     /// memcached's exptime preservation, so incrementing a counter never
     /// extends its deadline (rate-limiter windows still reset). An
-    /// already-expired counter returns `NotFound`. The returned [`Item`]
-    /// is a fresh pin at the new location; previously held `Item`s keep
-    /// reading the old value at their pinned location.
-    pub fn wrapping_add(&mut self, key: &[u8], rhs: u64) -> Result<Item, SegcacheError> {
+    /// already-expired counter returns `NotFound`.
+    ///
+    /// Returns the new value, as memcached's incr does. Previously held
+    /// `Item`s keep reading the old value at their pinned location.
+    pub fn wrapping_add(&mut self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
         self.numeric_update(key, |v| v.wrapping_add(rhs))
     }
 
@@ -568,7 +565,8 @@ impl Segcache {
     /// the stored value is not a numeric type.
     ///
     /// See [`Self::wrapping_add`] for the update and CAS-token semantics.
-    pub fn saturating_sub(&mut self, key: &[u8], rhs: u64) -> Result<Item, SegcacheError> {
+    /// Returns the new value.
+    pub fn saturating_sub(&mut self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
         self.numeric_update(key, |v| v.saturating_sub(rhs))
     }
 
@@ -581,11 +579,15 @@ impl Segcache {
     /// where this operation's own reservation evicts the source key in a
     /// tiny cache — retries from the lookup, surfacing `NotFound` if the
     /// key is gone.
+    ///
+    /// Returns the value this call published — the value at the
+    /// operation's linearization point, which under concurrency may
+    /// differ from what a subsequent read observes.
     fn numeric_update(
         &mut self,
         key: &[u8],
         op: impl Fn(u64) -> u64,
-    ) -> Result<Item, SegcacheError> {
+    ) -> Result<u64, SegcacheError> {
         loop {
             let verifier = self.verifier();
             let (location, _freq) = self
@@ -623,20 +625,9 @@ impl Segcache {
             // location.
             let reserved =
                 self.reserve_and_define(key, Value::U64(new_value), &opt_buf[..olen], seg_ttl)?;
-            let new_seg = reserved.seg();
-            let new_offset = reserved.offset();
 
             match self.replace_at(key, location, reserved) {
-                Ok(()) => {
-                    let new_location = pack_location(new_seg, new_offset as u64);
-                    let (raw, guard) = self
-                        .segments
-                        .acquire_item_at(new_seg, new_offset)
-                        .ok_or(SegcacheError::NotFound)?;
-                    let cas =
-                        CasToken::new(new_location, self.segments.generation(new_seg)).as_raw();
-                    return Ok(Item::new(raw, cas, guard));
-                }
+                Ok(()) => return Ok(new_value),
                 // The key moved between the read and the publish (under
                 // &mut only via this operation's own eviction) — retry.
                 Err(SegcacheError::Exists) => continue,

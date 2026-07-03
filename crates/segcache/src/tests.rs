@@ -124,10 +124,11 @@ fn pinned_segment_survives_clear() {
     assert_eq!(cache.segments.free(), segments);
 }
 
-// wrapping_add returns an Item that pins its segment like any other;
-// dropping it releases the pin.
+// A held Item pins its segment even after the key it exposes has been
+// logically replaced by an increment: the old copy is removed from the
+// hashtable, but the pinned bytes stay readable until the guard drops.
 #[test]
-fn numeric_op_item_pins_segment() {
+fn held_item_survives_numeric_republish() {
     let segment_size = 4096;
     let segments = 64;
     let heap_size = segments * segment_size as usize;
@@ -141,16 +142,19 @@ fn numeric_op_item_pins_segment() {
 
     assert!(cache.insert(b"n", 0, None, ttl).is_ok());
 
-    // temporary result: guard released at end of statement
-    assert!(cache.wrapping_add(b"n", 1).is_ok());
+    let held = cache.get(b"n").unwrap();
+    assert_eq!(held.value(), 0);
 
-    // held result: pins the segment across clear()
-    let held = cache.wrapping_add(b"n", 1).unwrap();
+    // increments republish; the held pin keeps the old bytes stable
+    assert_eq!(cache.wrapping_add(b"n", 1).unwrap(), 1);
+    assert_eq!(cache.wrapping_add(b"n", 1).unwrap(), 2);
+    assert_eq!(held.value(), 0);
+
+    // and the pinned segment cannot be reclaimed while held
     cache.clear();
     assert_eq!(cache.segments.free(), segments - 1);
-    assert_eq!(held.value(), 2);
+    assert_eq!(held.value(), 0);
 
-    // guard drop frees the condemned segment directly
     drop(held);
     assert_eq!(cache.segments.free(), segments);
 }
@@ -331,9 +335,9 @@ fn incr_bumps_cas_token() {
     assert!(cache.insert(b"counter", 5, None, ttl).is_ok());
     let stale = cache.get(b"counter").unwrap().cas();
 
-    let updated = cache.wrapping_add(b"counter", 1).unwrap();
-    assert_ne!(updated.cas(), stale, "increment must bump the CAS token");
-    drop(updated);
+    assert_eq!(cache.wrapping_add(b"counter", 1).unwrap(), 6);
+    let fresh_token = cache.get(b"counter").unwrap().cas();
+    assert_ne!(fresh_token, stale, "increment must bump the CAS token");
 
     // the pre-increment token must not match anymore
     assert_eq!(
@@ -384,10 +388,11 @@ fn numeric_update_preserves_expiry_and_optional() {
     // than the full TTL
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    let updated = cache.wrapping_add(b"counter", 1).unwrap();
-    assert_eq!(updated.value(), 8);
-    assert_eq!(updated.optional(), Some(&b"flags"[..]));
-    drop(updated);
+    assert_eq!(cache.wrapping_add(b"counter", 1).unwrap(), 8);
+    let item = cache.get(b"counter").unwrap();
+    assert_eq!(item.value(), 8);
+    assert_eq!(item.optional(), Some(&b"flags"[..]));
+    drop(item);
 
     let new_expiry = expiry_of(&mut cache, b"counter");
 
@@ -435,7 +440,7 @@ fn numeric_update_keeps_max_ttl_bucket() {
     assert!(cache.insert(b"counter", 1, None, Duration::ZERO).is_ok());
     let before = seg_ttl_of(&mut cache, b"counter");
 
-    assert_eq!(cache.wrapping_add(b"counter", 1).unwrap().value(), 2);
+    assert_eq!(cache.wrapping_add(b"counter", 1).unwrap(), 2);
 
     let after = seg_ttl_of(&mut cache, b"counter");
     assert_eq!(
@@ -482,7 +487,7 @@ fn try_into_numeric_arms() {
     assert_eq!(cache.try_into_numeric(b"fresh", 42, ttl), Ok(()));
     assert_eq!(cache.get(b"fresh").unwrap().value(), 42);
     // and it is incrementable
-    assert_eq!(cache.wrapping_add(b"fresh", 1).unwrap().value(), 43);
+    assert_eq!(cache.wrapping_add(b"fresh", 1).unwrap(), 43);
 
     // arm 2: existing numeric -> no-op (value and token untouched)
     let before = cache.get(b"fresh").unwrap().cas();
@@ -527,7 +532,7 @@ fn try_into_numeric_arms() {
     };
     assert_eq!(new_bucket_ttl, old_bucket_ttl);
     // converted key is incrementable
-    assert_eq!(cache.wrapping_add(b"ascii", 2).unwrap().value(), 125);
+    assert_eq!(cache.wrapping_add(b"ascii", 2).unwrap(), 125);
 
     // arm 4: non-numeric bytes -> NotNumeric, item untouched
     assert!(cache.insert(b"text", b"not a number", None, ttl).is_ok());
@@ -1060,30 +1065,27 @@ fn wrapping_add() {
     let updated = cache
         .wrapping_add(b"coffee", 1)
         .expect("failed to increment");
-    assert_eq!(updated.value(), 1, "item is: {updated:?}");
+    assert_eq!(updated, 1, "item is: {updated:?}");
 
     // a previously held Item keeps reading the OLD value at its pinned
     // location — updates are new items, not in-place mutation
     assert_eq!(item.value(), 0, "item is: {item:?}");
     drop(item);
-    drop(updated);
 
     let updated = cache
         .wrapping_add(b"coffee", u64::MAX - 1)
         .expect("failed to increment");
-    assert_eq!(updated.value(), u64::MAX, "item is: {updated:?}");
-    drop(updated);
+    assert_eq!(updated, u64::MAX, "item is: {updated:?}");
 
     let updated = cache
         .wrapping_add(b"coffee", 1)
         .expect("failed to increment");
-    assert_eq!(updated.value(), 0, "item is: {updated:?}");
-    drop(updated);
+    assert_eq!(updated, 0, "item is: {updated:?}");
 
     let updated = cache
         .wrapping_add(b"coffee", 2)
         .expect("failed to increment");
-    assert_eq!(updated.value(), 2, "item is: {updated:?}");
+    assert_eq!(updated, 2, "item is: {updated:?}");
 
     // the store agrees with the returned item
     assert_eq!(cache.get(b"coffee").unwrap().value(), 2);
@@ -1115,20 +1117,18 @@ fn saturating_sub() {
     let updated = cache
         .saturating_sub(b"coffee", 2)
         .expect("failed to decrement");
-    assert_eq!(updated.value(), 1, "item is: {updated:?}");
-    drop(updated);
+    assert_eq!(updated, 1, "item is: {updated:?}");
 
     let updated = cache
         .saturating_sub(b"coffee", 1)
         .expect("failed to decrement");
-    assert_eq!(updated.value(), 0, "item is: {updated:?}");
-    drop(updated);
+    assert_eq!(updated, 0, "item is: {updated:?}");
 
     // saturates at zero
     let updated = cache
         .saturating_sub(b"coffee", 1)
         .expect("failed to decrement");
-    assert_eq!(updated.value(), 0, "item is: {updated:?}");
+    assert_eq!(updated, 0, "item is: {updated:?}");
     assert_eq!(cache.get(b"coffee").unwrap().value(), 0);
 }
 

@@ -169,6 +169,15 @@ impl Segments {
         self.free_queue.len()
     }
 
+    /// Returns a segment's creation time and TTL, read directly from the
+    /// header — no `Segment` view construction or magic-byte check, since
+    /// this sits on the numeric-op hot path.
+    #[inline]
+    pub(crate) fn expiry_info(&self, seg_id: NonZeroU32) -> (Instant, Duration) {
+        let header = &self.headers[seg_id.get() as usize - 1];
+        (header.create_at(), header.ttl())
+    }
+
     /// Returns the generation counter for a segment. Bumped each time the
     /// segment is returned to the free queue, so CAS tokens built from it
     /// are invalidated when the segment is recycled.

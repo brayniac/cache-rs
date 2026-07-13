@@ -3,7 +3,6 @@
 mod reserved;
 
 use crate::segments::SegmentGuard;
-use crate::SegcacheError;
 use keyvalue::{RawItem, Value};
 
 pub(crate) use reserved::ReservedItem;
@@ -59,20 +58,6 @@ impl Item {
     /// Returns true if the item has been soft-deleted.
     pub fn is_deleted(&self) -> bool {
         self.raw.is_deleted()
-    }
-
-    /// Perform a wrapping addition on a numeric value.
-    pub fn wrapping_add(&mut self, rhs: u64) -> Result<(), SegcacheError> {
-        self.raw
-            .wrapping_add(rhs)
-            .map_err(|_| SegcacheError::NotNumeric)
-    }
-
-    /// Perform a saturating subtraction on a numeric value.
-    pub fn saturating_sub(&mut self, rhs: u64) -> Result<(), SegcacheError> {
-        self.raw
-            .saturating_sub(rhs)
-            .map_err(|_| SegcacheError::NotNumeric)
     }
 }
 

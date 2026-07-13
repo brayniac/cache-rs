@@ -64,7 +64,7 @@ pub(crate) use hashtable::{
     pack_location, unpack_location, Hashtable, MultiChoiceHashtable, SegmentsVerifier,
 };
 pub(crate) use item::*;
-pub(crate) use keyvalue::{size_of, RawItem, ITEM_HDR_SIZE};
+pub(crate) use keyvalue::{RawItem, ITEM_HDR_SIZE};
 pub(crate) use segments::*;
 pub(crate) use ttl_buckets::*;
 

@@ -124,10 +124,11 @@ fn pinned_segment_survives_clear() {
     assert_eq!(cache.segments.free(), segments);
 }
 
-// wrapping_add returns an Item that pins its segment like any other;
-// dropping it releases the pin.
+// Numeric updates are in place: a held Item aliases the same memory and
+// observes increments through the seqlock — reads are never torn, and
+// the pinned segment cannot be reclaimed while held.
 #[test]
-fn numeric_op_item_pins_segment() {
+fn held_item_observes_inplace_increments() {
     let segment_size = 4096;
     let segments = 64;
     let heap_size = segments * segment_size as usize;
@@ -139,59 +140,27 @@ fn numeric_op_item_pins_segment() {
         .build()
         .expect("failed to create cache");
 
-    assert!(cache.insert(b"n", 0, None, ttl).is_ok());
+    assert!(cache.insert(b"n", 0, Some(b"opt"), ttl).is_ok());
 
-    // temporary result: guard released at end of statement
-    assert!(cache.wrapping_add(b"n", 1).is_ok());
+    let held = cache.get(b"n").unwrap();
+    assert_eq!(held.value(), 0);
 
-    // held result: pins the segment across clear()
-    let held = cache.wrapping_add(b"n", 1).unwrap();
+    // in-place updates are visible through the held alias
+    assert_eq!(cache.wrapping_add(b"n", 1).unwrap(), 1);
+    assert_eq!(held.value(), 1);
+    assert_eq!(cache.wrapping_add(b"n", 1).unwrap(), 2);
+    assert_eq!(held.value(), 2);
+
+    // optional data is untouched by increments
+    assert_eq!(held.optional(), Some(&b"opt"[..]));
+
+    // the pin still protects the segment
     cache.clear();
     assert_eq!(cache.segments.free(), segments - 1);
     assert_eq!(held.value(), 2);
 
-    // guard drop frees the condemned segment directly
     drop(held);
     assert_eq!(cache.segments.free(), segments);
-}
-
-// The AwaitingRelease handoff end to end: a pinned segment condemned by
-// clear() is freed by the last guard drop — no second pass required —
-// and exactly once (the free count returns to full, not beyond).
-#[test]
-fn guard_drop_frees_segment() {
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-    let ttl = Duration::ZERO;
-
-    let mut cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
-        .build()
-        .expect("failed to create cache");
-
-    assert!(cache.insert(b"coffee", b"strong", None, ttl).is_ok());
-
-    // two pins on the same segment
-    let first = cache.get(b"coffee").unwrap();
-    let second = cache.get(b"coffee").unwrap();
-
-    assert_eq!(cache.clear(), 0);
-    assert_eq!(cache.segments.free(), segments - 1);
-
-    // dropping the first pin must NOT free (a reader remains)
-    drop(first);
-    assert_eq!(cache.segments.free(), segments - 1);
-    assert_eq!(second.value(), b"strong");
-
-    // dropping the LAST pin frees, exactly once
-    drop(second);
-    assert_eq!(cache.segments.free(), segments);
-
-    // and the recycled segment is fully reusable
-    assert!(cache.insert(b"tea", b"green", None, ttl).is_ok());
-    assert_eq!(cache.get(b"tea").unwrap().value(), b"green");
 }
 
 // The seal happens on append: while a segment is the bucket tail it is
@@ -245,6 +214,244 @@ fn seal_on_append() {
         .unwrap();
     assert_eq!(tail.state(), State::Live);
     assert!(!tail.can_evict(), "the write tail must never be evictable");
+}
+
+// cas() publishes by swapping the hashtable slot from the token-checked
+// location — so if the eviction triggered by cas's OWN reservation
+// relocates or evicts the checked item, the CAS fails with Exists
+// (fail-safe) instead of silently succeeding through a plain insert.
+#[test]
+fn cas_fails_when_own_reservation_evicts_checked_item() {
+    let segment_size = 4096;
+    let segments = 2;
+    let heap_size = segments * segment_size as usize;
+    let ttl = Duration::ZERO;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .eviction(Policy::Fifo)
+        .build()
+        .expect("failed to create cache");
+
+    // target lands in segment 1 — the oldest, Fifo's first victim
+    assert!(cache.insert(b"target", b"original", None, ttl).is_ok());
+    let token = cache.get(b"target").unwrap().cas();
+
+    // fill the heap so the next reservation must evict: keep inserting
+    // fillers until the Live tail can't fit another large item
+    let filler = [0xEEu8; 128];
+    // stop filling once the tail can no longer fit the cas item below
+    // (header 12 + key 6 + value 600, rounded up -> 624 bytes)
+    let needed = 624;
+    let mut i = 0u32;
+    loop {
+        let tail_free = {
+            let used = segments - cache.segments.free();
+            let tail = cache
+                .segments
+                .get_mut(NonZeroU32::new(used as u32).unwrap())
+                .unwrap();
+            segment_size as usize - tail.write_offset() as usize
+        };
+        if cache.segments.free() == 0 && tail_free < needed {
+            break;
+        }
+        let key = format!("filler_{i}");
+        cache
+            .insert(key.as_bytes(), &filler[..], None, ttl)
+            .expect("setup insert must succeed");
+        i += 1;
+    }
+
+    // the token is still valid right now
+    assert_eq!(cache.get(b"target").unwrap().cas(), token);
+
+    // cas must reserve, reservation must evict, Fifo evicts segment 1
+    // (the sealed oldest — where target lives) — the checked location no
+    // longer maps to the key, so the CAS fails closed
+    let big = [0xFFu8; 600];
+    assert_eq!(
+        cache.cas(b"target", &big[..], None, ttl, token),
+        Err(SegcacheError::Exists)
+    );
+
+    // the target was evicted, not replaced
+    assert!(cache.get(b"target").is_none());
+
+    // and the cache remains fully usable
+    assert!(cache.insert(b"after", b"ok", None, ttl).is_ok());
+    assert_eq!(cache.get(b"after").unwrap().value(), b"ok");
+}
+
+// Every increment writes a new item and bumps the key's CAS token —
+// matching memcached, where incr/decr assign a fresh cas unique. A
+// gets -> (incr) -> cas sequence must fail, not silently discard the
+// increment.
+#[test]
+fn incr_bumps_cas_token() {
+    let ttl = Duration::ZERO;
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"counter", 5, None, ttl).is_ok());
+    let stale = cache.get(b"counter").unwrap().cas();
+
+    assert_eq!(cache.wrapping_add(b"counter", 1).unwrap(), 6);
+    let fresh_token = cache.get(b"counter").unwrap().cas();
+    assert_ne!(fresh_token, stale, "increment must bump the CAS token");
+
+    // the pre-increment token must not match anymore
+    assert_eq!(
+        cache.cas(b"counter", 100, None, ttl, stale),
+        Err(SegcacheError::Exists)
+    );
+    assert_eq!(cache.get(b"counter").unwrap().value(), 6);
+
+    // a fresh token works
+    let fresh = cache.get(b"counter").unwrap().cas();
+    assert_eq!(cache.cas(b"counter", 100, None, ttl, fresh), Ok(()));
+    assert_eq!(cache.get(b"counter").unwrap().value(), 100);
+}
+
+// Numeric updates preserve the item's ABSOLUTE expiration exactly
+// (memcached's incr/decr keep the original exptime): the update is in
+// place, so the item's location — and therefore its segment deadline —
+// never changes. A rate-limiter window still resets on schedule.
+#[test]
+fn numeric_update_preserves_expiry() {
+    let ttl = Duration::from_secs(300);
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"counter", 7, None, ttl).is_ok());
+
+    let location_of = |cache: &mut Segcache, key: &[u8]| {
+        let verifier = cache.segments.verifier();
+        let (loc, _) = cache
+            .hashtable
+            .lookup_no_freq_update(key, &verifier)
+            .unwrap();
+        loc
+    };
+
+    let before = location_of(&mut cache, b"counter");
+    assert_eq!(cache.wrapping_add(b"counter", 1).unwrap(), 8);
+    let after = location_of(&mut cache, b"counter");
+
+    // in place: same location, same segment, same deadline
+    assert_eq!(
+        after.as_raw(),
+        before.as_raw(),
+        "in-place increment must not move the item"
+    );
+}
+
+// Incrementing a counter whose deadline has already passed returns
+// NotFound, matching memcached's treatment of expired keys — even if
+// the segment has not been reclaimed by expire() yet.
+#[test]
+fn numeric_update_expired_counter_not_found() {
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    // 2s requests the first tier-1 bucket, whose floor TTL is 1s
+    assert!(cache
+        .insert(b"counter", 5, None, Duration::from_secs(2))
+        .is_ok());
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    assert!(matches!(
+        cache.wrapping_add(b"counter", 1),
+        Err(SegcacheError::NotFound)
+    ));
+}
+
+#[test]
+fn try_into_numeric_arms() {
+    let ttl = Duration::ZERO;
+    let other_ttl = Duration::from_secs(60);
+    let mut cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    // arm 1: missing key -> created with initial and the caller's ttl
+    assert_eq!(cache.try_into_numeric(b"fresh", 42, ttl), Ok(()));
+    assert_eq!(cache.get(b"fresh").unwrap().value(), 42);
+    // and it is incrementable
+    assert_eq!(cache.wrapping_add(b"fresh", 1).unwrap(), 43);
+
+    // arm 2: existing numeric -> no-op (value and token untouched)
+    let before = cache.get(b"fresh").unwrap().cas();
+    assert_eq!(cache.try_into_numeric(b"fresh", 999, ttl), Ok(()));
+    assert_eq!(cache.get(b"fresh").unwrap().value(), 43);
+    assert_eq!(cache.get(b"fresh").unwrap().cas(), before);
+
+    // arm 3: simple-ASCII bytes -> converted with the SAME value, in the
+    // existing item's TTL bucket (caller ttl deliberately ignored),
+    // optional preserved
+    assert!(cache.insert(b"ascii", b"123", Some(b"opt"), ttl).is_ok());
+    let old_bucket_ttl = {
+        let verifier = cache.segments.verifier();
+        let (loc, _) = cache
+            .hashtable
+            .lookup_no_freq_update(b"ascii", &verifier)
+            .unwrap();
+        let (seg, _) = unpack_location(loc);
+        cache
+            .segments
+            .get_mut(NonZeroU32::new(seg).unwrap())
+            .unwrap()
+            .ttl()
+    };
+    assert_eq!(cache.try_into_numeric(b"ascii", 0, other_ttl), Ok(()));
+    let item = cache.get(b"ascii").unwrap();
+    assert_eq!(item.value(), 123);
+    assert_eq!(item.optional(), Some(&b"opt"[..]));
+    drop(item);
+    let new_bucket_ttl = {
+        let verifier = cache.segments.verifier();
+        let (loc, _) = cache
+            .hashtable
+            .lookup_no_freq_update(b"ascii", &verifier)
+            .unwrap();
+        let (seg, _) = unpack_location(loc);
+        cache
+            .segments
+            .get_mut(NonZeroU32::new(seg).unwrap())
+            .unwrap()
+            .ttl()
+    };
+    assert_eq!(new_bucket_ttl, old_bucket_ttl);
+    // converted key is incrementable
+    assert_eq!(cache.wrapping_add(b"ascii", 2).unwrap(), 125);
+
+    // arm 4: non-numeric bytes -> NotNumeric, item untouched
+    assert!(cache.insert(b"text", b"not a number", None, ttl).is_ok());
+    assert_eq!(
+        cache.try_into_numeric(b"text", 0, ttl),
+        Err(SegcacheError::NotNumeric)
+    );
+    assert_eq!(cache.get(b"text").unwrap().value(), b"not a number");
+
+    // non-canonical numerics are rejected too (leading zero)
+    assert!(cache.insert(b"zeroes", b"007", None, ttl).is_ok());
+    assert_eq!(
+        cache.try_into_numeric(b"zeroes", 0, ttl),
+        Err(SegcacheError::NotNumeric)
+    );
 }
 
 #[test]
@@ -756,22 +963,23 @@ fn wrapping_add() {
 
     let item = cache.get(b"coffee").unwrap();
     assert_eq!(item.value(), 0, "item is: {item:?}");
-    cache
-        .wrapping_add(b"coffee", 1)
-        .expect("failed to increment");
+
+    // updates are in place: the held Item observes each one
+    assert_eq!(cache.wrapping_add(b"coffee", 1).unwrap(), 1);
     assert_eq!(item.value(), 1, "item is: {item:?}");
-    cache
-        .wrapping_add(b"coffee", u64::MAX - 1)
-        .expect("failed to increment");
-    assert_eq!(item.value(), u64::MAX, "item is: {item:?}");
-    cache
-        .wrapping_add(b"coffee", 1)
-        .expect("failed to increment");
-    assert_eq!(item.value(), 0, "item is: {item:?}");
-    cache
-        .wrapping_add(b"coffee", 2)
-        .expect("failed to increment");
+
+    // wrap at the 64-bit mark (memcached incr semantics)
+    assert_eq!(
+        cache.wrapping_add(b"coffee", u64::MAX - 1).unwrap(),
+        u64::MAX
+    );
+    assert_eq!(cache.wrapping_add(b"coffee", 1).unwrap(), 0);
+    assert_eq!(cache.wrapping_add(b"coffee", 2).unwrap(), 2);
     assert_eq!(item.value(), 2, "item is: {item:?}");
+
+    // the store agrees
+    drop(item);
+    assert_eq!(cache.get(b"coffee").unwrap().value(), 2);
 }
 
 #[test]
@@ -795,18 +1003,24 @@ fn saturating_sub() {
 
     let item = cache.get(b"coffee").unwrap();
     assert_eq!(item.value(), 3, "item is: {item:?}");
-    cache
+    drop(item);
+
+    let updated = cache
         .saturating_sub(b"coffee", 2)
-        .expect("failed to increment");
-    assert_eq!(item.value(), 1, "item is: {item:?}");
-    cache
+        .expect("failed to decrement");
+    assert_eq!(updated, 1, "item is: {updated:?}");
+
+    let updated = cache
         .saturating_sub(b"coffee", 1)
-        .expect("failed to increment");
-    assert_eq!(item.value(), 0, "item is: {item:?}");
-    cache
+        .expect("failed to decrement");
+    assert_eq!(updated, 0, "item is: {updated:?}");
+
+    // saturates at zero
+    let updated = cache
         .saturating_sub(b"coffee", 1)
-        .expect("failed to increment");
-    assert_eq!(item.value(), 0, "item is: {item:?}");
+        .expect("failed to decrement");
+    assert_eq!(updated, 0, "item is: {updated:?}");
+    assert_eq!(cache.get(b"coffee").unwrap().value(), 0);
 }
 
 #[test]

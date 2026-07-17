@@ -408,6 +408,36 @@ impl SegmentHeader {
         self.write_offset.fetch_add(size, Ordering::Relaxed)
     }
 
+    /// Atomically reserve `size` bytes of item space, returning the
+    /// offset where the caller may write. Fails (`None`) if the
+    /// reservation would exceed `capacity` — `write_offset` never
+    /// exceeds the capacity, so item scans, live-byte accounting, and
+    /// seal decisions need no clamping (this is why the reservation is
+    /// a bounded CAS rather than a raw `fetch_add`).
+    ///
+    /// A CAS failure means another writer took the slot; the retry
+    /// re-reads the observed offset, which only moves toward capacity,
+    /// so the loop terminates.
+    #[allow(dead_code)] // Task 2 routes allocation through this
+    pub fn try_reserve_space(&self, size: i32, capacity: i32) -> Option<i32> {
+        let mut current = self.write_offset.load(Ordering::Acquire);
+        loop {
+            let new = current.checked_add(size)?;
+            if new > capacity {
+                return None;
+            }
+            match self.write_offset.compare_exchange(
+                current,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(current),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     // -- Live bytes --
 
     #[inline]
@@ -760,5 +790,52 @@ mod loom_tests {
                 assert_eq!(header.ref_count(), 0);
             }
         });
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+
+    // The initial write_offset is 0, or 8 with the `integrity` feature
+    // (magic bytes). Tests use relative math so they pass either way.
+    fn initial_offset() -> i32 {
+        if cfg!(feature = "integrity") {
+            std::mem::size_of::<u64>() as i32
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn reserve_space_grants_sequential_offsets() {
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        let base = initial_offset();
+        assert_eq!(h.try_reserve_space(24, base + 128), Some(base));
+        assert_eq!(h.try_reserve_space(40, base + 128), Some(base + 24));
+        assert_eq!(h.write_offset(), base + 64);
+    }
+
+    #[test]
+    fn reserve_space_exact_fit_boundary() {
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        let base = initial_offset();
+        // fills the segment exactly
+        assert_eq!(h.try_reserve_space(64, base + 64), Some(base));
+        assert_eq!(h.write_offset(), base + 64);
+        // nothing further fits, offset must not move
+        assert_eq!(h.try_reserve_space(8, base + 64), None);
+        assert_eq!(h.write_offset(), base + 64);
+    }
+
+    #[test]
+    fn reserve_space_rejects_oversized() {
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        let base = initial_offset();
+        assert_eq!(h.try_reserve_space(129, base + 128), None);
+        // a failed reservation must not advance the offset
+        assert_eq!(h.write_offset(), base);
+        // smaller items still fit after a large one failed
+        assert_eq!(h.try_reserve_space(64, base + 128), Some(base));
     }
 }

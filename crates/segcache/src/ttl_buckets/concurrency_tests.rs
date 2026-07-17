@@ -40,6 +40,8 @@ fn concurrent_reserve_stress() {
     const PER_THREAD: usize = 2_000;
     const SEG_SIZE: i32 = 4096;
     const SEG_COUNT: usize = 4096;
+    // max item size in this workload's size formula (40 + 8 * 49)
+    const MAX_ITEM: i32 = 40 + 8 * 49;
 
     let segments = SegmentsBuilder::default()
         .segment_size(SEG_SIZE)
@@ -59,7 +61,7 @@ fn concurrent_reserve_stress() {
                 s.spawn(move || {
                     let mut local = Vec::with_capacity(PER_THREAD);
                     for i in 0..PER_THREAD {
-                        // 40..432 bytes, 8-aligned, varied per thread
+                        // 40..=MAX_ITEM bytes, 8-aligned, varied per thread
                         let size = 40 + 8 * ((t * 31 + i * 17) % 50);
                         let r = bucket
                             .reserve(size, segments)
@@ -82,6 +84,7 @@ fn concurrent_reserve_stress() {
     let mut cursor = bucket.head();
     let mut prev: Option<core::num::NonZeroU32> = None;
     while let Some(id) = cursor {
+        assert!(chain.len() <= SEG_COUNT, "cycle in segment chain");
         chain.push(id.get());
         let header = segments.header(id);
         let meta = header.metadata(Ordering::Acquire);
@@ -93,6 +96,16 @@ fn concurrent_reserve_stress() {
                 meta.state,
                 State::Sealed,
                 "interior segment {id} not Sealed"
+            );
+            // A segment is only legitimately sealed by an expander that
+            // failed to fit a <= MAX_ITEM-byte item in it, and
+            // write_offset is monotone — so an under-filled interior
+            // segment means an election loser sealed the winner's fresh
+            // tail (the bug the observed-tail contract exists to
+            // prevent).
+            assert!(
+                header.write_offset() > SEG_SIZE - MAX_ITEM,
+                "interior segment {id} sealed while under-filled"
             );
         } else {
             assert_eq!(meta.state, State::Live, "tail segment {id} not Live");

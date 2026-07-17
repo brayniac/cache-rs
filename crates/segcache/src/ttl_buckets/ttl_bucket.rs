@@ -40,8 +40,8 @@ pub struct TtlBucket {
     head: AtomicU32,
     tail: AtomicU32,
     ttl: i32,
-    /// Total segments ever linked into this bucket (write-only today;
-    /// kept for parity with the original layout).
+    /// Total segments ever linked (never decremented; read only by
+    /// tests today).
     nseg: AtomicU32,
     next_to_merge: AtomicU32,
     _pad: [u8; 44],

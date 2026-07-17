@@ -534,6 +534,9 @@ fn try_alloc_item_bounds_and_grants() {
 
     let id = segments.reserve_free().expect("free segment");
 
+    // live_bytes starts at the initial offset (0, or 8 with `integrity`)
+    let live_bytes_before = segments.header(id).live_bytes();
+
     // grants are sequential and within capacity
     let a = segments.try_alloc_item(id, 64).expect("first alloc");
     let b = segments.try_alloc_item(id, 64).expect("second alloc");
@@ -547,6 +550,7 @@ fn try_alloc_item_bounds_and_grants() {
 
     // live statistics track successful grants only
     assert_eq!(segments.header(id).live_items(), 2);
+    assert_eq!(segments.header(id).live_bytes(), live_bytes_before + 128);
 }
 
 #[test]

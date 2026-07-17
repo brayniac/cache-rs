@@ -94,6 +94,12 @@ impl TtlBucket {
             .is_ok()
     }
 
+    /// Total segments ever linked into this bucket.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn nseg(&self) -> u32 {
+        self.nseg.load(Ordering::Relaxed)
+    }
+
     /// Next segment to merge (for merge eviction policy).
     /// Relaxed: only touched under `&mut`-serialized eviction.
     pub fn next_to_merge(&self) -> Option<NonZeroU32> {

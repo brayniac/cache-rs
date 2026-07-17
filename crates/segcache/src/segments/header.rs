@@ -834,4 +834,16 @@ mod tests {
         // smaller items still fit after a large one failed
         assert_eq!(h.try_reserve_space(64, base + 128), Some(base));
     }
+
+    #[test]
+    fn reserve_space_offset_overflow_fails() {
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        let base = initial_offset();
+        // advance the offset so current > 0, then request a size that
+        // overflows current + size in i32
+        assert_eq!(h.try_reserve_space(8, base + 64), Some(base));
+        assert_eq!(h.try_reserve_space(i32::MAX, i32::MAX), None);
+        // a failed reservation must not advance the offset
+        assert_eq!(h.write_offset(), base + 8);
+    }
 }

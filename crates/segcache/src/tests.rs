@@ -525,6 +525,31 @@ fn get_free_seg() {
 }
 
 #[test]
+fn try_alloc_item_bounds_and_grants() {
+    let mut segments = SegmentsBuilder::default()
+        .segment_size(4096)
+        .heap_size(4096 * 4)
+        .build()
+        .expect("build segments");
+
+    let id = segments.reserve_free().expect("free segment");
+
+    // grants are sequential and within capacity
+    let a = segments.try_alloc_item(id, 64).expect("first alloc");
+    let b = segments.try_alloc_item(id, 64).expect("second alloc");
+    assert_eq!(b.offset(), a.offset() + 64);
+    assert_eq!(a.seg(), id);
+
+    // an oversized request fails and does not move the offset
+    let before = segments.header(id).write_offset();
+    assert!(segments.try_alloc_item(id, 4096).is_none());
+    assert_eq!(segments.header(id).write_offset(), before);
+
+    // live statistics track successful grants only
+    assert_eq!(segments.header(id).live_items(), 2);
+}
+
+#[test]
 fn get() {
     let ttl = Duration::ZERO;
     let segment_size = 4096;

@@ -169,12 +169,18 @@ impl Segments {
         self.free_queue.len()
     }
 
+    /// Shared access to a segment's header by id.
+    #[inline]
+    pub(crate) fn header(&self, id: NonZeroU32) -> &SegmentHeader {
+        &self.headers[id.get() as usize - 1]
+    }
+
     /// Returns a segment's creation time and TTL, read directly from the
     /// header — no `Segment` view construction or magic-byte check, since
     /// this sits on the numeric-op hot path.
     #[inline]
     pub(crate) fn expiry_info(&self, seg_id: NonZeroU32) -> (Instant, Duration) {
-        let header = &self.headers[seg_id.get() as usize - 1];
+        let header = self.header(seg_id);
         (header.create_at(), header.ttl())
     }
 
@@ -183,7 +189,7 @@ impl Segments {
     /// are invalidated when the segment is recycled.
     #[inline]
     pub(crate) fn generation(&self, seg_id: NonZeroU32) -> u16 {
-        self.headers[seg_id.get() as usize - 1].generation()
+        self.header(seg_id).generation()
     }
 
     // ── Item access ──────────────────────────────────────────────────
@@ -225,6 +231,44 @@ impl Segments {
         let byte_offset = self.segment_size() as usize * (seg_id.get() as usize - 1) + offset;
         let raw = RawItem::from_ptr(unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) });
         Some((raw, guard))
+    }
+
+    /// Atomically reserve space for an item in the given segment,
+    /// returning a `ReservedItem` for the granted region. `None` means
+    /// the segment is full — the caller should expand the chain.
+    ///
+    /// Takes `&self`: the reservation is a header CAS and the item
+    /// pointer is derived from the data base pointer, the same pattern
+    /// as `get_item_at`.
+    ///
+    /// SCOPE(item-5): the reserve→define→publish window is not yet
+    /// protected against a concurrent drain of this segment. Safe today
+    /// because eviction and writers are serialized by `&mut Segcache`;
+    /// the writer-vs-drain protocol lands with the eviction drain
+    /// rework.
+    pub(crate) fn try_alloc_item(&self, seg_id: NonZeroU32, size: i32) -> Option<ReservedItem> {
+        debug_assert!(seg_id.get() <= self.cap);
+        let header = self.header(seg_id);
+        let offset = header.try_reserve_space(size, self.segment_size)?;
+
+        header.incr_live_items();
+        header.incr_live_bytes(size);
+
+        #[cfg(feature = "metrics")]
+        {
+            ITEM_CURRENT.increment();
+            ITEM_CURRENT_BYTES.add(size as _);
+            ITEM_ALLOCATE.increment();
+        }
+
+        let byte_offset =
+            self.segment_size as usize * (seg_id.get() as usize - 1) + offset as usize;
+        let ptr = unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) };
+        Some(ReservedItem::new(
+            RawItem::from_ptr(ptr),
+            seg_id,
+            offset as usize,
+        ))
     }
 
     // ── Segment views ────────────────────────────────────────────────

@@ -229,25 +229,6 @@ impl<'a> Segment<'a> {
 
     // -- Item operations --
 
-    /// Allocate space for an item, returning a `RawItem` pointing to the
-    /// allocated region. Updates write offset, live items, and live bytes.
-    pub(crate) fn alloc_item(&self, size: i32) -> RawItem {
-        let offset = self.header.fetch_add_write_offset(size);
-
-        self.header.incr_live_items();
-        self.header.incr_live_bytes(size);
-
-        #[cfg(feature = "metrics")]
-        {
-            ITEM_CURRENT.increment();
-            ITEM_CURRENT_BYTES.add(size as _);
-            ITEM_ALLOCATE.increment();
-        }
-
-        let ptr = (self.data.as_ptr() as *mut u8).wrapping_add(offset as usize);
-        RawItem::from_ptr(ptr)
-    }
-
     /// Remove an item at the given offset, decrementing live counters.
     pub(crate) fn remove_item_at(&self, offset: usize) {
         let item = self.get_item_at(offset).unwrap();

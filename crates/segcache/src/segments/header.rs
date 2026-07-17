@@ -401,25 +401,22 @@ impl SegmentHeader {
         self.write_offset.store(offset, Ordering::Relaxed);
     }
 
-    /// Atomically add to the write offset, returning the previous value.
-    /// The returned value is the offset where the caller can write.
-    #[inline]
-    pub fn fetch_add_write_offset(&self, size: i32) -> i32 {
-        self.write_offset.fetch_add(size, Ordering::Relaxed)
-    }
-
     /// Atomically reserve `size` bytes of item space, returning the
     /// offset where the caller may write. Fails (`None`) if the
-    /// reservation would exceed `capacity` — `write_offset` never
-    /// exceeds the capacity, so item scans, live-byte accounting, and
-    /// seal decisions need no clamping (this is why the reservation is
-    /// a bounded CAS rather than a raw `fetch_add`).
+    /// reservation would exceed `capacity`, or if the new offset would
+    /// overflow `i32` — `write_offset` never exceeds the capacity, so
+    /// item scans, live-byte accounting, and seal decisions need no
+    /// clamping (this is why the reservation is a bounded CAS rather
+    /// than a raw `fetch_add`).
     ///
     /// A CAS failure means another writer took the slot; the retry
     /// re-reads the observed offset, which only moves toward capacity,
     /// so the loop terminates.
-    #[allow(dead_code)] // Task 2 routes allocation through this
+    ///
+    /// AcqRel: writer↔writer coordination on the offset word only — no
+    /// Dekker pairing with the reader path, so SeqCst is not warranted.
     pub fn try_reserve_space(&self, size: i32, capacity: i32) -> Option<i32> {
+        debug_assert!(size >= 0, "reservation size must be non-negative");
         let mut current = self.write_offset.load(Ordering::Acquire);
         loop {
             let new = current.checked_add(size)?;

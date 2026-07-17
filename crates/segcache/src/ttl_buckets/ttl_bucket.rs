@@ -268,17 +268,13 @@ impl TtlBucket {
 
         loop {
             if let Some(id) = self.tail {
-                if let Ok(segment) = segments.get_mut(id) {
-                    // A non-writable tail (sealed, or drained while pinned
-                    // by a reader) falls through to expansion: a fresh
-                    // segment is linked after it. Spinning here would
-                    // never make the tail writable again.
-                    if segment.state().is_writable() {
-                        let offset = segment.write_offset() as usize;
-                        if offset + size <= seg_size {
-                            let item = segment.alloc_item(size as i32);
-                            return Ok(ReservedItem::new(item, segment.id(), offset));
-                        }
+                // A non-writable tail (sealed, or drained while pinned
+                // by a reader) falls through to expansion: a fresh
+                // segment is linked after it. Spinning here would
+                // never make the tail writable again.
+                if segments.header(id).state().is_writable() {
+                    if let Some(reserved) = segments.try_alloc_item(id, size as i32) {
+                        return Ok(reserved);
                     }
                 }
             }

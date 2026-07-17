@@ -378,3 +378,39 @@ impl TtlBucket {
         }
     }
 }
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    // Two writers race to install the first segment of an empty
+    // bucket. The tail-word CAS admits exactly one winner — the mutual
+    // exclusion the empty-bucket arm of try_expand relies on. Pure CAS
+    // uniqueness: SC-independent, within loom's power.
+    #[test]
+    fn loom_empty_bucket_election_single_winner() {
+        loom::model(|| {
+            let bucket = Arc::new(TtlBucket::new(60));
+
+            let handles: Vec<_> = [1u32, 2u32]
+                .into_iter()
+                .map(|id| {
+                    let b = Arc::clone(&bucket);
+                    thread::spawn(move || b.cas_tail_none_to(NonZeroU32::new(id).unwrap()))
+                })
+                .collect();
+            let wins: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            assert_eq!(
+                wins.iter().filter(|w| **w).count(),
+                1,
+                "exactly one install"
+            );
+            let tail = bucket.tail().unwrap().get();
+            let expected = if wins[0] { 1 } else { 2 };
+            assert_eq!(tail, expected);
+        });
+    }
+}

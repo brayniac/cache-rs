@@ -787,6 +787,71 @@ mod loom_tests {
             }
         });
     }
+
+    // The chain-extension election: two expanders race to seal the same
+    // Live tail with different successors. The one-CAS seal admits
+    // exactly one winner, and the link matches the winner — this is the
+    // mutual exclusion the lock-free try_expand relies on. Pure CAS
+    // uniqueness on one word: SC-independent, fully within loom's power
+    // (see module note).
+    #[test]
+    fn loom_seal_election_single_winner() {
+        loom::model(|| {
+            let tail = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            tail.set_state(State::Live);
+
+            let handles: Vec<_> = [2u32, 3u32]
+                .into_iter()
+                .map(|succ| {
+                    let t = Arc::clone(&tail);
+                    thread::spawn(move || {
+                        t.cas_metadata(
+                            State::Live,
+                            State::Sealed,
+                            Some(NonZeroU32::new(succ)),
+                            None,
+                            Ordering::AcqRel,
+                        )
+                    })
+                })
+                .collect();
+            let wins: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            assert_eq!(wins.iter().filter(|w| **w).count(), 1, "exactly one seal");
+            assert_eq!(tail.state(), State::Sealed);
+            let expected_succ = if wins[0] { 2 } else { 3 };
+            assert_eq!(tail.next_seg().unwrap().get(), expected_succ);
+        });
+    }
+
+    // Two writers CAS-reserve space from the same segment: grants are
+    // disjoint and never exceed capacity, in every interleaving.
+    #[test]
+    fn loom_reserve_space_disjoint_bounded() {
+        loom::model(|| {
+            let h = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            let base = h.write_offset(); // 0, or 8 with `integrity`
+            let cap = base + 64;
+
+            let handles: Vec<_> = [24i32, 24i32]
+                .into_iter()
+                .map(|size| {
+                    let h = Arc::clone(&h);
+                    thread::spawn(move || h.try_reserve_space(size, cap).map(|o| (o, size)))
+                })
+                .collect();
+            let grants: Vec<(i32, i32)> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect();
+
+            // both fit; grants must be disjoint and bounded
+            assert_eq!(grants.len(), 2);
+            let (a, b) = (grants[0], grants[1]);
+            assert!(a.0 + a.1 <= b.0 || b.0 + b.1 <= a.0, "grants overlap");
+            assert!(h.write_offset() <= cap);
+        });
+    }
 }
 
 #[cfg(all(test, not(feature = "loom")))]

@@ -241,6 +241,10 @@ impl Segments {
     /// pointer is derived from the data base pointer, the same pattern
     /// as `get_item_at`.
     ///
+    /// The `integrity` magic-byte check is intentionally skipped here
+    /// (hot path); the debug-feature `check_integrity` scan covers it,
+    /// the same idiom as `expiry_info`.
+    ///
     /// SCOPE(item-5): the reserve→define→publish window is not yet
     /// protected against a concurrent drain of this segment. Safe today
     /// because eviction and writers are serialized by `&mut Segcache`;
@@ -263,6 +267,10 @@ impl Segments {
 
         let byte_offset =
             self.segment_size as usize * (seg_id.get() as usize - 1) + offset as usize;
+        // SAFETY: `header()` above bounds-checks seg_id via slice
+        // indexing, and the CAS grant guarantees
+        // `offset + size <= segment_size`, so the granted region lies
+        // inside this segment's slice of the data mmap.
         let ptr = unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) };
         Some(ReservedItem::new(
             RawItem::from_ptr(ptr),
@@ -450,7 +458,7 @@ impl Segments {
     /// Reserve a segment from the free queue. Returns the id of a
     /// segment in the Reserved state (statistics reset, generation
     /// bumped), which must then be linked into a segment chain.
-    pub(crate) fn reserve_free(&mut self) -> Option<NonZeroU32> {
+    pub(crate) fn reserve_free(&self) -> Option<NonZeroU32> {
         loop {
             match self.free_queue.steal() {
                 crossbeam_deque::Steal::Retry => continue,
@@ -467,8 +475,9 @@ impl Segments {
                         }
                         return Some(id);
                     }
-                    // Not actually Free (unreachable today with writers
-                    // serialized by &mut self) — put it back.
+                    // Not actually Free (a transient state raced through
+                    // the queue) — put it back and let the caller retry
+                    // or run eviction.
                     self.free_queue.push(raw);
                     return None;
                 }
@@ -476,11 +485,18 @@ impl Segments {
         }
     }
 
-    /// Return a Reserved segment that was never linked into a chain.
-    #[cfg(test)]
-    pub(crate) fn release_unused(&mut self, id: NonZeroU32) {
+    /// Return a Reserved (or Linking) segment that was never published
+    /// into a chain — the loser path of the chain-extension election
+    /// and allocation error paths.
+    pub(crate) fn release_unused(&self, id: NonZeroU32) {
         assert!(self.headers[id.get() as usize - 1].try_release());
         self.free_queue.push(id.get());
+
+        #[cfg(feature = "metrics")]
+        {
+            SEGMENT_RETURN.increment();
+            SEGMENT_FREE.increment();
+        }
     }
 
     // ── Eviction ─────────────────────────────────────────────────────

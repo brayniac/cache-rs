@@ -174,15 +174,6 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
-    pub fn update_links(
-        &self,
-        new_next: Option<Option<NonZeroU32>>,
-        new_prev: Option<Option<NonZeroU32>>,
-    ) {
-        self.header.update_links(new_next, new_prev);
-    }
-
-    #[inline]
     pub fn can_evict(&self) -> bool {
         self.header.can_evict()
     }
@@ -195,11 +186,6 @@ impl<'a> Segment<'a> {
     #[inline]
     pub fn ttl(&self) -> Duration {
         self.header.ttl()
-    }
-
-    #[inline]
-    pub fn set_ttl(&self, ttl: Duration) {
-        self.header.set_ttl(ttl);
     }
 
     #[inline]

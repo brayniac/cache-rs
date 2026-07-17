@@ -526,7 +526,7 @@ fn get_free_seg() {
 
 #[test]
 fn try_alloc_item_bounds_and_grants() {
-    let mut segments = SegmentsBuilder::default()
+    let segments = SegmentsBuilder::default()
         .segment_size(4096)
         .heap_size(4096 * 4)
         .build()

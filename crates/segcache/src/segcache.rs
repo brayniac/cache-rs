@@ -242,8 +242,8 @@ impl Segcache {
         loop {
             match self
                 .ttl_buckets
-                .get_mut_bucket(ttl)
-                .reserve(size, &mut self.segments)
+                .get_bucket(ttl)
+                .reserve(size, &self.segments)
             {
                 Ok(mut reserved_item) => {
                     reserved_item.define(key, value, optional);

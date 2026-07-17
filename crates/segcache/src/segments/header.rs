@@ -257,7 +257,6 @@ impl SegmentHeader {
 
     /// Return an unused segment to Free (Reserved|Linking -> Free).
     /// Used by allocation error paths before a segment becomes visible.
-    #[allow(dead_code)] // production callers arrive with the append-protocol error paths
     pub fn try_release(&self) -> bool {
         self.cas_metadata(
             State::Reserved,

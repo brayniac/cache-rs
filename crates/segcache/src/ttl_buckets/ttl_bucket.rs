@@ -33,6 +33,9 @@ use core::num::NonZeroU32;
 /// Padded to exactly 64 bytes (one cache line). Chain pointers use the
 /// 0-is-none convention (segment ids are `NonZeroU32`), matching the
 /// packed metadata links in `segments::state`.
+///
+/// Acquire/Release on head/tail: concurrent reservers read the tail
+/// word and must see the winner's published chain state.
 pub struct TtlBucket {
     head: AtomicU32,
     tail: AtomicU32,
@@ -81,6 +84,14 @@ impl TtlBucket {
     fn set_tail(&self, id: Option<NonZeroU32>) {
         self.tail
             .store(id.map_or(0, NonZeroU32::get), Ordering::Release);
+    }
+
+    /// Elect the first segment of an empty bucket: CAS the tail word
+    /// from empty to `id`. Exactly one concurrent expander wins.
+    fn cas_tail_none_to(&self, id: NonZeroU32) -> bool {
+        self.tail
+            .compare_exchange(0, id.get(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Next segment to merge (for merge eviction policy).
@@ -204,83 +215,125 @@ impl TtlBucket {
         freed
     }
 
-    /// Allocate a new segment and link it as the tail of this bucket,
-    /// following crucible's append protocol: seal the old tail (in the
-    /// same CAS that sets its `next` pointer), link the new segment,
-    /// then publish it as the writable Live tail.
-    fn try_expand(&mut self, segments: &mut Segments) -> Result<(), TtlBucketsError> {
+    /// Extend the segment chain past `observed_tail`, following
+    /// crucible's append protocol as a lock-free election: the one-CAS
+    /// seal (Live→Sealed + next pointer set together) admits exactly
+    /// one winner per tail, so concurrent expanders coordinate without
+    /// a chain mutex.
+    ///
+    /// `observed_tail` is the tail the caller found full (or None for
+    /// an empty bucket). The seal targets exactly that segment — never
+    /// whatever the tail happens to be at CAS time — so an election
+    /// loser can never seal the winner's freshly linked, near-empty
+    /// segment.
+    fn try_expand(
+        &self,
+        observed_tail: Option<NonZeroU32>,
+        segments: &Segments,
+    ) -> Result<(), TtlBucketsError> {
         let id = segments
             .reserve_free()
             .ok_or(TtlBucketsError::NoFreeSegments)?;
 
-        {
-            let segment = segments.get_mut(id).unwrap();
-            segment.set_ttl(Duration::from_secs(self.ttl as u32));
-        }
+        segments
+            .header(id)
+            .set_ttl(Duration::from_secs(self.ttl as u32));
 
-        if let Some(tail_id) = self.tail() {
-            // THE SEAL: the old tail stops accepting writes and becomes
-            // evictable at the exact moment its successor exists — one
-            // CAS carries both the state transition and the next pointer.
-            let tail = segments.get_mut(tail_id).unwrap();
-            let sealed = tail.cas_metadata(
+        let won = match observed_tail {
+            Some(tail_id) => {
+                let tail = segments.header(tail_id);
+                loop {
+                    // THE SEAL: the old tail stops accepting writes and
+                    // becomes evictable at the exact moment its
+                    // successor exists — one CAS carries both the state
+                    // transition and the next pointer. This is also the
+                    // election: exactly one expander can seal a given
+                    // tail.
+                    if tail.cas_metadata(
+                        State::Live,
+                        State::Sealed,
+                        Some(Some(id)),
+                        None,
+                        Ordering::AcqRel,
+                    ) {
+                        let linked = segments.header(id).cas_metadata(
+                            State::Reserved,
+                            State::Linking,
+                            Some(None),
+                            Some(Some(tail_id)),
+                            Ordering::AcqRel,
+                        );
+                        debug_assert!(linked, "freshly reserved segment must be Reserved");
+                        self.set_tail(Some(id));
+                        break true;
+                    }
+                    // The CAS can fail without the election being
+                    // decided: a draining neighbor patching `prev`
+                    // changes the packed metadata word while the state
+                    // stays Live. Only a state change decides the
+                    // election.
+                    if tail.state() == State::Live {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    break false;
+                }
+            }
+            None => {
+                if self.cas_tail_none_to(id) {
+                    let linked = segments.header(id).cas_metadata(
+                        State::Reserved,
+                        State::Linking,
+                        Some(None),
+                        Some(None),
+                        Ordering::AcqRel,
+                    );
+                    debug_assert!(linked, "freshly reserved segment must be Reserved");
+                    self.set_head(Some(id));
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if won {
+            // Publish the new tail as the writable segment.
+            let live = segments.header(id).cas_metadata(
+                State::Linking,
                 State::Live,
-                State::Sealed,
-                Some(Some(id)),
+                None,
                 None,
                 Ordering::AcqRel,
             );
-            if !sealed {
-                // Condemned segments are unlinked immediately, so the
-                // bucket tail is always Live (or None). Surface a broken
-                // invariant in tests; degrade to a link-only patch in
-                // release builds.
-                debug_assert!(false, "bucket tail was not Live at seal time");
-                tail.update_links(Some(Some(id)), None);
-            }
-
-            let segment = segments.get_mut(id).unwrap();
-            let linked = segment.cas_metadata(
-                State::Reserved,
-                State::Linking,
-                Some(None),
-                Some(Some(tail_id)),
-                Ordering::AcqRel,
-            );
-            debug_assert!(linked, "freshly reserved segment must be Reserved");
+            debug_assert!(live, "linking segment must publish as Live");
+            self.nseg.fetch_add(1, Ordering::Relaxed);
         } else {
-            debug_assert!(self.head().is_none());
-            let segment = segments.get_mut(id).unwrap();
-            let linked = segment.cas_metadata(
-                State::Reserved,
-                State::Linking,
-                Some(None),
-                Some(None),
-                Ordering::AcqRel,
-            );
-            debug_assert!(linked, "freshly reserved segment must be Reserved");
-            self.set_head(Some(id));
+            // Election lost: another writer expanded past the tail we
+            // observed (or eviction drained it). Wait for the tail word
+            // to advance — the winner's store is imminent — so the
+            // caller's retry sees the fresh segment, then put our
+            // reserved segment back.
+            while self.tail() == observed_tail {
+                std::hint::spin_loop();
+            }
+            segments.release_unused(id);
         }
-
-        self.set_tail(Some(id));
-        self.nseg.fetch_add(1, Ordering::Relaxed);
-
-        // Publish the new tail as the writable segment.
-        let segment = segments.get_mut(id).unwrap();
-        let live = segment.cas_metadata(State::Linking, State::Live, None, None, Ordering::AcqRel);
-        debug_assert!(live, "linking segment must publish as Live");
         Ok(())
     }
 
     /// Reserve space for an item in this bucket's tail segment.
     ///
-    /// Expands the bucket with a new segment if the current tail is full
-    /// or inaccessible. Returns a `ReservedItem` pointing to the allocated
-    /// space, or an error if the item is oversized or no segments are free.
+    /// Expands the bucket with a new segment if the current tail is
+    /// full. Concurrent-safe among writers: space grants are a bounded
+    /// CAS on the tail's write offset, and expansion is a lock-free
+    /// seal election (see `try_expand`). Returns a `ReservedItem`
+    /// pointing to the allocated space, or an error if the item is
+    /// oversized or no segments are free.
     pub(crate) fn reserve(
-        &mut self,
+        &self,
         size: usize,
-        segments: &mut Segments,
+        segments: &Segments,
     ) -> Result<ReservedItem, TtlBucketsError> {
         let seg_size = segments.segment_size() as usize;
 
@@ -289,18 +342,25 @@ impl TtlBucket {
         }
 
         loop {
-            if let Some(id) = self.tail() {
-                // A non-writable tail (sealed, or drained while pinned
-                // by a reader) falls through to expansion: a fresh
-                // segment is linked after it. Spinning here would
-                // never make the tail writable again.
-                if segments.header(id).state().is_writable() {
+            let tail = self.tail();
+            if let Some(id) = tail {
+                let state = segments.header(id).state();
+                if state.is_writable() {
                     if let Some(reserved) = segments.try_alloc_item(id, size as i32) {
                         return Ok(reserved);
                     }
+                    // Live but full: expand, sealing exactly this tail.
+                } else {
+                    // Mid-election (Linking) or being drained: the
+                    // chain is about to advance. Re-read the tail
+                    // rather than expanding behind a transient state.
+                    // Unreachable single-threaded: seal and publish
+                    // happen inside one try_expand call.
+                    std::hint::spin_loop();
+                    continue;
                 }
             }
-            self.try_expand(segments)?;
+            self.try_expand(tail, segments)?;
         }
     }
 }

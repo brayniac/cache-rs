@@ -23,7 +23,7 @@ mod test {
 
     #[test]
     fn free_q() {
-        let mut segments = SegmentsBuilder::default()
+        let segments = SegmentsBuilder::default()
             .heap_size(16 * 1024 * 1024)
             .build()
             .expect("failed to create segments");

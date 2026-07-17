@@ -75,6 +75,13 @@ impl TtlBuckets {
         }
     }
 
+    /// Get the bucket for the given TTL.
+    pub(crate) fn get_bucket(&self, ttl: Duration) -> &TtlBucket {
+        let index = self.get_bucket_index(ttl);
+        // SAFETY: get_bucket_index always returns a valid index.
+        unsafe { self.buckets.get_unchecked(index) }
+    }
+
     /// Get a mutable reference to the bucket for the given TTL.
     pub(crate) fn get_mut_bucket(&mut self, ttl: Duration) -> &mut TtlBucket {
         let index = self.get_bucket_index(ttl);

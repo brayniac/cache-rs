@@ -385,6 +385,8 @@ mod loom_tests {
     use loom::sync::Arc;
     use loom::thread;
 
+    // See the loom discipline NOTE in segments/header.rs loom_tests.
+
     // Two writers race to install the first segment of an empty
     // bucket. The tail-word CAS admits exactly one winner — the mutual
     // exclusion the empty-bucket arm of try_expand relies on. Pure CAS
@@ -398,7 +400,18 @@ mod loom_tests {
                 .into_iter()
                 .map(|id| {
                     let b = Arc::clone(&bucket);
-                    thread::spawn(move || b.cas_tail_none_to(NonZeroU32::new(id).unwrap()))
+                    thread::spawn(move || {
+                        let won = b.cas_tail_none_to(NonZeroU32::new(id).unwrap());
+                        if !won {
+                            // Loser coherence: the winner's tail install
+                            // is visible immediately after the failed
+                            // CAS — the fact the production loser's
+                            // spin-wait termination depends on. Pure
+                            // coherence, not the SC total order.
+                            assert!(b.tail().is_some());
+                        }
+                        won
+                    })
                 })
                 .collect();
             let wins: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();

@@ -622,9 +622,9 @@ mod loom_tests {
     // loom, because it explores the store-buffering interleaving that
     // SeqCst forbids on real hardware. The models therefore assert only
     // the SC-independent halves (CAS uniqueness -> no double-free;
-    // revert consistency); the SC-dependent halves are pinned by the
-    // single-threaded behavioral tests, where store buffering cannot
-    // occur.
+    // revert consistency; election uniqueness; bounded reservation
+    // grants); the SC-dependent halves are pinned by the single-threaded
+    // behavioral tests, where store buffering cannot occur.
 
     // Two readers race a drain that mirrors the merge-source gate: take
     // Draining exclusivity via CAS, re-check the reader count, and
@@ -805,13 +805,22 @@ mod loom_tests {
                 .map(|succ| {
                     let t = Arc::clone(&tail);
                     thread::spawn(move || {
-                        t.cas_metadata(
+                        let won = t.cas_metadata(
                             State::Live,
                             State::Sealed,
                             Some(NonZeroU32::new(succ)),
                             None,
                             Ordering::AcqRel,
-                        )
+                        );
+                        if !won {
+                            // Loser coherence: the winner's Sealed
+                            // transition is visible immediately after the
+                            // failed CAS — the fact the loser's
+                            // state-recheck in try_expand depends on.
+                            // Pure coherence, not the SC total order.
+                            assert_eq!(t.state(), State::Sealed);
+                        }
+                        won
                     })
                 })
                 .collect();
@@ -824,8 +833,10 @@ mod loom_tests {
         });
     }
 
-    // Two writers CAS-reserve space from the same segment: grants are
-    // disjoint and never exceed capacity, in every interleaving.
+    // Two writers CAS-reserve space from the same segment: both fit, so
+    // the final state is fully determined regardless of interleaving —
+    // the grants are exactly {base, base+24} and the offset lands at
+    // base+48. Pure CAS-disjointness + bound: SC-independent.
     #[test]
     fn loom_reserve_space_disjoint_bounded() {
         loom::model(|| {
@@ -840,15 +851,49 @@ mod loom_tests {
                     thread::spawn(move || h.try_reserve_space(size, cap).map(|o| (o, size)))
                 })
                 .collect();
-            let grants: Vec<(i32, i32)> = handles
+            let mut grants: Vec<(i32, i32)> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect();
+            grants.sort_unstable();
+
+            // both fit; the grant set and final offset are exact.
+            assert_eq!(grants, vec![(base, 24), (base + 24, 24)]);
+            assert_eq!(h.write_offset(), base + 48);
+        });
+    }
+
+    // Two writers race to reserve more than half the capacity each: only
+    // one 40-byte grant can fit in 64 bytes (40 + 40 > 64). This is the
+    // capacity-rejection property under contention that motivated a
+    // bounded CAS over a raw fetch_add. Pure CAS uniqueness + bound:
+    // SC-independent.
+    #[test]
+    fn loom_reserve_space_bounded_under_contention() {
+        loom::model(|| {
+            let h = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            let base = h.write_offset(); // 0, or 8 with `integrity`
+            let cap = base + 64;
+
+            let handles: Vec<_> = [40i32, 40i32]
+                .into_iter()
+                .map(|size| {
+                    let h = Arc::clone(&h);
+                    thread::spawn(move || h.try_reserve_space(size, cap))
+                })
+                .collect();
+            let grants: Vec<i32> = handles
                 .into_iter()
                 .filter_map(|h| h.join().unwrap())
                 .collect();
 
-            // both fit; grants must be disjoint and bounded
-            assert_eq!(grants.len(), 2);
-            let (a, b) = (grants[0], grants[1]);
-            assert!(a.0 + a.1 <= b.0 || b.0 + b.1 <= a.0, "grants overlap");
+            assert_eq!(
+                grants.len(),
+                1,
+                "only one 40-byte reservation can fit in 64 bytes"
+            );
+            assert_eq!(grants[0], base);
+            assert_eq!(h.write_offset(), base + 40);
             assert!(h.write_offset() <= cap);
         });
     }

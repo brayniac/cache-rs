@@ -24,53 +24,75 @@
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 
-use crate::sync::Ordering;
+use crate::sync::{AtomicU32, Ordering};
 use crate::*;
 use core::num::NonZeroU32;
 
 /// A TTL bucket holding a doubly-linked segment chain.
 ///
-/// Padded to exactly 64 bytes (one cache line).
+/// Padded to exactly 64 bytes (one cache line). Chain pointers use the
+/// 0-is-none convention (segment ids are `NonZeroU32`), matching the
+/// packed metadata links in `segments::state`.
 pub struct TtlBucket {
-    head: Option<NonZeroU32>,
-    tail: Option<NonZeroU32>,
+    head: AtomicU32,
+    tail: AtomicU32,
     ttl: i32,
-    nseg: i32,
-    next_to_merge: Option<NonZeroU32>,
+    /// Total segments ever linked into this bucket (write-only today;
+    /// kept for parity with the original layout).
+    nseg: AtomicU32,
+    next_to_merge: AtomicU32,
     _pad: [u8; 44],
 }
+
+// Loom atomics are larger than std atomics, so skip size check under loom.
+#[cfg(not(feature = "loom"))]
+const _: () = assert!(std::mem::size_of::<TtlBucket>() == 64);
 
 impl TtlBucket {
     /// Create an empty bucket for the given TTL.
     pub(super) fn new(ttl: i32) -> Self {
         Self {
-            head: None,
-            tail: None,
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
             ttl,
-            nseg: 0,
-            next_to_merge: None,
+            nseg: AtomicU32::new(0),
+            next_to_merge: AtomicU32::new(0),
             _pad: [0; 44],
         }
     }
 
     /// Head of the segment chain (oldest segment).
     pub fn head(&self) -> Option<NonZeroU32> {
-        self.head
+        NonZeroU32::new(self.head.load(Ordering::Acquire))
     }
 
     /// Set the head segment.
-    pub fn set_head(&mut self, id: Option<NonZeroU32>) {
-        self.head = id;
+    pub fn set_head(&self, id: Option<NonZeroU32>) {
+        self.head
+            .store(id.map_or(0, NonZeroU32::get), Ordering::Release);
+    }
+
+    /// Tail of the segment chain (the writable segment, when Live).
+    pub(crate) fn tail(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.tail.load(Ordering::Acquire))
+    }
+
+    /// Set the tail segment.
+    fn set_tail(&self, id: Option<NonZeroU32>) {
+        self.tail
+            .store(id.map_or(0, NonZeroU32::get), Ordering::Release);
     }
 
     /// Next segment to merge (for merge eviction policy).
+    /// Relaxed: only touched under `&mut`-serialized eviction.
     pub fn next_to_merge(&self) -> Option<NonZeroU32> {
-        self.next_to_merge
+        NonZeroU32::new(self.next_to_merge.load(Ordering::Relaxed))
     }
 
     /// Set the next merge target.
-    pub fn set_next_to_merge(&mut self, next: Option<NonZeroU32>) {
-        self.next_to_merge = next;
+    pub fn set_next_to_merge(&self, next: Option<NonZeroU32>) {
+        self.next_to_merge
+            .store(next.map_or(0, NonZeroU32::get), Ordering::Relaxed);
     }
 
     /// Expire segments whose TTL has elapsed.
@@ -109,7 +131,7 @@ impl TtlBucket {
         expire_cutoff: Option<Instant>,
     ) -> usize {
         let mut freed = 0;
-        let mut cursor = self.head;
+        let mut cursor = self.head();
 
         while let Some(seg_id) = cursor {
             let mut segment = segments.get_mut(seg_id).unwrap();
@@ -145,11 +167,11 @@ impl TtlBucket {
             segment.clear(hashtable, true);
 
             // The segment leaves the chain either way.
-            if self.head == Some(seg_id) {
-                self.head = next;
+            if self.head() == Some(seg_id) {
+                self.set_head(next);
             }
-            if self.tail == Some(seg_id) {
-                self.tail = prev;
+            if self.tail() == Some(seg_id) {
+                self.set_tail(prev);
             }
 
             if segment.header_ref_count_seqcst() == 0 {
@@ -196,7 +218,7 @@ impl TtlBucket {
             segment.set_ttl(Duration::from_secs(self.ttl as u32));
         }
 
-        if let Some(tail_id) = self.tail {
+        if let Some(tail_id) = self.tail() {
             // THE SEAL: the old tail stops accepting writes and becomes
             // evictable at the exact moment its successor exists — one
             // CAS carries both the state transition and the next pointer.
@@ -227,7 +249,7 @@ impl TtlBucket {
             );
             debug_assert!(linked, "freshly reserved segment must be Reserved");
         } else {
-            debug_assert!(self.head.is_none());
+            debug_assert!(self.head().is_none());
             let segment = segments.get_mut(id).unwrap();
             let linked = segment.cas_metadata(
                 State::Reserved,
@@ -237,11 +259,11 @@ impl TtlBucket {
                 Ordering::AcqRel,
             );
             debug_assert!(linked, "freshly reserved segment must be Reserved");
-            self.head = Some(id);
+            self.set_head(Some(id));
         }
 
-        self.tail = Some(id);
-        self.nseg += 1;
+        self.set_tail(Some(id));
+        self.nseg.fetch_add(1, Ordering::Relaxed);
 
         // Publish the new tail as the writable segment.
         let segment = segments.get_mut(id).unwrap();
@@ -267,7 +289,7 @@ impl TtlBucket {
         }
 
         loop {
-            if let Some(id) = self.tail {
+            if let Some(id) = self.tail() {
                 // A non-writable tail (sealed, or drained while pinned
                 // by a reader) falls through to expansion: a fresh
                 // segment is linked after it. Spinning here would

@@ -489,7 +489,11 @@ impl Segments {
     /// into a chain — the loser path of the chain-extension election
     /// and allocation error paths.
     pub(crate) fn release_unused(&self, id: NonZeroU32) {
-        assert!(self.headers[id.get() as usize - 1].try_release());
+        let released = self.headers[id.get() as usize - 1].try_release();
+        assert!(
+            released,
+            "release_unused on a segment not in Reserved/Linking"
+        );
         self.free_queue.push(id.get());
 
         #[cfg(feature = "metrics")]

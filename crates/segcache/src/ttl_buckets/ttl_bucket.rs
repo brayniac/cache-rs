@@ -226,6 +226,11 @@ impl TtlBucket {
     /// whatever the tail happens to be at CAS time — so an election
     /// loser can never seal the winner's freshly linked, near-empty
     /// segment.
+    ///
+    /// The *election* is lock-free; losers briefly wait for the
+    /// winner's tail publish, which is bounded straight-line work. The
+    /// spins have no yield fallback yet — acceptable while writers are
+    /// internal-test-only; revisit at item 7.
     fn try_expand(
         &self,
         observed_tail: Option<NonZeroU32>,
@@ -281,6 +286,7 @@ impl TtlBucket {
             }
             None => {
                 if self.cas_tail_none_to(id) {
+                    debug_assert!(self.head().is_none());
                     let linked = segments.header(id).cas_metadata(
                         State::Reserved,
                         State::Linking,
@@ -351,9 +357,11 @@ impl TtlBucket {
                     }
                     // Live but full: expand, sealing exactly this tail.
                 } else {
-                    // Mid-election (Linking) or being drained: the
-                    // chain is about to advance. Re-read the tail
-                    // rather than expanding behind a transient state.
+                    // Mid-election (Reserved or Linking — the
+                    // empty-bucket winner publishes the tail word
+                    // before its link CAS) or being drained: the chain
+                    // is about to advance. Re-read the tail rather
+                    // than expanding behind a transient state.
                     // Unreachable single-threaded: seal and publish
                     // happen inside one try_expand call.
                     std::hint::spin_loop();

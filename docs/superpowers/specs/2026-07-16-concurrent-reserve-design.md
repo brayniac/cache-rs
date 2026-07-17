@@ -62,18 +62,23 @@ is absorbed by this outer loop — one bounded retry, not an error.
 ## 3. Chain extension: seal-CAS election in `try_expand`
 
 - Reserve a free segment `R` (`Segments::reserve_free`), set its TTL.
-- **Non-empty bucket**: loop — read `tail = T`; attempt the seal CAS on `T`
-  (Live→Sealed, next=`R`, one CAS).
+- **Non-empty bucket**: attempt the seal CAS on the caller's observed-full
+  tail `T` (Live→Sealed, next=`R`, one CAS), retrying while `T` remains
+  Live — the packed word can churn without a state change (a draining
+  neighbor patching `T.prev`); only a state change decides the election.
   - **Win**: link `R` (Reserved→Linking, prev=`T`), store `bucket.tail = R`
     (Release), publish `R` Linking→Live, `nseg += 1`.
-  - **Lose**: another writer sealed `T` first. Chase `T.next` links to the
-    current tail (no spinning on the bucket atomic waiting for the winner's
-    store) and retry the seal with the same `R` — no free-queue churn.
+  - **Lose**: `T` left Live — another writer sealed it first (or eviction
+    drained it). Wait for the bucket tail word to advance past `T` (the
+    winner's Release store is imminent), release `R` back to the free
+    queue (`release_unused`), and return; the caller's `reserve` loop
+    retries against the fresh tail.
 - **Empty bucket**: election by `CAS bucket.tail 0→R`. Winner links `R`
   (prev=None), stores `head = R` (Release), publishes Live, `nseg += 1`.
-  Loser falls into the non-empty path.
-- Error paths (a loser that must abandon, `NoFreeSegments` after partial
-  work) release `R` via `try_release` + free-queue push. The
+  Loser takes the same wait-then-release path as the non-empty loser
+  (the tail word was already advanced by the winning CAS itself).
+- Error paths (a loser abandoning its reservation, `NoFreeSegments` after
+  partial work) release `R` via `try_release` + free-queue push. The
   `#[cfg(test)] release_unused` helper is promoted to a real code path.
 
 Today's `debug_assert!(false, "bucket tail was not Live at seal time")`
@@ -83,6 +88,15 @@ paths become the normal lose/retry paths.
 and `try_reserve` are already lock-free from #28). The "not actually Free —
 put it back" branch keeps its return-None behavior; it is genuinely
 reachable under concurrent expansion now.
+
+**Amendment (2026-07-16).** An earlier draft of the loser path chased
+`T.next` links to the current tail and retried the seal with the same `R`,
+avoiding free-queue churn. That was superseded during planning: the seal
+must target only the tail the caller observed as full — retrying against a
+chased successor could seal the winner's freshly linked, near-empty
+segment, cascading into poor utilization. The landed release-and-retry
+variant is also simpler, and its churn is one free-queue round-trip per
+lost election, which is rare.
 
 ## 4. Memory ordering
 

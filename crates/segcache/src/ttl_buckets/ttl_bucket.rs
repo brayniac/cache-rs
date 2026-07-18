@@ -141,6 +141,12 @@ impl TtlBucket {
     }
 
     /// Shared drain walk for expire (with an age cutoff) and clear.
+    ///
+    /// SCOPE(item-5): assumes no concurrent writers — the walk parses
+    /// items up to write_offset, which is only sound while reservations
+    /// cannot race the drain. Safe today because eviction and writers
+    /// are serialized by `&mut Segcache`; the writer-vs-drain protocol
+    /// lands with the eviction drain rework.
     fn drain_chain(
         &mut self,
         hashtable: &MultiChoiceHashtable,

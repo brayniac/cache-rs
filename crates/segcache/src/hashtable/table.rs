@@ -578,6 +578,12 @@ impl MultiChoiceHashtable {
     // =========================================================================
 
     /// Try to link in a bucket, handling existing entries and ghosts.
+    ///
+    /// Every `compare_exchange` below publishes `new_packed` with
+    /// `Ordering::Release` on success: this is the linearization point
+    /// that exposes a location to readers, and Release orders the item
+    /// bytes written into segment memory by reserve/define ahead of it —
+    /// the ordering the concurrent reserve path relies on (spec §4).
     fn try_link_in_bucket(
         &self,
         bucket_index: usize,
@@ -742,7 +748,10 @@ impl MultiChoiceHashtable {
         false
     }
 
-    /// Try to CAS update location in a bucket.
+    /// Try to CAS update location in a bucket. Same publish reasoning as
+    /// `try_link_in_bucket`: the success ordering below is Release, which
+    /// orders the new item's reserve/define byte writes ahead of the
+    /// location becoming visible to readers.
     fn try_cas_in_bucket(
         &self,
         bucket_index: usize,

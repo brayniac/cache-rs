@@ -174,15 +174,6 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
-    pub fn update_links(
-        &self,
-        new_next: Option<Option<NonZeroU32>>,
-        new_prev: Option<Option<NonZeroU32>>,
-    ) {
-        self.header.update_links(new_next, new_prev);
-    }
-
-    #[inline]
     pub fn can_evict(&self) -> bool {
         self.header.can_evict()
     }
@@ -195,11 +186,6 @@ impl<'a> Segment<'a> {
     #[inline]
     pub fn ttl(&self) -> Duration {
         self.header.ttl()
-    }
-
-    #[inline]
-    pub fn set_ttl(&self, ttl: Duration) {
-        self.header.set_ttl(ttl);
     }
 
     #[inline]
@@ -228,25 +214,6 @@ impl<'a> Segment<'a> {
     }
 
     // -- Item operations --
-
-    /// Allocate space for an item, returning a `RawItem` pointing to the
-    /// allocated region. Updates write offset, live items, and live bytes.
-    pub(crate) fn alloc_item(&self, size: i32) -> RawItem {
-        let offset = self.header.fetch_add_write_offset(size);
-
-        self.header.incr_live_items();
-        self.header.incr_live_bytes(size);
-
-        #[cfg(feature = "metrics")]
-        {
-            ITEM_CURRENT.increment();
-            ITEM_CURRENT_BYTES.add(size as _);
-            ITEM_ALLOCATE.increment();
-        }
-
-        let ptr = (self.data.as_ptr() as *mut u8).wrapping_add(offset as usize);
-        RawItem::from_ptr(ptr)
-    }
 
     /// Remove an item at the given offset, decrementing live counters.
     pub(crate) fn remove_item_at(&self, offset: usize) {

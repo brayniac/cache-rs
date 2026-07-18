@@ -12,6 +12,9 @@ mod ttl_buckets;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, not(feature = "loom")))]
+mod concurrency_tests;
+
 pub use error::TtlBucketsError;
 pub use ttl_bucket::TtlBucket;
 pub use ttl_buckets::TtlBuckets;

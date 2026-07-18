@@ -257,7 +257,6 @@ impl SegmentHeader {
 
     /// Return an unused segment to Free (Reserved|Linking -> Free).
     /// Used by allocation error paths before a segment becomes visible.
-    #[allow(dead_code)] // production callers arrive with the append-protocol error paths
     pub fn try_release(&self) -> bool {
         self.cas_metadata(
             State::Reserved,
@@ -401,11 +400,38 @@ impl SegmentHeader {
         self.write_offset.store(offset, Ordering::Relaxed);
     }
 
-    /// Atomically add to the write offset, returning the previous value.
-    /// The returned value is the offset where the caller can write.
-    #[inline]
-    pub fn fetch_add_write_offset(&self, size: i32) -> i32 {
-        self.write_offset.fetch_add(size, Ordering::Relaxed)
+    /// Atomically reserve `size` bytes of item space, returning the
+    /// offset where the caller may write. Fails (`None`) if the
+    /// reservation would exceed `capacity`, or if the new offset would
+    /// overflow `i32` — `write_offset` never exceeds the capacity, so
+    /// item scans, live-byte accounting, and seal decisions need no
+    /// clamping (this is why the reservation is a bounded CAS rather
+    /// than a raw `fetch_add`).
+    ///
+    /// A CAS failure means another writer took the slot; the retry
+    /// re-reads the observed offset, which only moves toward capacity,
+    /// so the loop terminates.
+    ///
+    /// AcqRel: writer↔writer coordination on the offset word only — no
+    /// Dekker pairing with the reader path, so SeqCst is not warranted.
+    pub fn try_reserve_space(&self, size: i32, capacity: i32) -> Option<i32> {
+        debug_assert!(size >= 0, "reservation size must be non-negative");
+        let mut current = self.write_offset.load(Ordering::Acquire);
+        loop {
+            let new = current.checked_add(size)?;
+            if new > capacity {
+                return None;
+            }
+            match self.write_offset.compare_exchange(
+                current,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(current),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     // -- Live bytes --
@@ -596,9 +622,9 @@ mod loom_tests {
     // loom, because it explores the store-buffering interleaving that
     // SeqCst forbids on real hardware. The models therefore assert only
     // the SC-independent halves (CAS uniqueness -> no double-free;
-    // revert consistency); the SC-dependent halves are pinned by the
-    // single-threaded behavioral tests, where store buffering cannot
-    // occur.
+    // revert consistency; election uniqueness; bounded reservation
+    // grants); the SC-dependent halves are pinned by the single-threaded
+    // behavioral tests, where store buffering cannot occur.
 
     // Two readers race a drain that mirrors the merge-source gate: take
     // Draining exclusivity via CAS, re-check the reader count, and
@@ -760,5 +786,174 @@ mod loom_tests {
                 assert_eq!(header.ref_count(), 0);
             }
         });
+    }
+
+    // The chain-extension election: two expanders race to seal the same
+    // Live tail with different successors. The one-CAS seal admits
+    // exactly one winner, and the link matches the winner — this is the
+    // mutual exclusion the lock-free try_expand relies on. Pure CAS
+    // uniqueness on one word: SC-independent, fully within loom's power
+    // (see module note).
+    #[test]
+    fn loom_seal_election_single_winner() {
+        loom::model(|| {
+            let tail = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            tail.set_state(State::Live);
+
+            let handles: Vec<_> = [2u32, 3u32]
+                .into_iter()
+                .map(|succ| {
+                    let t = Arc::clone(&tail);
+                    thread::spawn(move || {
+                        let won = t.cas_metadata(
+                            State::Live,
+                            State::Sealed,
+                            Some(NonZeroU32::new(succ)),
+                            None,
+                            Ordering::AcqRel,
+                        );
+                        if !won {
+                            // Loser coherence: the winner's Sealed
+                            // transition is visible immediately after the
+                            // failed CAS — the fact the loser's
+                            // state-recheck in try_expand depends on.
+                            // Pure coherence, not the SC total order.
+                            assert_eq!(t.state(), State::Sealed);
+                        }
+                        won
+                    })
+                })
+                .collect();
+            let wins: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            assert_eq!(wins.iter().filter(|w| **w).count(), 1, "exactly one seal");
+            assert_eq!(tail.state(), State::Sealed);
+            let expected_succ = if wins[0] { 2 } else { 3 };
+            assert_eq!(tail.next_seg().unwrap().get(), expected_succ);
+        });
+    }
+
+    // Two writers CAS-reserve space from the same segment: both fit, so
+    // the final state is fully determined regardless of interleaving —
+    // the grants are exactly {base, base+24} and the offset lands at
+    // base+48. Pure CAS-disjointness + bound: SC-independent.
+    #[test]
+    fn loom_reserve_space_disjoint_bounded() {
+        loom::model(|| {
+            let h = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            let base = h.write_offset(); // 0, or 8 with `integrity`
+            let cap = base + 64;
+
+            let handles: Vec<_> = [24i32, 24i32]
+                .into_iter()
+                .map(|size| {
+                    let h = Arc::clone(&h);
+                    thread::spawn(move || h.try_reserve_space(size, cap).map(|o| (o, size)))
+                })
+                .collect();
+            let mut grants: Vec<(i32, i32)> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect();
+            grants.sort_unstable();
+
+            // both fit; the grant set and final offset are exact.
+            assert_eq!(grants, vec![(base, 24), (base + 24, 24)]);
+            assert_eq!(h.write_offset(), base + 48);
+        });
+    }
+
+    // Two writers race to reserve more than half the capacity each: only
+    // one 40-byte grant can fit in 64 bytes (40 + 40 > 64). This is the
+    // capacity-rejection property under contention that motivated a
+    // bounded CAS over a raw fetch_add. Pure CAS uniqueness + bound:
+    // SC-independent.
+    #[test]
+    fn loom_reserve_space_bounded_under_contention() {
+        loom::model(|| {
+            let h = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            let base = h.write_offset(); // 0, or 8 with `integrity`
+            let cap = base + 64;
+
+            let handles: Vec<_> = [40i32, 40i32]
+                .into_iter()
+                .map(|size| {
+                    let h = Arc::clone(&h);
+                    thread::spawn(move || h.try_reserve_space(size, cap))
+                })
+                .collect();
+            let grants: Vec<i32> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect();
+
+            assert_eq!(
+                grants.len(),
+                1,
+                "only one 40-byte reservation can fit in 64 bytes"
+            );
+            assert_eq!(grants[0], base);
+            assert_eq!(h.write_offset(), base + 40);
+            assert!(h.write_offset() <= cap);
+        });
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+
+    // The initial write_offset is 0, or 8 with the `integrity` feature
+    // (magic bytes). Tests use relative math so they pass either way.
+    fn initial_offset() -> i32 {
+        if cfg!(feature = "integrity") {
+            std::mem::size_of::<u64>() as i32
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn reserve_space_grants_sequential_offsets() {
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        let base = initial_offset();
+        assert_eq!(h.try_reserve_space(24, base + 128), Some(base));
+        assert_eq!(h.try_reserve_space(40, base + 128), Some(base + 24));
+        assert_eq!(h.write_offset(), base + 64);
+    }
+
+    #[test]
+    fn reserve_space_exact_fit_boundary() {
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        let base = initial_offset();
+        // fills the segment exactly
+        assert_eq!(h.try_reserve_space(64, base + 64), Some(base));
+        assert_eq!(h.write_offset(), base + 64);
+        // nothing further fits, offset must not move
+        assert_eq!(h.try_reserve_space(8, base + 64), None);
+        assert_eq!(h.write_offset(), base + 64);
+    }
+
+    #[test]
+    fn reserve_space_rejects_oversized() {
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        let base = initial_offset();
+        assert_eq!(h.try_reserve_space(129, base + 128), None);
+        // a failed reservation must not advance the offset
+        assert_eq!(h.write_offset(), base);
+        // smaller items still fit after a large one failed
+        assert_eq!(h.try_reserve_space(64, base + 128), Some(base));
+    }
+
+    #[test]
+    fn reserve_space_offset_overflow_fails() {
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        let base = initial_offset();
+        // advance the offset so current > 0, then request a size that
+        // overflows current + size in i32
+        assert_eq!(h.try_reserve_space(8, base + 64), Some(base));
+        assert_eq!(h.try_reserve_space(i32::MAX, i32::MAX), None);
+        // a failed reservation must not advance the offset
+        assert_eq!(h.write_offset(), base + 8);
     }
 }

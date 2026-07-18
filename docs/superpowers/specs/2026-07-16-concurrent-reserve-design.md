@@ -48,16 +48,23 @@ load/store instead of plain field access.
 
 ```text
 loop:
-    if let Some(tail) = self.tail (Acquire):
-        if tail.is_writable():
-            if let Some(item) = tail.try_alloc_item(size):
+    let tail = self.tail (Acquire)
+    if let Some(id) = tail:
+        if id.is_writable():
+            if let Some(item) = id.try_alloc_item(size):
                 return Ok(ReservedItem)
-    self.try_expand(segments)?
+            // writable but full → fall through to expand this tail
+        else:
+            spin_loop(); continue   // transient Reserved/Linking: re-read
+    self.try_expand(tail, segments)?
 ```
 
-`None` from `try_alloc_item` means genuinely full → expand. A transiently
-non-writable tail (expansion winner published `tail` before Linking→Live)
-is absorbed by this outer loop — one bounded retry, not an error.
+`None` from `try_alloc_item` on a *writable* tail means genuinely full →
+expand, sealing exactly the tail this loop observed. A transiently
+non-writable tail (an expansion winner published the tail word before
+`Linking→Live`, or an empty-bucket winner before its link CAS) is
+re-read rather than expanded behind — one bounded retry, not an error.
+`try_expand` receives the observed tail so the seal targets exactly it.
 
 ## 3. Chain extension: seal-CAS election in `try_expand`
 

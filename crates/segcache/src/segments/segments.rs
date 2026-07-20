@@ -32,6 +32,19 @@ pub(crate) struct Segments {
     /// hold a raw pointer to it so the AwaitingRelease handoff can return
     /// segments without `&mut Segments`.
     free_queue: Box<crossbeam_deque::Injector<u32>>,
+    /// Held-back spare segments for merge compaction. Never handed out by
+    /// `reserve_free` (normal writes), so a destination is always available
+    /// to merge even when the main free queue is empty.
+    spare_queue: Box<crossbeam_deque::Injector<u32>>,
+    /// Target number of segments to keep in the spare queue.
+    spare_capacity: u32,
+    /// Current spare-queue depth. Single-writer today — eviction (the
+    /// only caller of `reserve_spare`/`return_segment`) is `&mut`-
+    /// serialized, so the check-then-act in `return_segment` is race-free
+    /// in practice. This is `Atomic` for the type to stay stable, but a
+    /// CAS/bounded-push is required here before item-7 makes returns
+    /// concurrent.
+    spare_count: crate::sync::AtomicU32,
     /// Eviction configuration and state.
     evict: Box<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
@@ -85,10 +98,21 @@ impl Segments {
         let heap_size = segments * segment_size as usize;
         let mut data = MmapOptions::new().populate().len(heap_size).map_anon()?;
 
-        // Initialize each segment and fill the free queue. Segments rest
-        // in the Free state with no chain links; the free queue itself is
-        // a lock-free Injector rather than an intrusive list.
+        // A Merge-policy cache holds back one segment as a copy
+        // destination for compaction, always available even when the
+        // normal free queue is drained to empty. Other policies never
+        // compact in place, so they need no spare.
+        let spare_capacity: u32 = if matches!(evict_policy, Policy::Merge { .. }) {
+            1
+        } else {
+            0
+        };
+
+        // Initialize each segment and fill the free/spare queues. Segments
+        // rest in the Free state with no chain links; both queues are
+        // lock-free Injectors rather than intrusive lists.
         let free_queue = Box::new(crossbeam_deque::Injector::new());
+        let spare_queue = Box::new(crossbeam_deque::Injector::new());
         for idx in 0..segments {
             let begin = segment_size as usize * idx;
             let end = begin + segment_size as usize;
@@ -96,7 +120,12 @@ impl Segments {
             let mut segment = Segment::from_raw_parts(&headers[idx], &mut data[begin..end]);
             segment.init();
 
-            free_queue.push(idx as u32 + 1); // segments are 1-indexed
+            let id = idx as u32 + 1; // segments are 1-indexed
+            if (idx as u32) < spare_capacity {
+                spare_queue.push(id);
+            } else {
+                free_queue.push(id);
+            }
         }
 
         #[cfg(feature = "metrics")]
@@ -116,6 +145,9 @@ impl Segments {
             segment_size,
             cap: segments as u32,
             free_queue,
+            spare_queue,
+            spare_capacity,
+            spare_count: crate::sync::AtomicU32::new(spare_capacity),
             data,
             evict: Box::new(Eviction::new(segments, evict_policy)),
             admission_cap,
@@ -163,10 +195,30 @@ impl Segments {
         )
     }
 
-    /// Returns the number of free segments.
+    /// Returns the number of available segments (free queue + spare
+    /// queue).
     #[cfg(test)]
     pub fn free(&self) -> usize {
+        self.free_queue.len() + self.spare_queue.len()
+    }
+
+    /// Returns the number of segments available to normal writes (free
+    /// queue only, excluding the held-back spare).
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn free_only(&self) -> usize {
         self.free_queue.len()
+    }
+
+    /// Target number of segments held back in the spare queue.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn spare_capacity(&self) -> u32 {
+        self.spare_capacity
+    }
+
+    /// Current spare-queue depth.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn spare_count(&self) -> u32 {
+        self.spare_count.load(Ordering::Relaxed)
     }
 
     /// Shared access to a segment's header by id.
@@ -245,11 +297,13 @@ impl Segments {
     /// (hot path); the debug-feature `check_integrity` scan covers it,
     /// the same idiom as `expiry_info`.
     ///
-    /// SCOPE(item-5): the reserve→define→publish window is not yet
-    /// protected against a concurrent drain of this segment. Safe today
-    /// because eviction and writers are serialized by `&mut Segcache`;
-    /// the writer-vs-drain protocol lands with the eviction drain
-    /// rework.
+    /// SCOPE(writer-vs-drain): the reserve→define→publish window is not
+    /// yet protected against a concurrent drain of this segment. Safe
+    /// today because eviction and writers are serialized by `&mut
+    /// Segcache`. Drain-safe merge (item 5b) made eviction itself
+    /// reader-safe (no more in-place compaction of readable segments) but
+    /// does not close this writer-vs-drain hazard; that protocol is
+    /// deferred past 5b to item 7.
     pub(crate) fn try_alloc_item(&self, seg_id: NonZeroU32, size: i32) -> Option<ReservedItem> {
         debug_assert!(seg_id.get() <= self.cap);
         let header = self.header(seg_id);
@@ -446,7 +500,7 @@ impl Segments {
         );
         debug_assert!(freed, "recycled a segment that was not Draining");
 
-        self.free_queue.push(id.get());
+        self.return_segment(id.get());
 
         #[cfg(feature = "metrics")]
         {
@@ -485,6 +539,55 @@ impl Segments {
         }
     }
 
+    /// Reserve a segment for merge compaction. Prefers the held-back
+    /// spare queue; falls back to the normal free queue when the spare is
+    /// empty. Returns a `Reserved` segment, like `reserve_free`. Called by
+    /// `merge_evict` and `merge_compact` to obtain their copy-to-spare
+    /// destination.
+    pub(crate) fn reserve_spare(&self) -> Option<NonZeroU32> {
+        loop {
+            match self.spare_queue.steal() {
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return self.reserve_free(),
+                crossbeam_deque::Steal::Success(raw) => {
+                    debug_assert!(raw >= 1 && raw <= self.cap);
+                    let id = NonZeroU32::new(raw)?;
+                    if self.headers[raw as usize - 1].try_reserve() {
+                        self.spare_count.fetch_sub(1, Ordering::Relaxed);
+                        #[cfg(feature = "metrics")]
+                        {
+                            SEGMENT_REQUEST.increment();
+                            SEGMENT_REQUEST_SUCCESS.increment();
+                            SEGMENT_FREE.decrement();
+                        }
+                        return Some(id);
+                    }
+                    // Not actually Free (a transient state raced through
+                    // the queue) — put it back and let the caller retry
+                    // or run eviction.
+                    self.spare_queue.push(raw);
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Return a segment id to the pool, replenishing the held-back spare
+    /// queue before the normal free queue. Callers push the id after
+    /// their own state transition to Free; this only decides which queue
+    /// it lands in.
+    fn return_segment(&self, id: u32) {
+        // Check-then-act on `spare_count`: race-free only because eviction
+        // is `&mut`-serialized (see the field doc). Needs a CAS/bounded-
+        // push before this can be called concurrently (item-7).
+        if self.spare_count.load(Ordering::Relaxed) < self.spare_capacity {
+            self.spare_count.fetch_add(1, Ordering::Relaxed);
+            self.spare_queue.push(id);
+        } else {
+            self.free_queue.push(id);
+        }
+    }
+
     /// Return a Reserved (or Linking) segment that was never published
     /// into a chain — the loser path of the chain-extension election
     /// and allocation error paths.
@@ -494,7 +597,7 @@ impl Segments {
             released,
             "release_unused on a segment not in Reserved/Linking"
         );
-        self.free_queue.push(id.get());
+        self.return_segment(id.get());
 
         #[cfg(feature = "metrics")]
         {
@@ -606,7 +709,7 @@ impl Segments {
         if self.headers[id_idx].ref_count_seqcst() == 0
             && self.headers[id_idx].try_release_condemned()
         {
-            self.free_queue.push(id.get());
+            self.return_segment(id.get());
 
             #[cfg(feature = "metrics")]
             {
@@ -628,6 +731,13 @@ impl Segments {
         ttl_buckets: &mut TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
+        // Cheap path first: drop whole expired segments (no spare, no
+        // copy). If any segment frees, a subsequent reserve_free will now
+        // succeed, and the spare-consuming merge is skipped entirely.
+        if ttl_buckets.expire(hashtable, self) > 0 {
+            return Ok(());
+        }
+
         #[cfg(feature = "metrics")]
         let now = Instant::now();
 
@@ -650,7 +760,7 @@ impl Segments {
                     let ttl_bucket = &mut ttl_buckets.buckets[bucket_id];
                     if let Some(first_seg) = ttl_bucket.head() {
                         let start = ttl_bucket.next_to_merge().unwrap_or(first_seg);
-                        match self.merge_evict(start, hashtable) {
+                        match self.merge_evict(start, ttl_bucket, hashtable) {
                             Ok(next_to_merge) => {
                                 debug!("merged ttl_bucket: {bucket_id} seg: {start}");
                                 ttl_bucket.set_next_to_merge(next_to_merge);
@@ -858,8 +968,9 @@ impl Segments {
                     self.headers[next_idx].live_bytes() as f64 / self.segment_size() as f64;
 
                 if next_ratio <= target_ratio {
-                    let _ = self.merge_compact(seg_id, hashtable);
-                    let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+                    let ttl = self.headers[id_idx].ttl();
+                    let ttl_bucket = ttl_buckets.get_mut_bucket(ttl);
+                    let _ = self.merge_compact(seg_id, ttl_bucket, hashtable);
                     ttl_bucket.set_next_to_merge(None);
                 }
             }
@@ -939,24 +1050,53 @@ impl Segments {
     }
 
     /// Merge a chain of segments starting at `start`, pruning low-frequency
-    /// items and copying survivors into the first segment. Returns the next
-    /// segment id to merge from (if any).
+    /// items and copying the survivors into a fresh spare segment. The spare
+    /// is reserved from the held-back spare queue and head-inserted into
+    /// `ttl_bucket` exactly once; every candidate's survivors are appended to
+    /// it (reader-safe — bytes are never relocated in place) and the candidate
+    /// is then drained via `clear_segment`. Returns the next segment id to
+    /// merge from (if any).
     fn merge_evict(
         &mut self,
         start: NonZeroU32,
+        ttl_bucket: &mut TtlBucket,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
         #[cfg(feature = "metrics")]
         SEGMENT_MERGE.increment();
 
-        let dst_id = start;
         let chain_len = self.merge_evict_chain_len(start);
 
         if chain_len < 3 {
             return Err(SegmentsError::NoEvictableSegments);
         }
 
-        let mut next_id = self.get_mut(start).map(|s| s.next_seg())?;
+        // Reserve the copy destination. At "full" this comes from the
+        // held-back spare; if even that is empty, degrade gracefully to
+        // dropping the head candidate whole rather than compacting a
+        // readable segment in place.
+        let spare_id = match self.reserve_spare() {
+            Some(id) => id,
+            None => return self.merge_evict_fallback_drop(start, ttl_bucket, hashtable),
+        };
+
+        // Configure the spare and head-insert it as Sealed exactly ONCE:
+        // readable and evictable immediately, but never the write tail (the
+        // tail is Live). Because the spare is never drained, the bucket head
+        // points at it for the entire candidate loop below — draining a
+        // candidate only unlinks it from the middle of the chain (its
+        // neighbours are patched by clear_segment's recycle/condemn), so no
+        // per-candidate head fixup is required here.
+        let src_ttl = self.headers[start.get() as usize - 1].ttl();
+        {
+            let sidx = spare_id.get() as usize - 1;
+            self.headers[sidx].set_ttl(src_ttl);
+            self.headers[sidx].set_pool(SegmentPool::Main);
+            self.headers[sidx].mark_merged();
+        }
+        let old_head = ttl_bucket.head();
+        self.link_at_head(spare_id, old_head);
+        ttl_bucket.set_head(Some(spare_id));
 
         // Merge state.
         let mut cutoff = 1.0;
@@ -975,133 +1115,115 @@ impl Segments {
             self.evict.target_ratio()
         };
 
-        // Prune and compact the destination segment.
-        {
-            let mut dst = self.get_mut(start)?;
-            let dst_old_size = dst.live_bytes();
-
-            trace!("prune merge with cutoff: {cutoff}");
-            cutoff = dst.prune(hashtable, cutoff, target_ratio);
-            trace!("cutoff is now: {cutoff}");
-
-            // SCOPE: the destination stays Sealed (readable) during this
-            // in-place compaction, which is incompatible with concurrent
-            // readers — sound today only because reads and eviction are
-            // serialized by &mut. The eviction drain-protocol work
-            // (roadmap item 5) replaces in-place compaction; do not
-            // attempt to fix it here.
-            dst.compact(hashtable)?;
-
-            let dst_new_size = dst.live_bytes();
-            trace!("dst {dst_id}: {dst_old_size} bytes -> {dst_new_size} bytes");
-
-            dst.mark_merged();
-            merged += 1;
-        }
-
-        // Walk the chain, pruning source segments and copying survivors into
-        // the destination.
-        while let Some(src_id) = next_id {
+        // Walk the chain, pruning each candidate and copying its survivors
+        // into the spare, then draining the candidate.
+        let mut next_id = Some(start);
+        while let Some(cand_id) = next_id {
             if merged > max_merge {
                 trace!("stop merge: merged max segments");
                 break;
             }
 
-            if !self.get_mut(src_id).map(|s| s.can_evict()).unwrap_or(false) {
-                trace!("stop merge: can't evict source segment");
-                return Ok(None);
-            }
-
-            // Take exclusivity of the source before moving any bytes out
-            // of it (SeqCst: Dekker pair with try_acquire_reader), then
-            // re-check the reader count. A pin that raced in between the
-            // can_evict gate and the CAS must abort the merge before
-            // copy_into relocates data a reader is looking at — revert
-            // to Sealed and stop the pass (a port-local transition;
-            // crucible's merge runs behind Relinking machinery we have
-            // not ported).
-            {
-                let src_hdr = &self.headers[src_id.get() as usize - 1];
-                if !src_hdr.cas_metadata(
-                    State::Sealed,
-                    State::Draining,
-                    None,
-                    None,
-                    Ordering::SeqCst,
-                ) {
-                    trace!("stop merge: source not sealed");
-                    return Ok(None);
-                }
-                if src_hdr.ref_count_seqcst() != 0 {
-                    let reverted = src_hdr.cas_metadata(
-                        State::Draining,
-                        State::Sealed,
-                        None,
-                        None,
-                        Ordering::AcqRel,
-                    );
-                    debug_assert!(reverted);
-                    trace!("stop merge: source pinned by readers");
-                    #[cfg(feature = "metrics")]
-                    SEGMENT_PINNED_SKIP.increment();
-                    return Ok(None);
-                }
-            }
-
-            let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
-
-            let dst_start_size = dst.live_bytes();
-            let src_start_size = src.live_bytes();
-
-            if dst_start_size >= stop_bytes {
-                trace!("stop merge: target segment is full");
-                let reverted =
-                    src.cas_metadata(State::Draining, State::Sealed, None, None, Ordering::AcqRel);
-                debug_assert!(reverted);
+            // Stop once the spare reaches the high-watermark occupancy.
+            if self.headers[spare_id.get() as usize - 1].live_bytes() >= stop_bytes {
+                trace!("stop merge: spare segment is full");
                 break;
             }
 
-            trace!("pruning source segment");
-            cutoff = src.prune(hashtable, cutoff, target_ratio);
+            if !self
+                .get_mut(cand_id)
+                .map(|s| s.can_evict())
+                .unwrap_or(false)
+            {
+                trace!("stop merge: can't evict candidate segment");
+                break;
+            }
 
-            trace!(
-                "src {}: {} bytes -> {} bytes",
-                src_id,
-                src_start_size,
-                src.live_bytes()
-            );
+            // Advance the chain pointer BEFORE draining the candidate: once
+            // clear_segment recycles it, its links are reset and reading
+            // next_seg() would observe a stale/reused segment.
+            next_id = self.headers[cand_id.get() as usize - 1].next_seg();
 
-            trace!("copying source into target");
-            let _ = src.copy_into(&mut dst, hashtable);
-            trace!("copy dropped {} bytes", src.live_bytes());
+            // Prune low-frequency items (marks them deleted — moves no
+            // bytes), then copy the survivors into the spare. copy_into
+            // appends past the spare's write-offset and republishes each
+            // survivor via the hashtable's Release-CAS, so no readable
+            // segment's live bytes are ever moved in place.
+            {
+                let mut cand = self.get_mut(cand_id)?;
+                let cand_old_size = cand.live_bytes();
+                cutoff = cand.prune(hashtable, cutoff, target_ratio);
+                trace!(
+                    "cand {cand_id}: {cand_old_size} bytes -> {} bytes after prune",
+                    cand.live_bytes()
+                );
+            }
+            {
+                let (mut cand, mut spare) = self.get_mut_pair(cand_id, spare_id)?;
+                let _ = cand.copy_into(&mut spare, hashtable);
+            }
 
-            trace!(
-                "dst {}: {} bytes -> {} bytes",
-                dst_id,
-                dst_start_size,
-                dst.live_bytes()
-            );
-
-            next_id = src.next_seg();
-            src.clear(hashtable, false);
-            self.recycle(src_id);
+            // Drain the candidate (Sealed->Draining + ref_count recheck +
+            // condemn-if-pinned). An unpinned candidate is recycled — which
+            // replenishes the spare via return_segment; a pinned candidate is
+            // condemned to its last reader. Either way it leaves the chain,
+            // and clear_segment's unlink patches the neighbours, so the spare
+            // remains the bucket head.
+            match self.clear_segment(cand_id, hashtable, false) {
+                Ok(_outcome) => {}
+                Err(()) => break,
+            }
             merged += 1;
         }
 
         Ok(next_id)
     }
 
-    /// Merge-compact a chain of segments without pruning. Combines segments
-    /// whose total live bytes fit within one segment.
+    /// Graceful degradation when no spare is available: drop the chain head
+    /// whole via the drain machinery, freeing one segment (which also
+    /// replenishes the spare via `return_segment` on the next unpinned
+    /// recycle). No spare was head-inserted, so this path DOES fix the bucket
+    /// head when the dropped segment was itself the head.
+    fn merge_evict_fallback_drop(
+        &mut self,
+        start: NonZeroU32,
+        ttl_bucket: &mut TtlBucket,
+        hashtable: &MultiChoiceHashtable,
+    ) -> Result<Option<NonZeroU32>, SegmentsError> {
+        let meta = self.headers[start.get() as usize - 1].metadata(Ordering::Acquire);
+        let next = meta.next;
+        match self.clear_segment(start, hashtable, false) {
+            // Freed OR Deferred: the segment left service and was spliced
+            // out of the chain either way (Deferred = drained + condemned to
+            // AwaitingRelease, freed by its last reader's guard drop). The
+            // bucket head must be advanced past it if it was the head —
+            // otherwise the head dangles into a condemned/soon-reused
+            // segment.
+            Ok(_outcome) => {
+                if meta.prev.is_none() {
+                    ttl_bucket.set_head(next);
+                }
+                Ok(next)
+            }
+            // CAS failed — nothing drained, no progress.
+            Err(()) => Err(SegmentsError::NoEvictableSegments),
+        }
+    }
+
+    /// Merge-compact a chain of segments starting at `start` into a fresh
+    /// spare, without pruning by frequency. This is best-effort maintenance
+    /// invoked from `remove_at` when a segment drops below the compact-ratio
+    /// low watermark — not an evict-under-pressure path — so unlike
+    /// `merge_evict` it does not fall back to dropping a segment when no
+    /// spare is available; it simply skips (`Ok(None)`).
     fn merge_compact(
         &mut self,
         start: NonZeroU32,
+        ttl_bucket: &mut TtlBucket,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
         #[cfg(feature = "metrics")]
         SEGMENT_MERGE.increment();
-
-        let dst_id = start;
 
         let chain_len = self.merge_compact_chain_len(start);
 
@@ -1109,11 +1231,34 @@ impl Segments {
             return Err(SegmentsError::NoEvictableSegments);
         }
 
-        let mut next_id = self.get_mut(start).map(|s| s.next_seg())?;
+        let next_id = self.get_mut(start).map(|s| s.next_seg())?;
 
         if next_id.is_none() {
             return Err(SegmentsError::NoEvictableSegments);
         }
+
+        // Reserve the copy destination. Compaction is best-effort
+        // maintenance, not a must-free operation: if no spare is available,
+        // skip rather than falling back to dropping a segment (that fallback
+        // belongs to merge_evict, which MUST free a segment).
+        let spare_id = match self.reserve_spare() {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Configure the spare and head-insert it as Sealed exactly ONCE:
+        // same chain-head invariant as merge_evict (see its comment) — the
+        // spare is never drained, so no per-candidate head fixup is needed.
+        let src_ttl = self.headers[start.get() as usize - 1].ttl();
+        {
+            let sidx = spare_id.get() as usize - 1;
+            self.headers[sidx].set_ttl(src_ttl);
+            self.headers[sidx].set_pool(SegmentPool::Main);
+            self.headers[sidx].mark_merged();
+        }
+        let old_head = ttl_bucket.head();
+        self.link_at_head(spare_id, old_head);
+        ttl_bucket.set_head(Some(spare_id));
 
         // Merge state.
         let mut merged = 0;
@@ -1124,98 +1269,57 @@ impl Segments {
         let stop_ratio = self.evict.stop_ratio();
         let stop_bytes = (stop_ratio * self.segment_size() as f64) as i32;
 
-        // Compact the destination segment.
-        {
-            let mut dst = self.get_mut(start)?;
-            let dst_old_size = dst.live_bytes();
-
-            // SCOPE: in-place compaction of a readable segment — see the
-            // note in merge_evict; replaced by roadmap item 5.
-            dst.compact(hashtable)?;
-
-            let dst_new_size = dst.live_bytes();
-            trace!("dst {dst_id}: {dst_old_size} bytes -> {dst_new_size} bytes");
-
-            dst.mark_merged();
-            merged += 1;
-        }
-
-        // Copy sources into the destination.
-        while let Some(src_id) = next_id {
+        // Walk the chain, copying each candidate's survivors into the spare
+        // (no prune — merge_compact combines under-full segments as-is,
+        // without frequency-based pruning), then draining the candidate.
+        let mut next_id = Some(start);
+        while let Some(cand_id) = next_id {
             if merged > max_merge {
                 trace!("stop merge: merged max segments");
                 break;
             }
 
-            if !self.get_mut(src_id).map(|s| s.can_evict()).unwrap_or(false) {
-                trace!("stop merge: can't evict source segment");
-                return Ok(None);
-            }
-
-            // Same drain-with-revert protocol as merge_evict: exclusivity
-            // before bytes move, reader recheck, revert on pin.
+            if !self
+                .get_mut(cand_id)
+                .map(|s| s.can_evict())
+                .unwrap_or(false)
             {
-                let src_hdr = &self.headers[src_id.get() as usize - 1];
-                if !src_hdr.cas_metadata(
-                    State::Sealed,
-                    State::Draining,
-                    None,
-                    None,
-                    Ordering::SeqCst,
-                ) {
-                    trace!("stop merge: source not sealed");
-                    return Ok(None);
-                }
-                if src_hdr.ref_count_seqcst() != 0 {
-                    let reverted = src_hdr.cas_metadata(
-                        State::Draining,
-                        State::Sealed,
-                        None,
-                        None,
-                        Ordering::AcqRel,
-                    );
-                    debug_assert!(reverted);
-                    trace!("stop merge: source pinned by readers");
-                    #[cfg(feature = "metrics")]
-                    SEGMENT_PINNED_SKIP.increment();
-                    return Ok(None);
-                }
-            }
-
-            let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
-
-            let dst_start_size = dst.live_bytes();
-            let src_start_size = src.live_bytes();
-
-            if dst_start_size >= stop_bytes || dst_start_size + src_start_size > seg_size {
-                trace!("stop merge: target segment is full");
-                let reverted =
-                    src.cas_metadata(State::Draining, State::Sealed, None, None, Ordering::AcqRel);
-                debug_assert!(reverted);
+                trace!("stop merge: can't evict candidate segment");
                 break;
             }
 
-            trace!(
-                "src {}: {} bytes -> {} bytes",
-                src_id,
-                src_start_size,
-                src.live_bytes()
-            );
+            let spare_size = self.headers[spare_id.get() as usize - 1].live_bytes();
+            let cand_size = self.headers[cand_id.get() as usize - 1].live_bytes();
 
-            trace!("copying source into target");
-            let _ = src.copy_into(&mut dst, hashtable);
-            trace!("copy dropped {} bytes", src.live_bytes());
+            if spare_size >= stop_bytes || spare_size + cand_size > seg_size {
+                trace!("stop merge: spare segment is full");
+                break;
+            }
 
-            trace!(
-                "dst {}: {} bytes -> {} bytes",
-                dst_id,
-                dst_start_size,
-                dst.live_bytes()
-            );
+            // Advance the chain pointer BEFORE draining the candidate: once
+            // clear_segment recycles it, its links are reset and reading
+            // next_seg() would observe a stale/reused segment.
+            next_id = self.headers[cand_id.get() as usize - 1].next_seg();
 
-            next_id = src.next_seg();
-            src.clear(hashtable, false);
-            self.recycle(src_id);
+            // Copy the survivors into the spare. copy_into appends past the
+            // spare's write-offset and republishes each survivor via the
+            // hashtable's Release-CAS, so no readable segment's live bytes
+            // are ever moved in place.
+            {
+                let (mut cand, mut spare) = self.get_mut_pair(cand_id, spare_id)?;
+                let _ = cand.copy_into(&mut spare, hashtable);
+            }
+
+            // Drain the candidate (Sealed->Draining + ref_count recheck +
+            // condemn-if-pinned). An unpinned candidate is recycled — which
+            // replenishes the spare via return_segment; a pinned candidate is
+            // condemned to its last reader. Either way it leaves the chain,
+            // and clear_segment's unlink patches the neighbours, so the spare
+            // remains the bucket head.
+            match self.clear_segment(cand_id, hashtable, false) {
+                Ok(_outcome) => {}
+                Err(()) => break,
+            }
             merged += 1;
         }
 
@@ -1554,5 +1658,241 @@ impl Segments {
             }
         }
         integrity
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod spare_tests {
+    use super::*;
+    use crate::eviction::Policy;
+
+    fn build(policy: Policy, segs: usize) -> Segments {
+        SegmentsBuilder::default()
+            .segment_size(4096)
+            .heap_size(4096 * segs)
+            .eviction_policy(policy)
+            .build()
+            .expect("build segments")
+    }
+
+    #[test]
+    fn merge_policy_holds_back_one_spare() {
+        let segments = build(
+            Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            },
+            16,
+        );
+        // 16 total: 1 spare + 15 free.
+        assert_eq!(segments.spare_capacity(), 1);
+        assert_eq!(segments.free(), 16, "free() counts free + spare");
+        assert_eq!(
+            segments.free_only(),
+            15,
+            "normal free queue excludes the spare"
+        );
+    }
+
+    #[test]
+    fn non_merge_policy_holds_back_no_spare() {
+        let segments = build(Policy::Random, 16);
+        assert_eq!(segments.spare_capacity(), 0);
+        assert_eq!(segments.free_only(), 16);
+    }
+
+    #[test]
+    fn reserve_spare_prefers_spare_then_falls_back_to_free() {
+        let segments = build(
+            Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            },
+            4,
+        );
+        // Drain the whole normal free queue via reserve_free (3 segments).
+        let mut taken = Vec::new();
+        while let Some(id) = segments.reserve_free() {
+            taken.push(id);
+        }
+        assert_eq!(taken.len(), 3, "reserve_free must not hand out the spare");
+        // The spare is still available to reserve_spare.
+        let spare = segments.reserve_spare().expect("spare available at full");
+        // Now truly empty.
+        assert!(segments.reserve_spare().is_none());
+        // Returning the spare replenishes the spare queue first.
+        segments.release_unused(spare);
+        assert_eq!(
+            segments.spare_count(),
+            1,
+            "return replenished the spare, not the free queue"
+        );
+        assert_eq!(
+            segments.free_only(),
+            0,
+            "the returned segment replenished the spare, not the free queue"
+        );
+    }
+
+    #[test]
+    fn reserve_spare_falls_back_to_free_when_spare_empty() {
+        let segments = build(
+            Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            },
+            4,
+        );
+        // 4 total: 1 spare + 3 free.
+        assert_eq!(segments.free_only(), 3);
+
+        // Reserve the spare directly (not via reserve_free): the normal
+        // free queue must be untouched.
+        let from_spare = segments.reserve_spare().expect("spare available");
+        assert_eq!(
+            segments.free_only(),
+            3,
+            "reserving the spare must not touch the free queue"
+        );
+
+        // The spare is now empty: the next reserve_spare must hit
+        // Steal::Empty and fall back to reserve_free, returning Some and
+        // pulling one segment out of the normal free queue.
+        let from_free = segments
+            .reserve_spare()
+            .expect("reserve_spare must fall back to the free queue when the spare is empty");
+        assert_eq!(
+            segments.free_only(),
+            2,
+            "the fallback reservation must come from the free queue"
+        );
+        assert_ne!(
+            from_spare, from_free,
+            "spare and fallback must be distinct segments"
+        );
+    }
+
+    // Roadmap item 5b: the no-spare merge fallback drops the chain head via
+    // clear_segment. When that head is pinned by a live reader, clear_segment
+    // condemns it (Deferred / AwaitingRelease) instead of freeing it — the
+    // segment still leaves its chain. The fallback MUST advance the bucket
+    // head past the condemned segment; leaving the head pointing at a
+    // condemned (and soon-reused) segment is the latent bug this guards.
+    //
+    // This branch is unreachable through the normal evict() path today (the
+    // chain-length guard requires an unpinned head and &mut-serialization
+    // keeps it unpinned through clear_segment), so the fallback is driven
+    // directly with a manually pinned head — like the item-4 concurrency
+    // tests. Uses test-only accessors, so it is gated with the module.
+    #[test]
+    fn merge_evict_fallback_drop_fixes_head_on_condemned_segment() {
+        use crate::sync::Ordering;
+        use crate::Segcache;
+        use core::num::NonZeroU32;
+        use std::time::Duration;
+
+        const ITEMS_PER_SEGMENT: usize = 4;
+        const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
+        let value: &[u8] = b"x";
+        let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
+        let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+        let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+        // 1 held-back spare (Merge policy) + 4 free.
+        let total_segments = 5usize;
+
+        let mut cache = Segcache::builder()
+            .segment_size(segment_size)
+            .heap_size(segment_size as usize * total_segments)
+            .hash_power(16)
+            .eviction(Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            })
+            .build()
+            .expect("failed to create cache");
+
+        // Long TTL so nothing expires; all items share one bucket.
+        let ttl = Duration::from_secs(3600);
+
+        // Fill enough to span at least two segments so the bucket head
+        // (segment id 2 — id 1 is the held-back spare) is Sealed with a
+        // next. Ten items across 4-item segments -> seg2, seg3, seg4.
+        for i in 0..10 {
+            let key = format!("k{i:06}");
+            assert_eq!(key.len(), KEY_LEN);
+            cache
+                .insert(key.as_bytes(), value, None, ttl)
+                .expect("fill inserts must succeed");
+        }
+
+        // The head of the chain is the oldest (first-reserved) segment, id 2.
+        let head = NonZeroU32::new(2).unwrap();
+        assert_eq!(cache.segments.header(head).state(), State::Sealed);
+        let next = cache.segments.header(head).metadata(Ordering::Acquire).next;
+        assert!(next.is_some(), "head must have a successor in the chain");
+        let seg_ttl = cache.segments.header(head).ttl();
+        assert_eq!(
+            cache.ttl_buckets.get_mut_bucket(seg_ttl).head(),
+            Some(head),
+            "precondition: bucket head is the segment we drop"
+        );
+
+        // Pin the head segment with a live reader: the first inserted key
+        // lives in seg 2. Holding the Item keeps its SegmentGuard alive.
+        let held = cache.get(b"k000000").expect("head item must resolve");
+        assert!(
+            cache.segments.header(head).ref_count() > 0,
+            "the held item must pin the head segment"
+        );
+
+        // Drive the no-spare fallback directly.
+        let res = {
+            let bucket = cache.ttl_buckets.get_mut_bucket(seg_ttl);
+            cache
+                .segments
+                .merge_evict_fallback_drop(head, bucket, &cache.hashtable)
+        };
+
+        // (a) The fallback made progress and returned the old head's next.
+        assert!(
+            matches!(res, Ok(n) if n == next),
+            "fallback must return Ok(next), got {res:?}"
+        );
+        // (b) The pinned head was condemned (drained + spliced out), not freed.
+        assert_eq!(
+            cache.segments.header(head).state(),
+            State::AwaitingRelease,
+            "a pinned head must be condemned, not freed"
+        );
+        // (c) The bucket head advanced past the condemned segment — the fix.
+        assert_eq!(
+            cache.ttl_buckets.get_mut_bucket(seg_ttl).head(),
+            next,
+            "bucket head must advance to the old head's next, never dangle \
+             into the condemned segment"
+        );
+
+        // The pinned reader still reads intact bytes while condemned.
+        assert_eq!(held.value(), b"x");
+
+        // Dropping the guard completes the AwaitingRelease handoff: the
+        // condemned segment returns to the pool (no leak).
+        let free_before = cache.segments.free();
+        drop(held);
+        assert_eq!(
+            cache.segments.header(head).state(),
+            State::Free,
+            "guard drop must free the condemned segment"
+        );
+        assert_eq!(
+            cache.segments.free(),
+            free_before + 1,
+            "no leak: the condemned segment returns to the pool"
+        );
     }
 }

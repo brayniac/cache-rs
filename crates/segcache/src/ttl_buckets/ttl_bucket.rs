@@ -159,7 +159,7 @@ impl TtlBucket {
         let mut cursor = self.head();
 
         while let Some(seg_id) = cursor {
-            let mut segment = segments.get_mut(seg_id).unwrap();
+            let mut segment = segments.segment(seg_id).unwrap();
 
             if let Some(now) = expire_cutoff {
                 // the chain is oldest-first: stop at the first live segment

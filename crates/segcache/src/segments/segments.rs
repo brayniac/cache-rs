@@ -347,18 +347,45 @@ impl Segments {
 
     // ── Segment views ────────────────────────────────────────────────
 
-    /// Returns a `Segment` view for the segment with the specified id. The
-    /// header is borrowed as a shared reference (all fields are atomic) while
-    /// the data slice is borrowed mutably.
-    pub(crate) fn get_mut(&mut self, id: NonZeroU32) -> Result<Segment<'_>, SegmentsError> {
+    /// Returns a `Segment` view for the segment with the specified id.
+    ///
+    /// # Why `&self` is sound (exclusivity by segment state-ownership)
+    ///
+    /// This hands out `&mut [u8]` access to a segment's data region from
+    /// `&self`. It is sound because mutable access to a given segment's data is
+    /// exclusive by the segment's *state ownership*, not by any global lock:
+    /// - the reserver of the `Live` tail is the only writer of that tail (writes
+    ///   are placed at CAS-allocated, disjoint offsets — `try_alloc_item`);
+    /// - a `Sealed` candidate can be claimed for mutation (drain/merge-copy) only
+    ///   by the single thread that wins its `Sealed -> Draining` CAS; losers see
+    ///   a non-Sealed state and skip it;
+    /// - a `Reserved` spare is owned by the one evictor that reserved it;
+    /// - readers only read (via `acquire_item_at` pins); the copy-then-publish
+    ///   ordering (7a) + the pin/condemn protocol keep bytes valid for them.
+    ///
+    /// So no two threads ever hold `&mut` to the same segment's region at once.
+    ///
+    /// The ONE race this does NOT cover — a reserver writing the `Live` tail
+    /// while an evictor drains that same segment — is deferred to item 7d
+    /// (generation in the seal CAS + guarding the reserve->publish window); see
+    /// the `SCOPE(writer-vs-drain)` comments.
+    pub(crate) fn segment(&self, id: NonZeroU32) -> Result<Segment<'_>, SegmentsError> {
         let idx = id.get() as usize - 1;
         if idx < self.headers.len() {
             let header = &self.headers[idx];
 
             let seg_start = self.segment_size as usize * idx;
-            let seg_end = self.segment_size as usize * (idx + 1);
 
-            let seg_data = &mut self.data[seg_start..seg_end];
+            // SAFETY: idx is in bounds; per the state-ownership contract above,
+            // the region [seg_start, seg_start + seg_size) is exclusively owned
+            // by this caller for the view's lifetime. The mmap base pointer is
+            // stable for the life of `self` (the allocation is never resized).
+            let seg_data = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (self.data.as_ptr() as *mut u8).add(seg_start),
+                    self.segment_size as usize,
+                )
+            };
 
             let segment = Segment::from_raw_parts(header, seg_data);
             segment.check_magic();
@@ -368,11 +395,11 @@ impl Segments {
         }
     }
 
-    /// Gets a `Segment` view for two segments after ensuring the data borrows
-    /// are disjoint. Because headers are shared refs (all fields are atomic),
-    /// they can alias freely — we only need to split the data slice.
-    pub(crate) fn get_mut_pair(
-        &mut self,
+    /// Returns `Segment` views for two DISTINCT segments. `&self` for the same
+    /// reason as `segment` — the two data regions are disjoint (a != b), and
+    /// each is exclusively owned per the state-ownership contract on `segment`.
+    pub(crate) fn segment_pair(
+        &self,
         a: NonZeroU32,
         b: NonZeroU32,
     ) -> Result<(Segment<'_>, Segment<'_>), SegmentsError> {
@@ -390,42 +417,25 @@ impl Segments {
         let header_a = &self.headers[a_idx];
         let header_b = &self.headers[b_idx];
 
-        // Split data into non-overlapping slices.
-        let seg_size = self.segment_size() as usize;
+        let seg_size = self.segment_size as usize;
+        let base = self.data.as_ptr() as *mut u8;
 
-        // SAFETY: a_idx != b_idx is guaranteed above, so the data ranges are
-        // disjoint. We split the mmap slice at the boundary between the two
-        // lower-indexed and higher-indexed segments.
-        {
-            let data: &mut [u8] = &mut self.data;
-            let split = (std::cmp::min(a_idx, b_idx) + 1) * seg_size;
-            let (first, second) = data.split_at_mut(split);
+        // SAFETY: a_idx != b_idx, so [a_idx*seg_size, +seg_size) and
+        // [b_idx*seg_size, +seg_size) are disjoint; the two &mut slices never
+        // alias. Each region is exclusively owned per the contract on `segment`.
+        let (data_a, data_b) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(base.add(a_idx * seg_size), seg_size),
+                std::slice::from_raw_parts_mut(base.add(b_idx * seg_size), seg_size),
+            )
+        };
 
-            let (data_a, data_b) = if a_idx < b_idx {
-                let start_a = seg_size * a_idx;
-                let end_a = seg_size * (a_idx + 1);
+        let segment_a = Segment::from_raw_parts(header_a, data_a);
+        let segment_b = Segment::from_raw_parts(header_b, data_b);
 
-                let start_b = (seg_size * b_idx) - first.len();
-                let end_b = (seg_size * (b_idx + 1)) - first.len();
-
-                (&mut first[start_a..end_a], &mut second[start_b..end_b])
-            } else {
-                let start_a = (seg_size * a_idx) - first.len();
-                let end_a = (seg_size * (a_idx + 1)) - first.len();
-
-                let start_b = seg_size * b_idx;
-                let end_b = seg_size * (b_idx + 1);
-
-                (&mut second[start_a..end_a], &mut first[start_b..end_b])
-            };
-
-            let segment_a = Segment::from_raw_parts(header_a, data_a);
-            let segment_b = Segment::from_raw_parts(header_b, data_b);
-
-            segment_a.check_magic();
-            segment_b.check_magic();
-            Ok((segment_a, segment_b))
-        }
+        segment_a.check_magic();
+        segment_b.check_magic();
+        Ok((segment_a, segment_b))
     }
 
     // ── Chain helpers ────────────────────────────────────────────────
@@ -673,7 +683,7 @@ impl Segments {
         let (next, prev) = (meta.next, meta.prev);
 
         {
-            let mut segment = self.get_mut(id).unwrap();
+            let mut segment = self.segment(id).unwrap();
             segment.clear(hashtable, expire);
         }
 
@@ -935,7 +945,7 @@ impl Segments {
                     // (a `while let` would hold the temporary across the body).
                     let next = self.evict.lock().unwrap().least_valuable_seg();
                     let Some(id) = next else { break };
-                    if let Ok(seg) = self.get_mut(id) {
+                    if let Ok(seg) = self.segment(id) {
                         if seg.can_evict() {
                             return Some(id);
                         }
@@ -960,7 +970,7 @@ impl Segments {
     ) -> Result<(), SegmentsError> {
         // Remove the item.
         {
-            let segment = self.get_mut(seg_id)?;
+            let segment = self.segment(seg_id)?;
             segment.remove_item_at(offset);
 
             // If the segment is now empty and evictable, free it
@@ -1022,7 +1032,7 @@ impl Segments {
         let max = self.evict.lock().unwrap().max_merge();
 
         while len < max {
-            if let Ok(seg) = self.get_mut(id) {
+            if let Ok(seg) = self.segment(id) {
                 if seg.can_evict() {
                     len += 1;
                     match seg.next_seg() {
@@ -1055,7 +1065,7 @@ impl Segments {
         let seg_size = self.segment_size();
 
         while len < max {
-            if let Ok(seg) = self.get_mut(id) {
+            if let Ok(seg) = self.segment(id) {
                 if seg.can_evict() {
                     occupied += seg.live_bytes();
                     if occupied > seg_size {
@@ -1170,7 +1180,7 @@ impl Segments {
             }
 
             if !self
-                .get_mut(cand_id)
+                .segment(cand_id)
                 .map(|s| s.can_evict())
                 .unwrap_or(false)
             {
@@ -1189,7 +1199,7 @@ impl Segments {
             // survivor via the hashtable's Release-CAS, so no readable
             // segment's live bytes are ever moved in place.
             {
-                let mut cand = self.get_mut(cand_id)?;
+                let mut cand = self.segment(cand_id)?;
                 let cand_old_size = cand.live_bytes();
                 cutoff = cand.prune(hashtable, cutoff, target_ratio);
                 trace!(
@@ -1198,7 +1208,7 @@ impl Segments {
                 );
             }
             {
-                let (mut cand, mut spare) = self.get_mut_pair(cand_id, spare_id)?;
+                let (mut cand, mut spare) = self.segment_pair(cand_id, spare_id)?;
                 let _ = cand.copy_into(&mut spare, hashtable);
             }
 
@@ -1270,7 +1280,7 @@ impl Segments {
             return Err(SegmentsError::NoEvictableSegments);
         }
 
-        let next_id = self.get_mut(start).map(|s| s.next_seg())?;
+        let next_id = self.segment(start).map(|s| s.next_seg())?;
 
         if next_id.is_none() {
             return Err(SegmentsError::NoEvictableSegments);
@@ -1321,7 +1331,7 @@ impl Segments {
             }
 
             if !self
-                .get_mut(cand_id)
+                .segment(cand_id)
                 .map(|s| s.can_evict())
                 .unwrap_or(false)
             {
@@ -1347,7 +1357,7 @@ impl Segments {
             // hashtable's Release-CAS, so no readable segment's live bytes
             // are ever moved in place.
             {
-                let (mut cand, mut spare) = self.get_mut_pair(cand_id, spare_id)?;
+                let (mut cand, mut spare) = self.segment_pair(cand_id, spare_id)?;
                 let _ = cand.copy_into(&mut spare, hashtable);
             }
 
@@ -1483,7 +1493,7 @@ impl Segments {
         hashtable: &MultiChoiceHashtable,
     ) {
         let seg_size = self.segment_size() as usize;
-        let (src, dst) = match self.get_mut_pair(src_id, dst_id) {
+        let (src, dst) = match self.segment_pair(src_id, dst_id) {
             Ok(pair) => pair,
             Err(_) => return,
         };
@@ -1556,7 +1566,7 @@ impl Segments {
         // eviction lock.
         let mut hashes = Vec::new();
         {
-            let segment = match self.get_mut(seg_id) {
+            let segment = match self.segment(seg_id) {
                 Ok(s) => s,
                 Err(_) => return,
             };

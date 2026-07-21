@@ -356,14 +356,24 @@ impl Segments {
     /// exclusive by the segment's *state ownership*, not by any global lock:
     /// - the reserver of the `Live` tail is the only writer of that tail (writes
     ///   are placed at CAS-allocated, disjoint offsets — `try_alloc_item`);
-    /// - a `Sealed` candidate can be claimed for mutation (drain/merge-copy) only
-    ///   by the single thread that wins its `Sealed -> Draining` CAS; losers see
-    ///   a non-Sealed state and skip it;
+    /// - a candidate is claimed for mutation (drain/merge-copy) only by the
+    ///   single thread that wins its `Sealed -> Draining` CAS BEFORE mutating;
+    ///   losers see a non-Sealed state and skip it. This is the uniform claim for
+    ///   ALL candidate mutators (merge, s3fifo, drop, expire/clear, remove_at).
     /// - a `Reserved` spare is owned by the one evictor that reserved it;
     /// - readers only read (via `acquire_item_at` pins); the copy-then-publish
     ///   ordering (7a) + the pin/condemn protocol keep bytes valid for them.
     ///
     /// So no two threads ever hold `&mut` to the same segment's region at once.
+    ///
+    /// NOTE (drain-first, item 7c Task 6): `merge_evict`/`merge_compact`/
+    /// `s3fifo_promote_from` currently `prune`/`copy_into` a candidate while it is
+    /// still `Sealed`, taking the `Sealed -> Draining` CAS only afterward — so they
+    /// do NOT yet satisfy the "claim before mutate" rule above. That is why the
+    /// eviction receivers are still `&mut` today (exclusive via the borrow
+    /// checker, so no live unsoundness). Task 6 restructures those paths to claim
+    /// the Draining CAS first, making this contract literally hold before the
+    /// receivers flip to `&self` and concurrent evictors are exercised.
     ///
     /// The ONE race this does NOT cover — a reserver writing the `Live` tail
     /// while an evictor drains that same segment — is deferred to item 7d

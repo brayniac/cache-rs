@@ -178,16 +178,19 @@ Keep the name `get_mut` OR rename to `segment` and update all callers. RECOMMEND
 
 ---
 
-### Task 6: Flip eviction to `&self`
+### Task 6: Drain-first restructuring + flip eviction to `&self`
 
 **Files:** `crates/segcache/src/segments/segments.rs`
 
 `evict`, `merge_evict`, `merge_compact`, `s3fifo_evict`/`_admission`/`_main`, `s3fifo_promote_from`, `rerank` usage, `merge_evict_chain_len`, `merge_compact_chain_len` → `&self`.
 
-- [ ] **Step 1:** Change these receivers `&mut self` → `&self`. Replace `self.get_mut`/`get_mut_pair` with `self.segment`/`self.segment_pair`. Policy state access goes through the `Mutex` (Task 3) — `evict()` holds the guard for the eviction duration (coarse serialization). The `merge_*_chain_len` helpers only read headers (`&self` already fine) — flip receivers.
+**PREREQUISITE — drain-first restructuring (required for soundness; see the adversarial-review finding in spec §2).** `merge_evict`/`merge_compact`/`s3fifo_promote_from` currently `prune`/`copy_into` a candidate while it is still `Sealed`, taking the `Sealed→Draining` CAS only afterward (in `clear_segment`). Once eviction is `&self`, two evictors can deterministically select the same `Sealed` candidate and both derive `&mut [u8]` to it → aliasing UB; a held eviction lock does NOT fix it (`expire`/`clear` win the same CAS without that lock). So the candidate must be **claimed via its `Sealed→Draining` CAS BEFORE any `prune`/`copy_into`**, mirroring the drop path.
+
+- [ ] **Step 0 (drain-first):** In `merge_evict`, `merge_compact`, and the s3fifo source-copy paths, restructure the per-candidate loop to: (1) win the candidate's `Sealed→Draining` CAS (SeqCst) + ref_count recheck (revert to `Sealed` and skip if pinned, as the item-5b merge-source gate already does) BEFORE mutating; (2) `prune`/`copy_into` on the now-`Draining` candidate; (3) finalize (`recycle` if unpinned / `condemn` if pinned) — WITHOUT re-running the `Sealed→Draining` CAS (it's already `Draining`). This likely means splitting `clear_segment` into a "claim" step (the CAS + ref_count recheck, returning whether won) and a "finalize" step (`recycle`/`condemn`), so merge/s3fifo can claim-then-mutate-then-finalize. The drop/expire paths keep calling the combined `clear_segment`. Verify existing `integration_eviction.rs`/merge/s3fifo tests still pass — the surviving-item set and freed-segment count must be unchanged (only the CAS moves earlier). **Behavior note to document:** draining before copy-out rejects new pins on the candidate during the copy window and can cause a transient miss on an item mid-relink; acceptable under concurrent eviction (spec §2).
+- [ ] **Step 1:** Change these receivers `&mut self` → `&self`. Replace `self.get_mut`/`get_mut_pair` with `self.segment`/`self.segment_pair`. Policy-state access stays through the per-call `Mutex` (Task 3) — a held guard is NOT required now that per-segment exclusivity comes from the drain-first `Sealed→Draining` CAS (Step 0). The `merge_*_chain_len` helpers only read headers — flip receivers.
 - [ ] **Step 2:** Update the caller `reserve_and_define`/eviction-retry in `segcache.rs` — `self.segments.evict(&mut self.ttl_buckets, &self.hashtable)` still passes `&mut self.ttl_buckets` (TtlBuckets flip is Task 7); `evict` takes `&self` for Segments now. Confirm the borrow works (`&self.segments` + `&mut self.ttl_buckets` — distinct fields, fine).
-  - Note: `evict` currently takes `ttl_buckets: &mut TtlBuckets`. Keep that param `&mut` for now (Task 7 flips TtlBuckets); only the `Segments` receiver flips here. If the eviction body calls `ttl_buckets.get_mut_bucket`/`set_head` etc., those stay `&mut TtlBuckets` until Task 7.
-- [ ] **Step 3:** Battery green — especially `integration_eviction.rs` and the merge/s3fifo tests (behavior identical single-threaded, single evictor). Commit: `Flip eviction (evict/merge/s3fifo) to &self`.
+  - Note: `evict` currently takes `ttl_buckets: &mut TtlBuckets`. Keep that param `&mut` for now (Task 7 flips TtlBuckets); only the `Segments` receiver flips here.
+- [ ] **Step 3:** Battery green — especially `integration_eviction.rs` and the merge/s3fifo tests (surviving-item set + freed-segment count identical single-threaded; only the drain CAS moved earlier). Commit: `Restructure merge/s3fifo drain-first; flip eviction to &self`.
 
 ---
 

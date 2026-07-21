@@ -37,9 +37,16 @@ Their `&mut` comes from two sources: genuinely non-atomic mutable state, and the
 - **`Eviction`'s mutable cluster → one `Mutex`.** `{last_update_time,
   ranked_segs, index, rng, ghost}` is mutated only during policy selection
   (rerank, random pick, ghost ops). Wrap it in a `Mutex`; `policy` is `Copy` and
-  stays outside. `evict()` takes the lock for the policy decision. Eviction is
-  rare (only when full), so a coarse lock is cheap, and it admits one evictor at
-  a time — the serialization the `&self` accessor's soundness leans on.
+  stays outside. The lock protects ONLY this policy state — it is taken per-call
+  (short-lived), NOT held across the whole eviction. Two evictors may therefore
+  redundantly select the same candidate; that is harmless, because per-segment
+  *data-mutation* exclusivity comes from the state machine (below), not this
+  lock.
+
+  **Correction (adversarial review, 7c Task 4):** an earlier draft claimed this
+  Mutex "admits one evictor at a time — the serialization the `&self` accessor
+  leans on." That is wrong. The `&self` accessor's exclusivity rests on the
+  segment state machine, not the eviction lock (see §2).
 
 ### 2. The `&self` data accessor (the unsafe core)
 
@@ -51,23 +58,44 @@ pattern `try_alloc_item`/`acquire_item_at` already use:
 - `Segments::segment_pair(&self, a, b) -> (Segment, Segment)` — disjoint split
   for copy source→dst.
 
-**Soundness contract** (documented at the accessor; the reviews will stress it).
-Handing out `&mut [u8]` from `&self` is sound because per-region mutable access
-is exclusive by construction:
-- **evictor-vs-evictor:** the eviction `Mutex` admits one evictor, so no two
-  evictors mutate the same candidate/spare.
-- **evictor-vs-reserver:** an evictor mutates candidate/spare segments
-  (`Sealed`/`Reserved`); a reserver writes only the `Live` tail — different
-  segment ids, disjoint memory.
-- **evictor-vs-reader:** a reader only reads; the evictor copies *out of* a
-  source (read-only on src) into fresh spare space. Copy-then-publish (7a)
-  orders the bytes ahead of the hashtable relink; pinning + the condemn protocol
-  keep drained src bytes valid until the last guard drops.
+**Soundness contract** (documented at the accessor; the reviews stressed it and
+forced the correction below). Handing out `&mut [u8]` from `&self` is sound
+because per-segment mutable access is exclusive **by segment state-ownership** —
+a thread may mutate a segment's data region only once it OWNS that segment's
+state:
+- **reserver** owns the `Live` tail — the only writer of the tail, at disjoint
+  CAS-allocated offsets (`try_alloc_item`).
+- **candidate mutation requires winning the `Sealed→Draining` CAS FIRST.** A
+  thread must win a candidate's `Sealed→Draining` transition (with the ref_count
+  recheck) BEFORE mutating its data. Losers see a non-`Sealed` state and skip.
+  This is the single, uniform claim mechanism for ALL candidate mutators —
+  merge, s3fifo, the drop path, `expire`/`clear`, and `remove_at`'s empty-free.
+- **spare** is `Reserved`, owned by the one evictor that reserved it.
+- **readers** only read (via `acquire_item_at` pins); copy-then-publish (7a)
+  orders copied bytes ahead of the hashtable relink, and the pin/condemn protocol
+  keeps a drained source's bytes valid for existing pins until the last drops.
 
-The residual **same-segment writer-vs-drain race** (a reserver writing a segment
-an evictor drains) is NOT closed here — that is 7d (generation in the seal CAS +
-guarding the reserve→publish window). The `SCOPE(writer-vs-drain)` comments stay,
-and the accessor's contract documents this as the one race it does not close.
+**Drain-first restructuring (required for the merge/s3fifo paths).** Today
+`merge_evict`/`merge_compact`/`s3fifo_promote_from` `prune`/`copy_into` a
+candidate while it is still `Sealed`, and only take the `Sealed→Draining` CAS
+afterward (inside `clear_segment`). That violates the contract above. When Task 6
+flips these to `&self`, it MUST first restructure them to win the candidate's
+`Sealed→Draining` CAS (+ ref_count recheck) BEFORE `prune`/`copy_into`, mirroring
+the drop path — so the Draining CAS is the claim for every mutator. A held
+eviction lock is NOT a substitute (it would not serialize `expire`/`clear`, which
+win the same CAS without taking it). **Behavior note:** draining a candidate
+before copy-out rejects *new* reader pins on it during the copy window
+(`Draining` is not readable); a concurrent reader may see a transient miss on an
+item mid-relink (old location unpinnable, new not yet published). Existing pins
+stay valid. This is acceptable under concurrent eviction.
+
+Until that restructuring lands, the eviction receivers stay `&mut` (exclusive via
+the borrow checker), so no unsoundness exists in the interim.
+
+The residual **same-segment writer-vs-drain race** (a reserver writing the `Live`
+tail while an evictor drains that same segment) is NOT closed here — that is 7d
+(generation in the seal CAS + guarding the reserve→publish window). The
+`SCOPE(writer-vs-drain)` comments stay.
 
 ### 3. Receiver flips (mechanical, once §1 and §2 land)
 

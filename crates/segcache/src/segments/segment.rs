@@ -194,11 +194,6 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
-    pub fn next_seg(&self) -> Option<NonZeroU32> {
-        self.header.next_seg()
-    }
-
-    #[inline]
     pub fn pool(&self) -> SegmentPool {
         self.header.pool()
     }

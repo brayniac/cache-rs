@@ -469,11 +469,20 @@ impl Segments {
         }
     }
 
-    /// Link a Reserved segment at the front of a chain and publish it as
-    /// Sealed (readable + evictable, never the write tail): Reserved ->
-    /// Linking carries the next pointer, the old head's prev is patched,
-    /// then Linking -> Sealed publishes.
-    fn link_at_head(&self, this: NonZeroU32, head: Option<NonZeroU32>) {
+    /// Link a Reserved copy-destination segment (merge spare / s3fifo target)
+    /// at the front of a chain and publish it as `Relinking`: Reserved ->
+    /// Linking carries the next pointer, the old head's prev is patched, then
+    /// Linking -> Relinking publishes (never the write tail — the tail is Live).
+    ///
+    /// `Relinking` is readable (survivors relinked into the destination via
+    /// `cas_location` stay reachable to readers) but NOT evictable (only
+    /// `Sealed` is). So while the owner fills the destination across its copy
+    /// loop, no concurrent evictor can select it (`can_evict` is false, being
+    /// header-only via `is_evictable`) or win its `Sealed->Draining` claim
+    /// (`claim_for_drain` CASes from `Sealed`, which a `Relinking` segment is
+    /// not). The owner calls `publish_dest_sealed` (Relinking -> Sealed) once
+    /// the fill completes, making the destination a legal future candidate.
+    fn link_dest_at_head(&self, this: NonZeroU32, head: Option<NonZeroU32>) {
         let this_idx = this.get() as usize - 1;
         let linking = self.headers[this_idx].cas_metadata(
             State::Reserved,
@@ -490,14 +499,31 @@ impl Segments {
             self.headers[head_idx].update_links(None, Some(Some(this)));
         }
 
-        let sealed = self.headers[this_idx].cas_metadata(
+        let relinking = self.headers[this_idx].cas_metadata(
             State::Linking,
+            State::Relinking,
+            None,
+            None,
+            Ordering::AcqRel,
+        );
+        debug_assert!(relinking, "linking destination must publish as Relinking");
+    }
+
+    /// Publish a filled copy-destination: `Relinking -> Sealed`, making it a
+    /// legal future eviction candidate. Must be called on EVERY merge/s3fifo
+    /// exit path after the fill loop, so a destination is never left stuck in
+    /// `Relinking` (unclaimable, hence unrecyclable). Sealing an empty
+    /// destination (zero candidates merged) is fine — it matches the
+    /// pre-existing empty-spare-as-head behavior.
+    fn publish_dest_sealed(&self, id: NonZeroU32) {
+        let sealed = self.headers[id.get() as usize - 1].cas_metadata(
+            State::Relinking,
             State::Sealed,
             None,
             None,
             Ordering::AcqRel,
         );
-        debug_assert!(sealed, "linking segment must publish as Sealed");
+        debug_assert!(sealed, "copy destination must publish Relinking -> Sealed");
     }
 
     // ── Free queue ───────────────────────────────────────────────────
@@ -895,10 +921,12 @@ impl Segments {
                 SEGMENT_EVICT.increment();
 
                 if let Some(id) = self.least_valuable_seg(ttl_buckets) {
-                    // Capture the links before the drain (condemn clears
-                    // them) for the bucket head fixup below.
+                    // Capture the links AND ttl before the drain (condemn
+                    // clears the links; a recycled+re-reserved segment's ttl
+                    // could change) for the bucket head fixup below — M1.
                     let id_idx = id.get() as usize - 1;
                     let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
+                    let seg_ttl = self.headers[id_idx].ttl();
 
                     let outcome = self.clear_segment(id, hashtable, false);
 
@@ -910,8 +938,7 @@ impl Segments {
                         Ok(outcome) => {
                             // The segment left its chain either way.
                             if meta.prev.is_none() {
-                                let ttl_bucket =
-                                    ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+                                let ttl_bucket = ttl_buckets.get_mut_bucket(seg_ttl);
                                 ttl_bucket.set_head(meta.next);
                             }
                             match outcome {
@@ -983,14 +1010,15 @@ impl Segments {
                     self.evict.lock().unwrap().rerank(&self.headers);
                 }
                 loop {
-                    // Bind to a local so the guard drops before `get_mut`
-                    // (a `while let` would hold the temporary across the body).
+                    // Bind to a local so the lock guard drops before the
+                    // header read (a `while let` would hold the temporary
+                    // across the body).
                     let next = self.evict.lock().unwrap().least_valuable_seg();
                     let Some(id) = next else { break };
-                    if let Ok(seg) = self.segment(id) {
-                        if seg.can_evict() {
-                            return Some(id);
-                        }
+                    // Header-only can_evict: no Segment view / &mut [u8] is
+                    // derived on the un-claimed candidate (C2).
+                    if self.headers[id.get() as usize - 1].can_evict() {
+                        return Some(id);
                     }
                 }
                 None
@@ -1074,22 +1102,20 @@ impl Segments {
         let max = self.evict.lock().unwrap().max_merge();
 
         while len < max {
-            if let Ok(seg) = self.segment(id) {
-                if seg.can_evict() {
-                    len += 1;
-                    match seg.next_seg() {
-                        Some(i) => {
-                            id = i;
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                } else {
-                    break;
+            // Header-only walk: no Segment view / &mut [u8] is derived on an
+            // un-claimed candidate (C2 — a concurrent evictor may be mid-copy
+            // on one of these chain segments).
+            let Some(hdr) = self.headers.get(id.get() as usize - 1) else {
+                warn!("invalid segment id: {id}");
+                break;
+            };
+            if hdr.can_evict() {
+                len += 1;
+                match hdr.next_seg() {
+                    Some(i) => id = i,
+                    None => break,
                 }
             } else {
-                warn!("invalid segment id: {id}");
                 break;
             }
         }
@@ -1107,26 +1133,22 @@ impl Segments {
         let seg_size = self.segment_size();
 
         while len < max {
-            if let Ok(seg) = self.segment(id) {
-                if seg.can_evict() {
-                    occupied += seg.live_bytes();
-                    if occupied > seg_size {
-                        break;
-                    }
-                    len += 1;
-                    match seg.next_seg() {
-                        Some(i) => {
-                            id = i;
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                } else {
+            // Header-only walk (C2 — see merge_evict_chain_len).
+            let Some(hdr) = self.headers.get(id.get() as usize - 1) else {
+                warn!("invalid segment id: {id}");
+                break;
+            };
+            if hdr.can_evict() {
+                occupied += hdr.live_bytes();
+                if occupied > seg_size {
                     break;
                 }
+                len += 1;
+                match hdr.next_seg() {
+                    Some(i) => id = i,
+                    None => break,
+                }
             } else {
-                warn!("invalid segment id: {id}");
                 break;
             }
         }
@@ -1165,13 +1187,15 @@ impl Segments {
             None => return self.merge_evict_fallback_drop(start, ttl_bucket, hashtable),
         };
 
-        // Configure the spare and head-insert it as Sealed exactly ONCE:
-        // readable and evictable immediately, but never the write tail (the
-        // tail is Live). Because the spare is never drained, the bucket head
-        // points at it for the entire candidate loop below — draining a
-        // candidate only unlinks it from the middle of the chain (its
-        // neighbours are patched by clear_segment's recycle/condemn), so no
-        // per-candidate head fixup is required here.
+        // Configure the spare and head-insert it as `Relinking` exactly ONCE:
+        // readable (so relinked survivors stay reachable) but NOT evictable, so
+        // a concurrent evictor can neither select nor claim_for_drain the spare
+        // while we fill it (C1). It is never the write tail (the tail is Live).
+        // Because the spare is never drained, the bucket head points at it for
+        // the entire candidate loop below — draining a candidate only unlinks
+        // it from the middle of the chain (its neighbours are patched by
+        // finalize_drained's recycle/condemn), so no per-candidate head fixup
+        // is required here. `publish_dest_sealed` seals it after the loop.
         let src_ttl = self.headers[start.get() as usize - 1].ttl();
         {
             let sidx = spare_id.get() as usize - 1;
@@ -1180,7 +1204,7 @@ impl Segments {
             self.headers[sidx].mark_merged();
         }
         let old_head = ttl_bucket.head();
-        self.link_at_head(spare_id, old_head);
+        self.link_dest_at_head(spare_id, old_head);
         ttl_bucket.set_head(Some(spare_id));
 
         // Merge state.
@@ -1223,12 +1247,10 @@ impl Segments {
 
             // Fast advisory pre-check: don't bother claiming a candidate that
             // isn't evictable (Live tail, already draining, or pinned past
-            // can_evict). The authoritative claim is the CAS below.
-            if !self
-                .segment(cand_id)
-                .map(|s| s.can_evict())
-                .unwrap_or(false)
-            {
+            // can_evict). Header-only — no Segment view / &mut [u8] is derived
+            // on the un-claimed candidate (C2). The authoritative claim is the
+            // CAS below.
+            if !self.headers[cand_id.get() as usize - 1].can_evict() {
                 trace!("stop merge: can't evict candidate segment");
                 break;
             }
@@ -1285,6 +1307,12 @@ impl Segments {
             merged += 1;
         }
 
+        // Publish the filled spare: Relinking -> Sealed, making it a legal
+        // future eviction candidate. Runs on every exit from the fill loop
+        // (including zero candidates merged), so the spare is never left stuck
+        // in Relinking (C1).
+        self.publish_dest_sealed(spare_id);
+
         Ok(next_id)
     }
 
@@ -1340,7 +1368,9 @@ impl Segments {
             return Err(SegmentsError::NoEvictableSegments);
         }
 
-        let next_id = self.segment(start).map(|s| s.next_seg())?;
+        // Header-only read — no Segment view / &mut [u8] on the un-claimed
+        // `start` (C2).
+        let next_id = self.headers[start.get() as usize - 1].next_seg();
 
         if next_id.is_none() {
             return Err(SegmentsError::NoEvictableSegments);
@@ -1355,9 +1385,12 @@ impl Segments {
             None => return Ok(None),
         };
 
-        // Configure the spare and head-insert it as Sealed exactly ONCE:
-        // same chain-head invariant as merge_evict (see its comment) — the
-        // spare is never drained, so no per-candidate head fixup is needed.
+        // Configure the spare and head-insert it as `Relinking` exactly ONCE:
+        // same chain-head invariant as merge_evict (see its comment) — readable
+        // but not evictable while we fill it, so a concurrent evictor cannot
+        // select or claim_for_drain the spare (C1); `publish_dest_sealed` seals
+        // it after the loop. The spare is never drained, so no per-candidate
+        // head fixup is needed.
         let src_ttl = self.headers[start.get() as usize - 1].ttl();
         {
             let sidx = spare_id.get() as usize - 1;
@@ -1366,7 +1399,7 @@ impl Segments {
             self.headers[sidx].mark_merged();
         }
         let old_head = ttl_bucket.head();
-        self.link_at_head(spare_id, old_head);
+        self.link_dest_at_head(spare_id, old_head);
         ttl_bucket.set_head(Some(spare_id));
 
         // Merge state.
@@ -1390,12 +1423,10 @@ impl Segments {
                 break;
             }
 
-            // Fast advisory pre-check (authoritative claim is the CAS below).
-            if !self
-                .segment(cand_id)
-                .map(|s| s.can_evict())
-                .unwrap_or(false)
-            {
+            // Fast advisory pre-check (header-only — no Segment view / &mut [u8]
+            // on the un-claimed candidate, C2; authoritative claim is the CAS
+            // below).
+            if !self.headers[cand_id.get() as usize - 1].can_evict() {
                 trace!("stop merge: can't evict candidate segment");
                 break;
             }
@@ -1441,6 +1472,11 @@ impl Segments {
             let _ = self.finalize_drained(cand_id, hashtable, false);
             merged += 1;
         }
+
+        // Publish the filled spare: Relinking -> Sealed (see merge_evict). Runs
+        // on every exit from the fill loop, so the spare is never left stuck in
+        // Relinking (C1).
+        self.publish_dest_sealed(spare_id);
 
         Ok(next_id)
     }
@@ -1529,17 +1565,21 @@ impl Segments {
 
             let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
-            // Link the target at the head of the TTL bucket, then publish
-            // it as Sealed: the target is readable and evictable
-            // immediately, but is never the write tail, so it must not
-            // pass through Live (Live == the bucket tail reserve()
-            // writes into).
+            // Link the target at the head of the TTL bucket, published as
+            // `Relinking`: readable (promoted survivors stay reachable) but NOT
+            // evictable, so a concurrent evictor can neither select nor
+            // claim_for_drain the target while we fill it (C1). It is never the
+            // write tail (Live == the bucket tail reserve() writes into).
             let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
             let old_head = ttl_bucket.head();
-            self.link_at_head(tid, old_head);
+            self.link_dest_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
 
             self.s3fifo_promote_from(seg_id, tid, hashtable);
+
+            // Publish the filled target: Relinking -> Sealed, making it a legal
+            // future eviction candidate (C1).
+            self.publish_dest_sealed(tid);
         }
         // If no free segment, we just drop everything (all items evicted).
 
@@ -1547,16 +1587,19 @@ impl Segments {
         self.s3fifo_ghost_remaining(seg_id, hashtable);
 
         // Finalize the already-Draining source (recycle-or-condemn, NO second
-        // Sealed->Draining CAS). Capture links AFTER link_at_head patched the
-        // source's prev (if the source was the old head, its prev now points at
-        // the freshly linked target) and BEFORE finalize unlinks it.
+        // Sealed->Draining CAS). Capture links AFTER link_dest_at_head patched
+        // the source's prev (if the source was the old head, its prev now
+        // points at the freshly linked target) and BEFORE finalize unlinks it.
         let id_idx = seg_id.get() as usize - 1;
         let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
+        // Capture ttl BEFORE finalize (finalize may recycle the source, after
+        // which a concurrent reserve could re-stamp its ttl) — M1.
+        let seg_ttl = self.headers[id_idx].ttl();
         let outcome = self.finalize_drained(seg_id, hashtable, false);
 
         // The segment left its chain either way.
         if meta.prev.is_none() {
-            let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+            let ttl_bucket = ttl_buckets.get_mut_bucket(seg_ttl);
             ttl_bucket.set_head(meta.next);
         }
 
@@ -1720,26 +1763,32 @@ impl Segments {
 
             let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
-            // Head insert + publish as Sealed (see s3fifo_evict_admission).
+            // Head insert as `Relinking`, then seal after the fill (see
+            // s3fifo_evict_admission for the C1 rationale).
             let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
             let old_head = ttl_bucket.head();
-            self.link_at_head(tid, old_head);
+            self.link_dest_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
 
             // Copy freq > 0 items (same promote logic, but no ghost).
             self.s3fifo_promote_from(seg_id, tid, hashtable);
+
+            // Publish the filled target: Relinking -> Sealed (C1).
+            self.publish_dest_sealed(tid);
         }
 
         // Finalize the already-Draining source (recycle-or-condemn, NO second
-        // Sealed->Draining CAS). Capture links after link_at_head, before
+        // Sealed->Draining CAS). Capture links after link_dest_at_head, before
         // finalize unlinks it.
         let id_idx = seg_id.get() as usize - 1;
         let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
+        // Capture ttl BEFORE finalize (see s3fifo_evict_admission) — M1.
+        let seg_ttl = self.headers[id_idx].ttl();
         let outcome = self.finalize_drained(seg_id, hashtable, false);
 
         // The segment left its chain either way.
         if meta.prev.is_none() {
-            let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+            let ttl_bucket = ttl_buckets.get_mut_bucket(seg_ttl);
             ttl_bucket.set_head(meta.next);
         }
 

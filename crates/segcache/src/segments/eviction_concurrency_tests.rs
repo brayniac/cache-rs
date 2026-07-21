@@ -183,10 +183,11 @@ fn merge_halts_at_pinned_candidate_and_relocates_survivors() {
 
     // ── Run one merge pass. It drains seg2/3/4 via copy-to-spare and STOPS at
     //    the pinned seg5. raw_item_x / guard_x hold raw pointers, not a borrow
-    //    of cache.segments, so this &mut call compiles while the pin is live.
+    //    of cache.segments, so this call compiles while the pin is live (item
+    //    7c: evict() and its ttl_buckets argument are both &self now, too).
     cache
         .segments
-        .evict(&mut cache.ttl_buckets, &cache.hashtable)
+        .evict(&cache.ttl_buckets, &cache.hashtable)
         .expect("merge eviction must succeed on the 3-candidate prefix");
 
     // ── With guard_x STILL ALIVE, re-read X through the pinned pointer. The

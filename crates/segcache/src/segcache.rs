@@ -184,7 +184,7 @@ impl Segcache {
                     let _ = self.segments.remove_at(
                         old_seg_id,
                         old_offset,
-                        &mut self.ttl_buckets,
+                        &self.ttl_buckets,
                         &self.hashtable,
                     );
                 }
@@ -196,7 +196,7 @@ impl Segcache {
                 let _ = self.segments.remove_at(
                     reserved.seg(),
                     reserved.offset(),
-                    &mut self.ttl_buckets,
+                    &self.ttl_buckets,
                     &self.hashtable,
                 );
                 Err(SegcacheError::HashTableInsertEx)
@@ -246,7 +246,7 @@ impl Segcache {
         if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. })
             && !self.segments.pool_has_room(target_pool)
         {
-            let _ = self.segments.evict(&mut self.ttl_buckets, &self.hashtable);
+            let _ = self.segments.evict(&self.ttl_buckets, &self.hashtable);
         }
 
         let mut retries = RESERVE_RETRIES;
@@ -277,7 +277,7 @@ impl Segcache {
                 Err(TtlBucketsError::NoFreeSegments) => {
                     if self
                         .segments
-                        .evict(&mut self.ttl_buckets, &self.hashtable)
+                        .evict(&self.ttl_buckets, &self.hashtable)
                         .is_err()
                     {
                         retries -= 1;
@@ -325,7 +325,7 @@ impl Segcache {
                 let _ = self.segments.remove_at(
                     reserved.seg(),
                     reserved.offset(),
-                    &mut self.ttl_buckets,
+                    &self.ttl_buckets,
                     &self.hashtable,
                 );
                 return Err(SegcacheError::NotFound);
@@ -343,7 +343,7 @@ impl Segcache {
                 let _ = self.segments.remove_at(
                     old_seg_id,
                     old_offset,
-                    &mut self.ttl_buckets,
+                    &self.ttl_buckets,
                     &self.hashtable,
                 );
                 return Ok(());
@@ -359,7 +359,7 @@ impl Segcache {
                 let _ = self.segments.remove_at(
                     reserved.seg(),
                     reserved.offset(),
-                    &mut self.ttl_buckets,
+                    &self.ttl_buckets,
                     &self.hashtable,
                 );
                 return Err(SegcacheError::Exists);
@@ -520,7 +520,7 @@ impl Segcache {
             }
             let _ = self
                 .segments
-                .remove_at(seg_id, offset, &mut self.ttl_buckets, &self.hashtable);
+                .remove_at(seg_id, offset, &self.ttl_buckets, &self.hashtable);
         }
 
         true

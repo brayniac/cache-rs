@@ -11,7 +11,9 @@
 //!
 //! TTL of 0 (no expiry) and TTLs beyond ~97 days map to the last bucket.
 
+use crate::sync::Ordering;
 use crate::*;
+use clocksource::coarse::AtomicInstant;
 
 const BUCKETS_PER_TIER: usize = 256;
 const TIER_COUNT: usize = 4;
@@ -31,7 +33,7 @@ const TIER_3_MAX: i32 = 1 << (TIER_3_SHIFT + 8); // 524,288
 /// The full collection of TTL buckets.
 pub struct TtlBuckets {
     pub(crate) buckets: Box<[TtlBucket]>,
-    pub(crate) last_expired: Instant,
+    pub(crate) last_expired: AtomicInstant,
 }
 
 impl TtlBuckets {
@@ -54,7 +56,7 @@ impl TtlBuckets {
 
         Self {
             buckets: buckets.into_boxed_slice(),
-            last_expired: Instant::now(),
+            last_expired: AtomicInstant::now(),
         }
     }
 
@@ -82,28 +84,22 @@ impl TtlBuckets {
         unsafe { self.buckets.get_unchecked(index) }
     }
 
-    /// Get a mutable reference to the bucket for the given TTL.
-    pub(crate) fn get_mut_bucket(&mut self, ttl: Duration) -> &mut TtlBucket {
-        let index = self.get_bucket_index(ttl);
-        // SAFETY: get_bucket_index always returns a valid index.
-        unsafe { self.buckets.get_unchecked_mut(index) }
-    }
-
     /// Run eager expiration across all buckets. Returns total segments expired.
-    pub(crate) fn expire(
-        &mut self,
-        hashtable: &MultiChoiceHashtable,
-        segments: &Segments,
-    ) -> usize {
+    ///
+    /// The once-per-tick debounce (`last_expired`) is an atomic swap rather
+    /// than a plain compare-and-set: under `&self` more than one caller can
+    /// race this method, and the swap still admits exactly one winner per
+    /// coarse tick (the loser observes its own freshly-stored value and
+    /// skips the redundant pass) without needing any lock.
+    pub(crate) fn expire(&self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
         let now = Instant::now();
-        if now == self.last_expired {
+        if self.last_expired.swap(now, Ordering::Relaxed) == now {
             return 0;
         }
-        self.last_expired = now;
 
         let start = Instant::now();
         let mut expired = 0;
-        for bucket in self.buckets.iter_mut() {
+        for bucket in self.buckets.iter() {
             expired += bucket.expire(hashtable, segments);
         }
         let duration = start.elapsed();
@@ -116,10 +112,10 @@ impl TtlBuckets {
     }
 
     /// Clear all segments across all buckets. Returns total segments cleared.
-    pub(crate) fn clear(&mut self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
+    pub(crate) fn clear(&self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
         let start = Instant::now();
         let mut cleared = 0;
-        for bucket in self.buckets.iter_mut() {
+        for bucket in self.buckets.iter() {
             cleared += bucket.clear(hashtable, segments);
         }
         let duration = start.elapsed();

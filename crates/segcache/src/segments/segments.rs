@@ -838,7 +838,7 @@ impl Segments {
     /// should return some segment id.
     pub fn evict(
         &self,
-        ttl_buckets: &mut TtlBuckets,
+        ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Cheap path first: drop whole expired segments (no spare, no
@@ -867,7 +867,7 @@ impl Segments {
                 // may need to loop back around to the first TTL bucket.
                 for i in 0..=buckets {
                     let bucket_id = (offset + i) % buckets;
-                    let ttl_bucket = &mut ttl_buckets.buckets[bucket_id];
+                    let ttl_bucket = &ttl_buckets.buckets[bucket_id];
                     if let Some(first_seg) = ttl_bucket.head() {
                         let start = ttl_bucket.next_to_merge().unwrap_or(first_seg);
                         match self.merge_evict(start, ttl_bucket, hashtable) {
@@ -938,7 +938,7 @@ impl Segments {
                         Ok(outcome) => {
                             // The segment left its chain either way.
                             if meta.prev.is_none() {
-                                let ttl_bucket = ttl_buckets.get_mut_bucket(seg_ttl);
+                                let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
                                 ttl_bucket.set_head(meta.next);
                             }
                             match outcome {
@@ -968,7 +968,7 @@ impl Segments {
 
     /// Returns the least valuable segment based on the configured eviction
     /// policy.
-    pub(crate) fn least_valuable_seg(&self, ttl_buckets: &mut TtlBuckets) -> Option<NonZeroU32> {
+    pub(crate) fn least_valuable_seg(&self, ttl_buckets: &TtlBuckets) -> Option<NonZeroU32> {
         match self.policy {
             Policy::None => None,
             Policy::Random => {
@@ -998,7 +998,7 @@ impl Segments {
                     let idx = (start + i) % self.cap;
                     if self.headers[idx as usize].state().is_readable() {
                         let ttl = self.headers[idx as usize].ttl();
-                        let ttl_bucket = ttl_buckets.get_mut_bucket(ttl);
+                        let ttl_bucket = ttl_buckets.get_bucket(ttl);
                         return ttl_bucket.head();
                     }
                 }
@@ -1032,10 +1032,10 @@ impl Segments {
     /// May trigger merge compaction if the merge eviction policy is active and
     /// the segment occupancy drops below the compact ratio.
     pub(crate) fn remove_at(
-        &mut self,
+        &self,
         seg_id: NonZeroU32,
         offset: usize,
-        ttl_buckets: &mut TtlBuckets,
+        ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Remove the item.
@@ -1047,10 +1047,15 @@ impl Segments {
             // immediately via the drain/condemn protocol.
             if segment.live_items() == 0 && segment.can_evict() {
                 let meta = segment.header_metadata();
+                // Capture ttl BEFORE clear_segment (clear_segment may recycle
+                // the segment, after which a concurrent reserve could
+                // re-stamp its ttl) — M1, same fix as the s3fifo/default
+                // evict paths.
+                let id_idx = seg_id.get() as usize - 1;
+                let seg_ttl = self.headers[id_idx].ttl();
 
                 if self.clear_segment(seg_id, hashtable, false).is_ok() && meta.prev.is_none() {
-                    let id_idx = seg_id.get() as usize - 1;
-                    let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+                    let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
                     ttl_bucket.set_head(meta.next);
                 }
                 return Ok(());
@@ -1082,7 +1087,7 @@ impl Segments {
 
                 if next_ratio <= target_ratio {
                     let ttl = self.headers[id_idx].ttl();
-                    let ttl_bucket = ttl_buckets.get_mut_bucket(ttl);
+                    let ttl_bucket = ttl_buckets.get_bucket(ttl);
                     let _ = self.merge_compact(seg_id, ttl_bucket, hashtable);
                     ttl_bucket.set_next_to_merge(None);
                 }
@@ -1166,7 +1171,7 @@ impl Segments {
     fn merge_evict(
         &self,
         start: NonZeroU32,
-        ttl_bucket: &mut TtlBucket,
+        ttl_bucket: &TtlBucket,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
         #[cfg(feature = "metrics")]
@@ -1328,7 +1333,7 @@ impl Segments {
     fn merge_evict_fallback_drop(
         &self,
         start: NonZeroU32,
-        ttl_bucket: &mut TtlBucket,
+        ttl_bucket: &TtlBucket,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
         let meta = self.headers[start.get() as usize - 1].metadata(Ordering::Acquire);
@@ -1360,7 +1365,7 @@ impl Segments {
     fn merge_compact(
         &self,
         start: NonZeroU32,
-        ttl_bucket: &mut TtlBucket,
+        ttl_bucket: &TtlBucket,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
         #[cfg(feature = "metrics")]
@@ -1519,7 +1524,7 @@ impl Segments {
     /// filtering step), then main pool (CLOCK second-chance).
     fn s3fifo_evict(
         &self,
-        ttl_buckets: &mut TtlBuckets,
+        ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Try evicting an admission-pool segment first (promoting freq > 0).
@@ -1544,7 +1549,7 @@ impl Segments {
     fn s3fifo_evict_admission(
         &self,
         seg_id: NonZeroU32,
-        ttl_buckets: &mut TtlBuckets,
+        ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Drain-first: claim the source's Sealed->Draining CAS BEFORE promoting
@@ -1576,7 +1581,7 @@ impl Segments {
             // evictable, so a concurrent evictor can neither select nor
             // claim_for_drain the target while we fill it (C1). It is never the
             // write tail (Live == the bucket tail reserve() writes into).
-            let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
+            let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
             let old_head = ttl_bucket.head();
             self.link_dest_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
@@ -1605,7 +1610,7 @@ impl Segments {
 
         // The segment left its chain either way.
         if meta.prev.is_none() {
-            let ttl_bucket = ttl_buckets.get_mut_bucket(seg_ttl);
+            let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
             ttl_bucket.set_head(meta.next);
         }
 
@@ -1750,7 +1755,7 @@ impl Segments {
     fn s3fifo_evict_main(
         &self,
         seg_id: NonZeroU32,
-        ttl_buckets: &mut TtlBuckets,
+        ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Drain-first: claim the source's Sealed->Draining CAS BEFORE promoting
@@ -1771,7 +1776,7 @@ impl Segments {
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
             // Head insert as `Relinking`, then seal after the fill (see
             // s3fifo_evict_admission for the C1 rationale).
-            let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
+            let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
             let old_head = ttl_bucket.head();
             self.link_dest_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
@@ -1794,7 +1799,7 @@ impl Segments {
 
         // The segment left its chain either way.
         if meta.prev.is_none() {
-            let ttl_bucket = ttl_buckets.get_mut_bucket(seg_ttl);
+            let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
             ttl_bucket.set_head(meta.next);
         }
 
@@ -2043,7 +2048,7 @@ mod spare_tests {
         assert!(next.is_some(), "head must have a successor in the chain");
         let seg_ttl = cache.segments.header(head).ttl();
         assert_eq!(
-            cache.ttl_buckets.get_mut_bucket(seg_ttl).head(),
+            cache.ttl_buckets.get_bucket(seg_ttl).head(),
             Some(head),
             "precondition: bucket head is the segment we drop"
         );
@@ -2058,7 +2063,7 @@ mod spare_tests {
 
         // Drive the no-spare fallback directly.
         let res = {
-            let bucket = cache.ttl_buckets.get_mut_bucket(seg_ttl);
+            let bucket = cache.ttl_buckets.get_bucket(seg_ttl);
             cache
                 .segments
                 .merge_evict_fallback_drop(head, bucket, &cache.hashtable)
@@ -2077,7 +2082,7 @@ mod spare_tests {
         );
         // (c) The bucket head advanced past the condemned segment — the fix.
         assert_eq!(
-            cache.ttl_buckets.get_mut_bucket(seg_ttl).head(),
+            cache.ttl_buckets.get_bucket(seg_ttl).head(),
             next,
             "bucket head must advance to the old head's next, never dangle \
              into the condemned segment"

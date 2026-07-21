@@ -119,11 +119,7 @@ impl TtlBucket {
     /// pinned by readers is condemned (AwaitingRelease) and unlinked
     /// immediately — the last reader's guard drop frees it. Returns the
     /// number of segments actually freed by this pass.
-    pub(super) fn expire(
-        &mut self,
-        hashtable: &MultiChoiceHashtable,
-        segments: &Segments,
-    ) -> usize {
+    pub(super) fn expire(&self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
         let now = Instant::now();
         self.drain_chain(hashtable, segments, Some(now))
     }
@@ -132,7 +128,7 @@ impl TtlBucket {
     /// hashtable. Unpinned segments are freed; pinned ones are condemned
     /// and freed by the last reader's guard drop. Returns the number of
     /// segments actually freed by this pass.
-    pub(super) fn clear(&mut self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
+    pub(super) fn clear(&self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
         self.drain_chain(hashtable, segments, None)
     }
 
@@ -146,7 +142,7 @@ impl TtlBucket {
     /// readable segments) but does not close this writer-vs-drain hazard;
     /// that protocol is deferred past 5b to item 7.
     fn drain_chain(
-        &mut self,
+        &self,
         hashtable: &MultiChoiceHashtable,
         segments: &Segments,
         expire_cutoff: Option<Instant>,

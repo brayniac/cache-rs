@@ -1156,13 +1156,13 @@ fn merge_evict_copies_survivors_into_spare() {
     // policy's random start still finds it (evict scans every bucket).
     cache
         .segments
-        .evict(&mut cache.ttl_buckets, &cache.hashtable)
+        .evict(&cache.ttl_buckets, &cache.hashtable)
         .expect("merge eviction must succeed on a full 5-segment chain");
 
     // (a) The bucket head is now the spare segment, Sealed and holding the
     // copied survivors.
     let seg_ttl = cache.segments.header(spare_id).ttl();
-    let head = cache.ttl_buckets.get_mut_bucket(seg_ttl).head();
+    let head = cache.ttl_buckets.get_bucket(seg_ttl).head();
     assert_eq!(head, Some(spare_id), "merge must head-insert the spare");
     {
         let spare = cache.segments.segment(spare_id).unwrap();
@@ -1350,7 +1350,7 @@ fn merge_compact_combines_under_full_segments_into_spare() {
     // both under-full candidates' survivors (2 from seg_a + 2 from
     // seg_b = 4), with none pruned.
     let seg_ttl = cache.segments.header(spare_id).ttl();
-    let head = cache.ttl_buckets.get_mut_bucket(seg_ttl).head();
+    let head = cache.ttl_buckets.get_bucket(seg_ttl).head();
     assert_eq!(
         head,
         Some(spare_id),

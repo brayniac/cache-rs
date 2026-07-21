@@ -50,7 +50,7 @@ pub(crate) struct Segments {
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
     admission_cap: u32,
     /// Current number of segments in the admission pool.
-    admission_count: u32,
+    admission_count: crate::sync::AtomicU32,
 }
 
 /// Result of draining a segment: `Freed` means it was returned to the
@@ -151,7 +151,7 @@ impl Segments {
             data,
             evict: Box::new(Eviction::new(segments, evict_policy)),
             admission_cap,
-            admission_count: 0,
+            admission_count: crate::sync::AtomicU32::new(0),
         })
     }
 
@@ -160,15 +160,17 @@ impl Segments {
     /// Check if the given pool has room for another segment.
     pub(crate) fn pool_has_room(&self, pool: SegmentPool) -> bool {
         match pool {
-            SegmentPool::Admission => self.admission_count < self.admission_cap,
+            SegmentPool::Admission => {
+                self.admission_count.load(Ordering::Relaxed) < self.admission_cap
+            }
             SegmentPool::Main => true,
         }
     }
 
     /// Track a segment transitioning to the given pool.
-    pub(crate) fn incr_pool(&mut self, pool: SegmentPool) {
+    pub(crate) fn incr_pool(&self, pool: SegmentPool) {
         if pool == SegmentPool::Admission {
-            self.admission_count += 1;
+            self.admission_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -487,7 +489,8 @@ impl Segments {
 
         // Pool membership ends when the segment leaves service.
         if self.headers[id_idx].pool() == SegmentPool::Admission {
-            self.admission_count = self.admission_count.saturating_sub(1);
+            let prev = self.admission_count.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(prev > 0, "admission_count underflowed in recycle");
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 
@@ -678,7 +681,8 @@ impl Segments {
         // Pool membership ends at condemn time (the guard drop has no
         // access to the pool bookkeeping).
         if self.headers[id_idx].pool() == SegmentPool::Admission {
-            self.admission_count = self.admission_count.saturating_sub(1);
+            let prev = self.admission_count.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(prev > 0, "admission_count underflowed in condemn");
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 

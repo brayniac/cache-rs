@@ -454,7 +454,7 @@ impl Segments {
     /// its neighbours.
     ///
     /// *NOTE*: this must not be used on segments in the free queue.
-    fn unlink(&mut self, id: NonZeroU32) {
+    fn unlink(&self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
 
         if let Some(next) = self.headers[id_idx].next_seg() {
@@ -472,7 +472,7 @@ impl Segments {
     /// Sealed (readable + evictable, never the write tail): Reserved ->
     /// Linking carries the next pointer, the old head's prev is patched,
     /// then Linking -> Sealed publishes.
-    fn link_at_head(&mut self, this: NonZeroU32, head: Option<NonZeroU32>) {
+    fn link_at_head(&self, this: NonZeroU32, head: Option<NonZeroU32>) {
         let this_idx = this.get() as usize - 1;
         let linking = self.headers[this_idx].cas_metadata(
             State::Reserved,
@@ -504,7 +504,7 @@ impl Segments {
     /// Return a drained segment to the free queue. The segment must be in
     /// the Draining state with no readers pinning it; its write statistics
     /// are reset (and its generation bumped) at reserve time.
-    pub(crate) fn recycle(&mut self, id: NonZeroU32) {
+    pub(crate) fn recycle(&self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
         debug_assert_eq!(
             self.headers[id_idx].ref_count(),
@@ -669,7 +669,7 @@ impl Segments {
     /// memory is not yet reclaimable — the last reader's guard drop will
     /// free it.
     fn clear_segment(
-        &mut self,
+        &self,
         id: NonZeroU32,
         hashtable: &MultiChoiceHashtable,
         expire: bool,
@@ -716,7 +716,7 @@ impl Segments {
     /// reader already dropped (this caller then reclaimed the segment),
     /// `Deferred` otherwise.
     pub(crate) fn condemn(
-        &mut self,
+        &self,
         id: NonZeroU32,
         next: Option<NonZeroU32>,
         prev: Option<NonZeroU32>,
@@ -726,8 +726,8 @@ impl Segments {
         // Pool membership ends at condemn time (the guard drop has no
         // access to the pool bookkeeping).
         if self.headers[id_idx].pool() == SegmentPool::Admission {
-            let prev = self.admission_count.fetch_sub(1, Ordering::Relaxed);
-            debug_assert!(prev > 0, "admission_count underflowed in condemn");
+            let prev_count = self.admission_count.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(prev_count > 0, "admission_count underflowed in condemn");
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 

@@ -56,6 +56,11 @@ pub(crate) struct Segments {
     /// per-segment *data-mutation* exclusivity comes from the `Sealed ->
     /// Draining` CAS (`claim_for_drain`, run before any mutation), NOT from a
     /// single-evictor lock. See the soundness contract on `segment()`.
+    ///
+    /// Lock order: this policy lock is INNER to `TtlBucket::chain_lock` — code
+    /// may take `evict` while holding a bucket's `chain_lock`, never the
+    /// reverse (no site acquires a `chain_lock` while holding `evict`).
+    // LOCK: eviction-policy
     evict: std::sync::Mutex<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
     admission_cap: u32,
@@ -921,12 +926,17 @@ impl Segments {
                 SEGMENT_EVICT.increment();
 
                 if let Some(id) = self.least_valuable_seg(ttl_buckets) {
-                    // Capture the links AND ttl before the drain (condemn
-                    // clears the links; a recycled+re-reserved segment's ttl
-                    // could change) for the bucket head fixup below — M1.
+                    // Resolve the segment's bucket (seg_ttl read before the
+                    // claim) and lock it. LOCK: bucket-chain — the drain
+                    // (finalize_drained unlink/splice) + bucket head fixup are
+                    // serialized on this bucket. Capture links UNDER the lock so
+                    // the head fixup is consistent with the drain. Resolving the
+                    // bucket before clear_segment sidesteps the M1 ttl re-stamp.
                     let id_idx = id.get() as usize - 1;
-                    let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
                     let seg_ttl = self.headers[id_idx].ttl();
+                    let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
+                    let _chain = ttl_bucket.chain_lock();
+                    let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
 
                     let outcome = self.clear_segment(id, hashtable, false);
 
@@ -938,7 +948,6 @@ impl Segments {
                         Ok(outcome) => {
                             // The segment left its chain either way.
                             if meta.prev.is_none() {
-                                let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
                                 ttl_bucket.set_head(meta.next);
                             }
                             match outcome {
@@ -1046,16 +1055,18 @@ impl Segments {
             // If the segment is now empty and evictable, free it
             // immediately via the drain/condemn protocol.
             if segment.live_items() == 0 && segment.can_evict() {
-                let meta = segment.header_metadata();
-                // Capture ttl BEFORE clear_segment (clear_segment may recycle
-                // the segment, after which a concurrent reserve could
-                // re-stamp its ttl) — M1, same fix as the s3fifo/default
-                // evict paths.
+                // Resolve the segment's bucket (seg_ttl read before the claim)
+                // and lock it. LOCK: bucket-chain — the empty-segment drain
+                // (finalize_drained unlink/splice) + head fixup are serialized
+                // on this bucket; resolving the bucket before clear_segment
+                // sidesteps the M1 ttl re-stamp. Capture links under the lock.
                 let id_idx = seg_id.get() as usize - 1;
                 let seg_ttl = self.headers[id_idx].ttl();
+                let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
+                let _chain = ttl_bucket.chain_lock();
+                let meta = segment.header_metadata();
 
                 if self.clear_segment(seg_id, hashtable, false).is_ok() && meta.prev.is_none() {
-                    let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
                     ttl_bucket.set_head(meta.next);
                 }
                 return Ok(());
@@ -1208,6 +1219,19 @@ impl Segments {
             self.headers[sidx].set_pool(SegmentPool::Main);
             self.headers[sidx].mark_merged();
         }
+
+        // LOCK: bucket-chain — serialize ALL chain-structure mutation of this
+        // bucket (the spare head-insert below + each drained candidate's
+        // finalize_drained unlink/splice) against concurrent evictors,
+        // reservers (try_expand), and drains. Held across the copy loop
+        // (coarse) so a single guard covers both the head-insert and every
+        // finalize unlink — recycle/condemn/unlink take NO lock themselves, so
+        // there is no re-entrant same-bucket re-lock. The reserve hot path
+        // (try_alloc_item) never takes this lock; only the infrequent
+        // try_expand does. Lock order: chain_lock is outer to the eviction
+        // policy lock taken for the merge params below.
+        let _chain = ttl_bucket.chain_lock();
+
         let old_head = ttl_bucket.head();
         self.link_dest_at_head(spare_id, old_head);
         ttl_bucket.set_head(Some(spare_id));
@@ -1336,6 +1360,12 @@ impl Segments {
         ttl_bucket: &TtlBucket,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
+        // LOCK: bucket-chain — the drop drains `start` (finalize_drained's
+        // unlink/splice) and fixes the bucket head; serialize that surgery on
+        // this bucket. Reached only when merge_evict found no spare, BEFORE it
+        // acquired the chain_lock, so there is no double-lock. Capture the
+        // links under the lock so the head fixup is consistent with the drain.
+        let _chain = ttl_bucket.chain_lock();
         let meta = self.headers[start.get() as usize - 1].metadata(Ordering::Acquire);
         let next = meta.next;
         match self.clear_segment(start, hashtable, false) {
@@ -1407,6 +1437,13 @@ impl Segments {
             self.headers[sidx].set_pool(SegmentPool::Main);
             self.headers[sidx].mark_merged();
         }
+
+        // LOCK: bucket-chain — same rationale as merge_evict: one guard covers
+        // the spare head-insert and every candidate's finalize unlink/splice,
+        // serialized per bucket. Acquired after reserve_spare (the no-spare
+        // path returns earlier without the lock). Held across the copy loop.
+        let _chain = ttl_bucket.chain_lock();
+
         let old_head = ttl_bucket.head();
         self.link_dest_at_head(spare_id, old_head);
         ttl_bucket.set_head(Some(spare_id));
@@ -1567,21 +1604,32 @@ impl Segments {
             return Err(SegmentsError::EvictFailure);
         }
 
+        // Resolve the source's bucket (source and promotion target share
+        // src_ttl's bucket — Bs == Bt) BEFORE any chain surgery, and lock it
+        // once. LOCK: bucket-chain — one guard covers the target head-insert,
+        // the source finalize unlink/splice, and the source head fixup; the
+        // spec's cross-bucket case never arises here (both use src_ttl's
+        // bucket), so no two bucket locks are ever held at once. Held across the
+        // promote copy (coarse) to keep a single guard — finalize_drained's
+        // unlink takes no lock, so no re-entrant same-bucket re-lock. Resolving
+        // the bucket before finalize also sidesteps the M1 ttl re-stamp race.
+        let id_idx = seg_id.get() as usize - 1;
+        let src_ttl = self.headers[id_idx].ttl();
+        let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
+        let _chain = ttl_bucket.chain_lock();
+
         // First pass: copy items with freq > 0 into a main-pool segment. The
         // source is now Draining and exclusively ours.
         let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
             self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
-
-            let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
             // Link the target at the head of the TTL bucket, published as
             // `Relinking`: readable (promoted survivors stay reachable) but NOT
             // evictable, so a concurrent evictor can neither select nor
             // claim_for_drain the target while we fill it (C1). It is never the
             // write tail (Live == the bucket tail reserve() writes into).
-            let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
             let old_head = ttl_bucket.head();
             self.link_dest_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
@@ -1601,16 +1649,11 @@ impl Segments {
         // Sealed->Draining CAS). Capture links AFTER link_dest_at_head patched
         // the source's prev (if the source was the old head, its prev now
         // points at the freshly linked target) and BEFORE finalize unlinks it.
-        let id_idx = seg_id.get() as usize - 1;
         let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
-        // Capture ttl BEFORE finalize (finalize may recycle the source, after
-        // which a concurrent reserve could re-stamp its ttl) — M1.
-        let seg_ttl = self.headers[id_idx].ttl();
         let outcome = self.finalize_drained(seg_id, hashtable, false);
 
         // The segment left its chain either way.
         if meta.prev.is_none() {
-            let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
             ttl_bucket.set_head(meta.next);
         }
 
@@ -1765,18 +1808,25 @@ impl Segments {
             return Err(SegmentsError::EvictFailure);
         }
 
+        // LOCK: bucket-chain — same structure as s3fifo_evict_admission: resolve
+        // the source's bucket (Bs == Bt, both src_ttl's bucket) BEFORE any chain
+        // surgery and lock it once; the guard covers the target head-insert, the
+        // source finalize unlink/splice, and the head fixup. No two bucket locks
+        // held at once. Held across the promote copy (coarse, single guard).
+        let id_idx = seg_id.get() as usize - 1;
+        let src_ttl = self.headers[id_idx].ttl();
+        let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
+        let _chain = ttl_bucket.chain_lock();
+
         // Try to get a target segment for second-chance items. The source is
         // now Draining and exclusively ours.
         let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
             self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
-
-            let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
             // Head insert as `Relinking`, then seal after the fill (see
             // s3fifo_evict_admission for the C1 rationale).
-            let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
             let old_head = ttl_bucket.head();
             self.link_dest_at_head(tid, old_head);
             ttl_bucket.set_head(Some(tid));
@@ -1791,15 +1841,11 @@ impl Segments {
         // Finalize the already-Draining source (recycle-or-condemn, NO second
         // Sealed->Draining CAS). Capture links after link_dest_at_head, before
         // finalize unlinks it.
-        let id_idx = seg_id.get() as usize - 1;
         let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
-        // Capture ttl BEFORE finalize (see s3fifo_evict_admission) — M1.
-        let seg_ttl = self.headers[id_idx].ttl();
         let outcome = self.finalize_drained(seg_id, hashtable, false);
 
         // The segment left its chain either way.
         if meta.prev.is_none() {
-            let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
             ttl_bucket.set_head(meta.next);
         }
 

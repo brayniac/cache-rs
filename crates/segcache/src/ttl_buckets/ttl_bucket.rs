@@ -44,7 +44,28 @@ pub struct TtlBucket {
     /// tests today).
     nseg: AtomicU32,
     next_to_merge: AtomicU32,
-    _pad: [u8; 44],
+    /// Serializes all chain-STRUCTURE mutations of THIS bucket (head/tail
+    /// pointer updates and the prev/next neighbour patches done as chain
+    /// surgery): `reserve`'s `try_expand` (link/seal/set_tail), eviction's
+    /// dest head-insert (`link_dest_at_head` + `set_head`), each drained
+    /// candidate's `finalize_drained` unlink/splice, `drain_chain`/`expire`/
+    /// `clear`, and `remove_at`'s empty-free + head fixup all take it.
+    ///
+    /// The reserve hot path never touches it: `try_alloc_item` (the CAS on
+    /// `write_offset`) makes no chain change, so only the infrequent
+    /// `try_expand` (tail full -> new segment) acquires the lock. Held only
+    /// around the brief per-bucket pointer surgery.
+    ///
+    /// Boxed so the `TtlBucket` stays exactly 64 bytes (one cache line, a
+    /// `std::sync::Mutex` is not a fixed size across platforms) with the hot
+    /// head/tail atomics cache-line-local; the mutex itself lives off-line.
+    ///
+    /// Lock order: `chain_lock` is OUTER to `Segments::evict` (the eviction
+    /// policy Mutex) — code may take `evict` while holding this, never the
+    /// reverse.
+    // LOCK: bucket-chain
+    chain_lock: Box<std::sync::Mutex<()>>,
+    _pad: [u8; 36],
 }
 
 // Loom atomics are larger than std atomics, so skip size check under loom.
@@ -60,8 +81,16 @@ impl TtlBucket {
             ttl,
             nseg: AtomicU32::new(0),
             next_to_merge: AtomicU32::new(0),
-            _pad: [0; 44],
+            chain_lock: Box::new(std::sync::Mutex::new(())),
+            _pad: [0; 36],
         }
+    }
+
+    /// Acquire this bucket's chain-structure lock. See the field docs and the
+    /// lock inventory in the design spec (`docs/superpowers/specs/...`). Held
+    /// only around brief per-bucket chain pointer surgery.
+    pub(crate) fn chain_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.chain_lock.lock().unwrap()
     }
 
     /// Head of the segment chain (oldest segment).
@@ -147,6 +176,15 @@ impl TtlBucket {
         segments: &Segments,
         expire_cutoff: Option<Instant>,
     ) -> usize {
+        // LOCK: bucket-chain — the drain walk mutates this bucket's chain
+        // structure (set_head/set_tail + each recycle/condemn's unlink/splice).
+        // Held across the whole walk (coarse: also spans the per-segment
+        // hashtable clear) to serialize against concurrent evictors, reservers
+        // (try_expand), and other drains of this bucket without re-entrant
+        // re-locking in recycle/condemn. Lock order: chain_lock is outer to the
+        // eviction policy lock, which the primitives below never take.
+        let _chain = self.chain_lock();
+
         let mut freed = 0;
         let mut cursor = self.head();
 
@@ -249,6 +287,17 @@ impl TtlBucket {
         segments
             .header(id)
             .set_ttl(Duration::from_secs(self.ttl as u32));
+
+        // LOCK: bucket-chain — the tail-extension surgery (seal the old tail +
+        // link the new segment + set_tail/set_head) mutates this bucket's chain
+        // structure and must serialize against concurrent eviction/drain
+        // surgery on the same bucket. Held across the election so a merge's
+        // head-insert or a drain's unlink cannot interleave with the seal. The
+        // reserve hot path (`try_alloc_item`) never reaches here. Under this
+        // lock at most one expander runs at a time, so the loser's spin-wait
+        // for the winner's tail publish is always immediately satisfied (the
+        // winner publishes before releasing) — no self-deadlock.
+        let _chain = self.chain_lock();
 
         let won = match observed_tail {
             Some(tail_id) => {

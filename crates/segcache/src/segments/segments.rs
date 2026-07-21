@@ -1284,7 +1284,9 @@ impl Segments {
             // Release-CAS, so no readable segment's live bytes are ever moved
             // in place.
             {
-                let mut cand = self.segment(cand_id)?;
+                let mut cand = self
+                    .segment(cand_id)
+                    .expect("claimed chain candidate must be a valid segment id");
                 let cand_old_size = cand.live_bytes();
                 cutoff = cand.prune(hashtable, cutoff, target_ratio);
                 trace!(
@@ -1293,7 +1295,9 @@ impl Segments {
                 );
             }
             {
-                let (mut cand, mut spare) = self.segment_pair(cand_id, spare_id)?;
+                let (mut cand, mut spare) = self
+                    .segment_pair(cand_id, spare_id)
+                    .expect("claimed chain candidate / own spare must be valid segment ids");
                 let _ = cand.copy_into(&mut spare, hashtable);
             }
 
@@ -1459,7 +1463,9 @@ impl Segments {
             // Release-CAS, so no readable segment's live bytes are ever moved
             // in place.
             {
-                let (mut cand, mut spare) = self.segment_pair(cand_id, spare_id)?;
+                let (mut cand, mut spare) = self
+                    .segment_pair(cand_id, spare_id)
+                    .expect("claimed chain candidate / own spare must be valid segment ids");
                 let _ = cand.copy_into(&mut spare, hashtable);
             }
 

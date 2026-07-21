@@ -1589,12 +1589,30 @@ impl Segments {
         ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
+        // Resolve the source's bucket (source and promotion target share
+        // src_ttl's bucket — Bs == Bt) and lock it BEFORE claiming the source.
+        // LOCK: bucket-chain — one guard covers the source claim, the target
+        // head-insert, the source finalize unlink/splice, and the head fixup;
+        // Bs == Bt so no two bucket locks are ever held at once. Held across the
+        // promote copy (coarse, single guard); claim_for_drain / finalize
+        // primitives take no lock, so no re-entrant same-bucket re-lock.
+        // Resolving the bucket from the pre-claim ttl is safe: on a lost claim
+        // nothing is mutated (no target reserved yet), and if the source's ttl
+        // changed under us the claim CAS simply fails.
+        let id_idx = seg_id.get() as usize - 1;
+        let src_ttl = self.headers[id_idx].ttl();
+        let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
+        let _chain = ttl_bucket.chain_lock();
+
         // Drain-first: claim the source's Sealed->Draining CAS BEFORE promoting
         // items out of it (s3fifo_promote_from calls remove_item_at on src).
-        // This is the uniform per-segment mutation claim shared with merge, the
-        // drop path, and expire/clear. A lost claim means the source was
-        // already taken by another mutator — fail this pass (matching the prior
-        // clear_segment-Err -> EvictFailure semantics), having mutated nothing.
+        // The claim is taken UNDER the chain_lock — symmetric with every other
+        // evict/drain path (merge per-candidate, evict-default, remove_at,
+        // drain_chain) — so a bucket-lock holder (e.g. a concurrent
+        // drain_chain/expire) never observes this source mid-claim in Draining
+        // (which would trip drain_chain's Sealed/Live debug_assert). A lost
+        // claim means the source was already taken by another mutator — fail
+        // this pass, having mutated nothing.
         //
         // Behavior note (spec §2): draining the source before copy-out rejects
         // NEW reader pins on it during the promotion window and can cause a
@@ -1603,20 +1621,6 @@ impl Segments {
         if !self.claim_for_drain(seg_id) {
             return Err(SegmentsError::EvictFailure);
         }
-
-        // Resolve the source's bucket (source and promotion target share
-        // src_ttl's bucket — Bs == Bt) BEFORE any chain surgery, and lock it
-        // once. LOCK: bucket-chain — one guard covers the target head-insert,
-        // the source finalize unlink/splice, and the source head fixup; the
-        // spec's cross-bucket case never arises here (both use src_ttl's
-        // bucket), so no two bucket locks are ever held at once. Held across the
-        // promote copy (coarse) to keep a single guard — finalize_drained's
-        // unlink takes no lock, so no re-entrant same-bucket re-lock. Resolving
-        // the bucket before finalize also sidesteps the M1 ttl re-stamp race.
-        let id_idx = seg_id.get() as usize - 1;
-        let src_ttl = self.headers[id_idx].ttl();
-        let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
-        let _chain = ttl_bucket.chain_lock();
 
         // First pass: copy items with freq > 0 into a main-pool segment. The
         // source is now Draining and exclusively ours.
@@ -1801,22 +1805,25 @@ impl Segments {
         ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
-        // Drain-first: claim the source's Sealed->Draining CAS BEFORE promoting
-        // items out of it (see s3fifo_evict_admission for the full rationale +
-        // behavior note). A lost claim fails this pass, having mutated nothing.
-        if !self.claim_for_drain(seg_id) {
-            return Err(SegmentsError::EvictFailure);
-        }
-
         // LOCK: bucket-chain — same structure as s3fifo_evict_admission: resolve
-        // the source's bucket (Bs == Bt, both src_ttl's bucket) BEFORE any chain
-        // surgery and lock it once; the guard covers the target head-insert, the
-        // source finalize unlink/splice, and the head fixup. No two bucket locks
-        // held at once. Held across the promote copy (coarse, single guard).
+        // the source's bucket (Bs == Bt, both src_ttl's bucket) and lock it
+        // BEFORE claiming the source; the guard covers the source claim, the
+        // target head-insert, the source finalize unlink/splice, and the head
+        // fixup. No two bucket locks held at once. Held across the promote copy
+        // (coarse, single guard).
         let id_idx = seg_id.get() as usize - 1;
         let src_ttl = self.headers[id_idx].ttl();
         let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
         let _chain = ttl_bucket.chain_lock();
+
+        // Drain-first: claim the source's Sealed->Draining CAS UNDER the
+        // chain_lock (symmetric with every other evict/drain path — see
+        // s3fifo_evict_admission for the full rationale + behavior note), so a
+        // concurrent bucket-lock holder never observes this source mid-claim in
+        // Draining. A lost claim fails this pass, having mutated nothing.
+        if !self.claim_for_drain(seg_id) {
+            return Err(SegmentsError::EvictFailure);
+        }
 
         // Try to get a target segment for second-chance items. The source is
         // now Draining and exclusively ours.

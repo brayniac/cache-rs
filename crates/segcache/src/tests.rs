@@ -498,7 +498,7 @@ fn reader_pin_acquire_release() {
 
 #[test]
 fn init() {
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(4096)
         .heap_size(4096 * 64)
         .build()
@@ -512,7 +512,7 @@ fn get_free_seg() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -1778,4 +1778,97 @@ fn fuzz_2() {
     );
     let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
     let _ = cache.insert(&[1], &[3, 4, 2], None, Duration::from_secs(114));
+}
+
+// Roadmap item 7b: `get`/`get_no_freq_incr` are `&self` so N threads can
+// share `&Segcache` for genuinely concurrent reads. Populate a cache with
+// known key -> value pairs (&mut phase), then share &cache across threads
+// for a read-only concurrent phase. No writes happen during the concurrent
+// phase, so every present key has a fixed value -- any torn read, corrupted
+// freq slot, or botched pin surfaces as a wrong value or a crash.
+//
+// This also doubles as the compile-time consumer of the Task-1 `Segcache:
+// Sync` guard: the test would not compile if `Segcache` were `!Sync`, since
+// `std::thread::scope` requires the captured `&Segcache` to be `Sync` to
+// share it across spawned threads.
+#[test]
+fn concurrent_readers_see_correct_values() {
+    const KEYS: usize = 500;
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 4_000;
+
+    let segment_size = 4096;
+    let segments = 64;
+    let heap_size = segments * segment_size as usize;
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .eviction(Policy::Fifo)
+        .build()
+        .expect("build cache");
+
+    let key = |i: usize| format!("k{i:06}").into_bytes();
+    let val = |i: usize| format!("val-{i:06}").into_bytes();
+    for i in 0..KEYS {
+        cache
+            .insert(&key(i), val(i).as_slice(), None, Duration::ZERO)
+            .expect("insert");
+    }
+
+    // Sanity: all present before the concurrent phase (no eviction happened).
+    for i in 0..KEYS {
+        let item = cache.get(&key(i)).expect("present");
+        assert!(item.value() == *val(i).as_slice());
+    }
+
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let cache = &cache; // shared &Segcache -- requires Segcache: Sync
+            s.spawn(move || {
+                for r in 0..ROUNDS {
+                    let i = (t * 31 + r * 17) % KEYS;
+                    // Hold two pins at once to exercise overlapping ref_counts.
+                    let a = cache.get(&key(i)).expect("present key must be found");
+                    assert!(
+                        a.value() == *val(i).as_slice(),
+                        "torn/wrong value for key {i}"
+                    );
+
+                    let j = (i + 7) % KEYS;
+                    let b = cache.get_no_freq_incr(&key(j)).expect("present");
+                    assert!(b.value() == *val(j).as_slice());
+
+                    assert!(cache.get(b"definitely-absent-key").is_none());
+
+                    drop(a);
+                    drop(b);
+                }
+            });
+        }
+    });
+
+    // No reader pin leaked: every segment's ref_count is back to 0. Pins are
+    // only guaranteed released once all reader threads have joined above.
+    for id in 1..=segments as u32 {
+        assert_eq!(
+            cache
+                .segments
+                .header(NonZeroU32::new(id).unwrap())
+                .ref_count(),
+            0,
+            "segment {id} has a leaked reader pin",
+        );
+    }
+
+    // After joining: cache still serves, and a write still works (exclusive &mut).
+    for i in 0..KEYS {
+        let item = cache
+            .get(&key(i))
+            .expect("still present after concurrent reads");
+        assert!(item.value() == *val(i).as_slice());
+    }
+    cache
+        .insert(b"post", b"ok", None, Duration::ZERO)
+        .expect("insert after concurrent reads");
+    assert!(cache.get(b"post").unwrap().value() == *b"ok".as_slice());
 }

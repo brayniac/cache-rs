@@ -50,11 +50,12 @@ pub(crate) struct Segments {
     /// Eviction mutable state (`rng`, `ranked_segs`/`index`, `ghost`,
     /// `last_update_time`), serialized behind a `std::sync::Mutex`. Eviction
     /// is not loom-modeled — the lock is what serializes it — so the std
-    /// mutex is correct here (not a loom mutex). Currently every access takes
-    /// the lock per-call; because `evict()` is still `&mut self` the lock is
-    /// uncontended, so behavior is identical to the pre-lock code. The
-    /// held-guard/single-evictor consolidation lands once eviction flips to
-    /// `&self` (a later task).
+    /// mutex is correct here (not a loom mutex). The lock is taken per-call
+    /// (short-lived), NOT held across a whole eviction. Two evictors may thus
+    /// redundantly select the same candidate; that is harmless, because
+    /// per-segment *data-mutation* exclusivity comes from the `Sealed ->
+    /// Draining` CAS (`claim_for_drain`, run before any mutation), NOT from a
+    /// single-evictor lock. See the soundness contract on `segment()`.
     evict: std::sync::Mutex<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
     admission_cap: u32,
@@ -366,14 +367,14 @@ impl Segments {
     ///
     /// So no two threads ever hold `&mut` to the same segment's region at once.
     ///
-    /// NOTE (drain-first, item 7c Task 6): `merge_evict`/`merge_compact`/
-    /// `s3fifo_promote_from` currently `prune`/`copy_into` a candidate while it is
-    /// still `Sealed`, taking the `Sealed -> Draining` CAS only afterward — so they
-    /// do NOT yet satisfy the "claim before mutate" rule above. That is why the
-    /// eviction receivers are still `&mut` today (exclusive via the borrow
-    /// checker, so no live unsoundness). Task 6 restructures those paths to claim
-    /// the Draining CAS first, making this contract literally hold before the
-    /// receivers flip to `&self` and concurrent evictors are exercised.
+    /// Drain-first (item 7c Task 6, DONE): `merge_evict`/`merge_compact`/
+    /// `s3fifo_evict_admission`/`s3fifo_evict_main` now win the candidate's
+    /// `Sealed -> Draining` CAS (`claim_for_drain`) BEFORE any `prune`/`copy_into`/
+    /// `remove_item_at`, then `finalize_drained` (no second CAS). So the
+    /// "claim before mutate" rule above holds literally for every mutator, and
+    /// the eviction receivers are `&self`: two evictors that deterministically
+    /// select the same `Sealed` candidate cannot both derive `&mut` to it — the
+    /// loser's `claim_for_drain` returns false and it skips.
     ///
     /// The ONE race this does NOT cover — a reserver writing the `Live` tail
     /// while an evictor drains that same segment — is deferred to item 7d
@@ -674,19 +675,53 @@ impl Segments {
         hashtable: &MultiChoiceHashtable,
         expire: bool,
     ) -> Result<ClearOutcome, ()> {
+        if self.claim_for_drain(id) {
+            Ok(self.finalize_drained(id, hashtable, expire))
+        } else {
+            Err(())
+        }
+    }
+
+    /// Claim a Sealed segment for draining by winning its `Sealed -> Draining`
+    /// CAS. Returns `true` iff this thread won (the segment was Sealed and is
+    /// now Draining, exclusively owned by this thread). Losers get `false`
+    /// (the segment was the Live tail, already Draining, or concurrently
+    /// claimed by another mutator).
+    ///
+    /// This is the single, uniform mutation claim for ALL candidate mutators
+    /// (merge, s3fifo, drop, expire/clear, remove_at's empty-free): a thread
+    /// must win this CAS BEFORE mutating a candidate's data region, so the
+    /// `segment()` accessor's exclusivity contract holds even under concurrent
+    /// evictors deterministically selecting the same candidate.
+    fn claim_for_drain(&self, id: NonZeroU32) -> bool {
         let id_idx = id.get() as usize - 1;
 
         // SeqCst: writer half of the Dekker pair with try_acquire_reader
         // (transition the state, then observe the reader count).
-        if !self.headers[id_idx].cas_metadata(
+        self.headers[id_idx].cas_metadata(
             State::Sealed,
             State::Draining,
             None,
             None,
             Ordering::SeqCst,
-        ) {
-            return Err(());
-        }
+        )
+    }
+
+    /// Finalize a segment this thread has already claimed (it is `Draining`,
+    /// owned by this thread via `claim_for_drain`): capture its chain links,
+    /// drain its remaining hashtable entries, then recycle it (ref_count == 0)
+    /// or condemn it to the last reader's guard drop (pinned).
+    ///
+    /// Must only be called on a segment already in `Draining` — it does NOT
+    /// re-run the `Sealed -> Draining` CAS. `expire` is threaded into
+    /// `segment.clear` (expiry-metric bookkeeping).
+    fn finalize_drained(
+        &self,
+        id: NonZeroU32,
+        hashtable: &MultiChoiceHashtable,
+        expire: bool,
+    ) -> ClearOutcome {
+        let id_idx = id.get() as usize - 1;
 
         // Capture the links before condemn clears them.
         let meta = self.headers[id_idx].metadata(Ordering::Acquire);
@@ -699,9 +734,9 @@ impl Segments {
 
         if self.headers[id_idx].ref_count_seqcst() == 0 {
             self.recycle(id);
-            Ok(ClearOutcome::Freed)
+            ClearOutcome::Freed
         } else {
-            Ok(self.condemn(id, next, prev))
+            self.condemn(id, next, prev)
         }
     }
 
@@ -776,7 +811,7 @@ impl Segments {
     /// indicates that a segment was put onto the free queue and `reserve_free()`
     /// should return some segment id.
     pub fn evict(
-        &mut self,
+        &self,
         ttl_buckets: &mut TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
@@ -906,10 +941,7 @@ impl Segments {
 
     /// Returns the least valuable segment based on the configured eviction
     /// policy.
-    pub(crate) fn least_valuable_seg(
-        &mut self,
-        ttl_buckets: &mut TtlBuckets,
-    ) -> Option<NonZeroU32> {
+    pub(crate) fn least_valuable_seg(&self, ttl_buckets: &mut TtlBuckets) -> Option<NonZeroU32> {
         match self.policy {
             Policy::None => None,
             Policy::Random => {
@@ -1036,7 +1068,7 @@ impl Segments {
 
     /// Count how many evictable segments follow `start` in the chain (up to
     /// `max_merge`).
-    fn merge_evict_chain_len(&mut self, start: NonZeroU32) -> usize {
+    fn merge_evict_chain_len(&self, start: NonZeroU32) -> usize {
         let mut len = 0;
         let mut id = start;
         let max = self.evict.lock().unwrap().max_merge();
@@ -1067,7 +1099,7 @@ impl Segments {
 
     /// Count how many evictable segments follow `start` whose combined live
     /// bytes fit within a single segment.
-    fn merge_compact_chain_len(&mut self, start: NonZeroU32) -> usize {
+    fn merge_compact_chain_len(&self, start: NonZeroU32) -> usize {
         let mut len = 0;
         let mut id = start;
         let max = self.evict.lock().unwrap().max_merge();
@@ -1110,7 +1142,7 @@ impl Segments {
     /// is then drained via `clear_segment`. Returns the next segment id to
     /// merge from (if any).
     fn merge_evict(
-        &mut self,
+        &self,
         start: NonZeroU32,
         ttl_bucket: &mut TtlBucket,
         hashtable: &MultiChoiceHashtable,
@@ -1189,6 +1221,9 @@ impl Segments {
                 break;
             }
 
+            // Fast advisory pre-check: don't bother claiming a candidate that
+            // isn't evictable (Live tail, already draining, or pinned past
+            // can_evict). The authoritative claim is the CAS below.
             if !self
                 .segment(cand_id)
                 .map(|s| s.can_evict())
@@ -1198,16 +1233,34 @@ impl Segments {
                 break;
             }
 
-            // Advance the chain pointer BEFORE draining the candidate: once
-            // clear_segment recycles it, its links are reset and reading
-            // next_seg() would observe a stale/reused segment.
+            // Drain-first: claim the candidate's Sealed->Draining CAS BEFORE
+            // mutating it. This is the uniform per-segment mutation claim for
+            // ALL mutators (merge, s3fifo, drop, expire/clear), so two
+            // concurrent evictors that deterministically select the same
+            // candidate cannot both derive &mut to it. A lost claim means the
+            // candidate was concurrently taken / is no longer Sealed — stop.
+            //
+            // Behavior note (spec §2): draining a candidate before copy-out
+            // rejects NEW reader pins on it during the copy window (Draining is
+            // not readable) and can cause a transient miss on an item mid-
+            // relink (old location unpinnable, new not yet published). Existing
+            // pins stay valid. Acceptable under concurrent eviction.
+            if !self.claim_for_drain(cand_id) {
+                trace!("stop merge: lost drain claim on candidate");
+                break;
+            }
+
+            // Read next AFTER the claim (the candidate is still linked —
+            // Draining does not unlink; finalize's recycle/condemn does) and
+            // BEFORE finalize unlinks it.
             next_id = self.headers[cand_id.get() as usize - 1].next_seg();
 
-            // Prune low-frequency items (marks them deleted — moves no
-            // bytes), then copy the survivors into the spare. copy_into
-            // appends past the spare's write-offset and republishes each
-            // survivor via the hashtable's Release-CAS, so no readable
-            // segment's live bytes are ever moved in place.
+            // Prune low-frequency items (marks them deleted — moves no bytes),
+            // then copy the survivors into the spare. The candidate is now
+            // Draining and exclusively ours. copy_into appends past the spare's
+            // write-offset and republishes each survivor via the hashtable's
+            // Release-CAS, so no readable segment's live bytes are ever moved
+            // in place.
             {
                 let mut cand = self.segment(cand_id)?;
                 let cand_old_size = cand.live_bytes();
@@ -1222,16 +1275,13 @@ impl Segments {
                 let _ = cand.copy_into(&mut spare, hashtable);
             }
 
-            // Drain the candidate (Sealed->Draining + ref_count recheck +
-            // condemn-if-pinned). An unpinned candidate is recycled — which
-            // replenishes the spare via return_segment; a pinned candidate is
-            // condemned to its last reader. Either way it leaves the chain,
-            // and clear_segment's unlink patches the neighbours, so the spare
-            // remains the bucket head.
-            match self.clear_segment(cand_id, hashtable, false) {
-                Ok(_outcome) => {}
-                Err(()) => break,
-            }
+            // Finalize the already-Draining candidate (ref_count recheck +
+            // recycle-or-condemn — NO second Sealed->Draining CAS). An unpinned
+            // candidate is recycled, replenishing the spare via return_segment;
+            // a pinned candidate is condemned to its last reader. Either way it
+            // leaves the chain, and finalize's unlink patches the neighbours,
+            // so the spare remains the bucket head.
+            let _ = self.finalize_drained(cand_id, hashtable, false);
             merged += 1;
         }
 
@@ -1244,7 +1294,7 @@ impl Segments {
     /// recycle). No spare was head-inserted, so this path DOES fix the bucket
     /// head when the dropped segment was itself the head.
     fn merge_evict_fallback_drop(
-        &mut self,
+        &self,
         start: NonZeroU32,
         ttl_bucket: &mut TtlBucket,
         hashtable: &MultiChoiceHashtable,
@@ -1276,7 +1326,7 @@ impl Segments {
     /// `merge_evict` it does not fall back to dropping a segment when no
     /// spare is available; it simply skips (`Ok(None)`).
     fn merge_compact(
-        &mut self,
+        &self,
         start: NonZeroU32,
         ttl_bucket: &mut TtlBucket,
         hashtable: &MultiChoiceHashtable,
@@ -1340,6 +1390,7 @@ impl Segments {
                 break;
             }
 
+            // Fast advisory pre-check (authoritative claim is the CAS below).
             if !self
                 .segment(cand_id)
                 .map(|s| s.can_evict())
@@ -1357,30 +1408,37 @@ impl Segments {
                 break;
             }
 
-            // Advance the chain pointer BEFORE draining the candidate: once
-            // clear_segment recycles it, its links are reset and reading
-            // next_seg() would observe a stale/reused segment.
+            // Drain-first: claim the candidate's Sealed->Draining CAS BEFORE
+            // copying it out — the same uniform per-segment mutation claim as
+            // merge_evict (see its comment for the full rationale + the
+            // transient-miss behavior note). A lost claim means the candidate
+            // was concurrently taken / is no longer Sealed — stop.
+            if !self.claim_for_drain(cand_id) {
+                trace!("stop merge: lost drain claim on candidate");
+                break;
+            }
+
+            // Read next AFTER the claim (Draining does not unlink) and BEFORE
+            // finalize unlinks it.
             next_id = self.headers[cand_id.get() as usize - 1].next_seg();
 
-            // Copy the survivors into the spare. copy_into appends past the
-            // spare's write-offset and republishes each survivor via the
-            // hashtable's Release-CAS, so no readable segment's live bytes
-            // are ever moved in place.
+            // Copy the survivors into the spare. The candidate is now Draining
+            // and exclusively ours. copy_into appends past the spare's write-
+            // offset and republishes each survivor via the hashtable's
+            // Release-CAS, so no readable segment's live bytes are ever moved
+            // in place.
             {
                 let (mut cand, mut spare) = self.segment_pair(cand_id, spare_id)?;
                 let _ = cand.copy_into(&mut spare, hashtable);
             }
 
-            // Drain the candidate (Sealed->Draining + ref_count recheck +
-            // condemn-if-pinned). An unpinned candidate is recycled — which
-            // replenishes the spare via return_segment; a pinned candidate is
-            // condemned to its last reader. Either way it leaves the chain,
-            // and clear_segment's unlink patches the neighbours, so the spare
-            // remains the bucket head.
-            match self.clear_segment(cand_id, hashtable, false) {
-                Ok(_outcome) => {}
-                Err(()) => break,
-            }
+            // Finalize the already-Draining candidate (ref_count recheck +
+            // recycle-or-condemn — NO second Sealed->Draining CAS). An unpinned
+            // candidate is recycled, replenishing the spare via return_segment;
+            // a pinned candidate is condemned to its last reader. Either way it
+            // leaves the chain, and finalize's unlink patches the neighbours,
+            // so the spare remains the bucket head.
+            let _ = self.finalize_drained(cand_id, hashtable, false);
             merged += 1;
         }
 
@@ -1418,7 +1476,7 @@ impl Segments {
     /// S3-FIFO eviction entry point. Tries admission pool first (the
     /// filtering step), then main pool (CLOCK second-chance).
     fn s3fifo_evict(
-        &mut self,
+        &self,
         ttl_buckets: &mut TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
@@ -1442,12 +1500,28 @@ impl Segments {
     /// (copied to a main-pool segment). Items with freq == 0 are dropped
     /// and their key hashes are added to the ghost queue.
     fn s3fifo_evict_admission(
-        &mut self,
+        &self,
         seg_id: NonZeroU32,
         ttl_buckets: &mut TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
-        // First pass: copy items with freq > 0 into a main-pool segment.
+        // Drain-first: claim the source's Sealed->Draining CAS BEFORE promoting
+        // items out of it (s3fifo_promote_from calls remove_item_at on src).
+        // This is the uniform per-segment mutation claim shared with merge, the
+        // drop path, and expire/clear. A lost claim means the source was
+        // already taken by another mutator — fail this pass (matching the prior
+        // clear_segment-Err -> EvictFailure semantics), having mutated nothing.
+        //
+        // Behavior note (spec §2): draining the source before copy-out rejects
+        // NEW reader pins on it during the promotion window and can cause a
+        // transient miss on an item mid-relink; existing pins stay valid.
+        // Acceptable under concurrent eviction.
+        if !self.claim_for_drain(seg_id) {
+            return Err(SegmentsError::EvictFailure);
+        }
+
+        // First pass: copy items with freq > 0 into a main-pool segment. The
+        // source is now Draining and exclusively ours.
         let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
@@ -1472,12 +1546,13 @@ impl Segments {
         // Add hashes of remaining (freq == 0) items to ghost queue.
         self.s3fifo_ghost_remaining(seg_id, hashtable);
 
-        // Drain the source; clear_segment frees or condemns it.
+        // Finalize the already-Draining source (recycle-or-condemn, NO second
+        // Sealed->Draining CAS). Capture links AFTER link_at_head patched the
+        // source's prev (if the source was the old head, its prev now points at
+        // the freshly linked target) and BEFORE finalize unlinks it.
         let id_idx = seg_id.get() as usize - 1;
         let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
-        let outcome = self
-            .clear_segment(seg_id, hashtable, false)
-            .map_err(|_| SegmentsError::EvictFailure)?;
+        let outcome = self.finalize_drained(seg_id, hashtable, false);
 
         // The segment left its chain either way.
         if meta.prev.is_none() {
@@ -1497,7 +1572,7 @@ impl Segments {
 
     /// Copy items with freq > 0 from src to dst (promotion).
     fn s3fifo_promote_from(
-        &mut self,
+        &self,
         src_id: NonZeroU32,
         dst_id: NonZeroU32,
         hashtable: &MultiChoiceHashtable,
@@ -1571,7 +1646,7 @@ impl Segments {
     }
 
     /// Add hashes of remaining live items in a segment to the ghost queue.
-    fn s3fifo_ghost_remaining(&mut self, seg_id: NonZeroU32, hashtable: &MultiChoiceHashtable) {
+    fn s3fifo_ghost_remaining(&self, seg_id: NonZeroU32, hashtable: &MultiChoiceHashtable) {
         // Collect hashes first to avoid holding the segment view across the
         // eviction lock.
         let mut hashes = Vec::new();
@@ -1624,12 +1699,20 @@ impl Segments {
     /// freq > 0 are copied to a fresh main segment. Items with freq == 0 are
     /// dropped.
     fn s3fifo_evict_main(
-        &mut self,
+        &self,
         seg_id: NonZeroU32,
         ttl_buckets: &mut TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
-        // Try to get a target segment for second-chance items.
+        // Drain-first: claim the source's Sealed->Draining CAS BEFORE promoting
+        // items out of it (see s3fifo_evict_admission for the full rationale +
+        // behavior note). A lost claim fails this pass, having mutated nothing.
+        if !self.claim_for_drain(seg_id) {
+            return Err(SegmentsError::EvictFailure);
+        }
+
+        // Try to get a target segment for second-chance items. The source is
+        // now Draining and exclusively ours.
         let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
@@ -1647,12 +1730,12 @@ impl Segments {
             self.s3fifo_promote_from(seg_id, tid, hashtable);
         }
 
-        // Drain the source; clear_segment frees or condemns it.
+        // Finalize the already-Draining source (recycle-or-condemn, NO second
+        // Sealed->Draining CAS). Capture links after link_at_head, before
+        // finalize unlinks it.
         let id_idx = seg_id.get() as usize - 1;
         let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
-        let outcome = self
-            .clear_segment(seg_id, hashtable, false)
-            .map_err(|_| SegmentsError::EvictFailure)?;
+        let outcome = self.finalize_drained(seg_id, hashtable, false);
 
         // The segment left its chain either way.
         if meta.prev.is_none() {

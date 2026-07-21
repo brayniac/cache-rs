@@ -122,7 +122,7 @@ impl TtlBucket {
     pub(super) fn expire(
         &mut self,
         hashtable: &MultiChoiceHashtable,
-        segments: &mut Segments,
+        segments: &Segments,
     ) -> usize {
         let now = Instant::now();
         self.drain_chain(hashtable, segments, Some(now))
@@ -132,11 +132,7 @@ impl TtlBucket {
     /// hashtable. Unpinned segments are freed; pinned ones are condemned
     /// and freed by the last reader's guard drop. Returns the number of
     /// segments actually freed by this pass.
-    pub(super) fn clear(
-        &mut self,
-        hashtable: &MultiChoiceHashtable,
-        segments: &mut Segments,
-    ) -> usize {
+    pub(super) fn clear(&mut self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
         self.drain_chain(hashtable, segments, None)
     }
 
@@ -152,7 +148,7 @@ impl TtlBucket {
     fn drain_chain(
         &mut self,
         hashtable: &MultiChoiceHashtable,
-        segments: &mut Segments,
+        segments: &Segments,
         expire_cutoff: Option<Instant>,
     ) -> usize {
         let mut freed = 0;

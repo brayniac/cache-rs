@@ -93,7 +93,7 @@ impl TtlBuckets {
     pub(crate) fn expire(
         &mut self,
         hashtable: &MultiChoiceHashtable,
-        segments: &mut Segments,
+        segments: &Segments,
     ) -> usize {
         let now = Instant::now();
         if now == self.last_expired {
@@ -116,11 +116,7 @@ impl TtlBuckets {
     }
 
     /// Clear all segments across all buckets. Returns total segments cleared.
-    pub(crate) fn clear(
-        &mut self,
-        hashtable: &MultiChoiceHashtable,
-        segments: &mut Segments,
-    ) -> usize {
+    pub(crate) fn clear(&mut self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
         let start = Instant::now();
         let mut cleared = 0;
         for bucket in self.buckets.iter_mut() {

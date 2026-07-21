@@ -552,7 +552,7 @@ impl Segcache {
     /// (and not counted) until a later pass runs after the pins drop.
     pub fn expire(&mut self) -> usize {
         self.time = Instant::now();
-        self.ttl_buckets.expire(&self.hashtable, &mut self.segments)
+        self.ttl_buckets.expire(&self.hashtable, &self.segments)
     }
 
     /// Clear the cache, draining every segment from the hashtable.
@@ -562,7 +562,7 @@ impl Segcache {
     /// until a later pass runs after the pins drop.
     pub fn clear(&mut self) -> usize {
         self.time = Instant::now();
-        self.ttl_buckets.clear(&self.hashtable, &mut self.segments)
+        self.ttl_buckets.clear(&self.hashtable, &self.segments)
     }
 
     /// Checks the integrity of all segments

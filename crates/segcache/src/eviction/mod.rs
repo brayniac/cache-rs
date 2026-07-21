@@ -57,11 +57,6 @@ impl Eviction {
         }
     }
 
-    #[inline]
-    pub fn policy(&self) -> Policy {
-        self.policy
-    }
-
     /// Returns the segment id of the least valuable segment.
     pub fn least_valuable_seg(&mut self) -> Option<NonZeroU32> {
         let index = self.index;

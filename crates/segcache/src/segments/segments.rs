@@ -43,8 +43,19 @@ pub(crate) struct Segments {
     /// guard-drop racing an evictor's recycle) never overfill it beyond
     /// `spare_capacity` — see `return_segment` and its loom model.
     spare_count: crate::sync::AtomicU32,
-    /// Eviction configuration and state.
-    evict: Box<Eviction>,
+    /// Cached eviction policy. `Policy` is `Copy` and set once in
+    /// `from_builder`; caching it here lets `evict_policy()` (on the reserve
+    /// hot path) read it without taking the eviction lock.
+    policy: Policy,
+    /// Eviction mutable state (`rng`, `ranked_segs`/`index`, `ghost`,
+    /// `last_update_time`), serialized behind a `std::sync::Mutex`. Eviction
+    /// is not loom-modeled — the lock is what serializes it — so the std
+    /// mutex is correct here (not a loom mutex). Currently every access takes
+    /// the lock per-call; because `evict()` is still `&mut self` the lock is
+    /// uncontended, so behavior is identical to the pre-lock code. The
+    /// held-guard/single-evictor consolidation lands once eviction flips to
+    /// `&self` (a later task).
+    evict: std::sync::Mutex<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
     admission_cap: u32,
     /// Current number of segments in the admission pool.
@@ -147,7 +158,8 @@ impl Segments {
             spare_capacity,
             spare_count: crate::sync::AtomicU32::new(spare_capacity),
             data,
-            evict: Box::new(Eviction::new(segments, evict_policy)),
+            policy: evict_policy,
+            evict: std::sync::Mutex::new(Eviction::new(segments, evict_policy)),
             admission_cap,
             admission_count: crate::sync::AtomicU32::new(0),
         })
@@ -177,7 +189,7 @@ impl Segments {
     /// Return the configured eviction policy.
     #[inline]
     pub fn evict_policy(&self) -> Policy {
-        self.evict.policy()
+        self.policy
     }
 
     /// Return the size of each segment in bytes.
@@ -758,12 +770,12 @@ impl Segments {
         #[cfg(feature = "metrics")]
         let now = Instant::now();
 
-        match self.evict.policy() {
+        match self.policy {
             Policy::Merge { .. } => {
                 #[cfg(feature = "metrics")]
                 SEGMENT_EVICT.increment();
 
-                let mut seg_idx = self.evict.random();
+                let mut seg_idx = self.evict.lock().unwrap().random();
 
                 seg_idx %= self.cap;
                 let ttl = self.headers[seg_idx as usize].ttl();
@@ -878,10 +890,10 @@ impl Segments {
         &mut self,
         ttl_buckets: &mut TtlBuckets,
     ) -> Option<NonZeroU32> {
-        match self.evict.policy() {
+        match self.policy {
             Policy::None => None,
             Policy::Random => {
-                let mut start: u32 = self.evict.random();
+                let mut start: u32 = self.evict.lock().unwrap().random();
 
                 start %= self.cap;
 
@@ -899,7 +911,7 @@ impl Segments {
                 // Pick a random accessible segment and look up the head of the
                 // corresponding TtlBucket. This is equivalent to a weighted
                 // random over buckets by segment count.
-                let mut start: u32 = self.evict.random();
+                let mut start: u32 = self.evict.lock().unwrap().random();
 
                 start %= self.cap;
 
@@ -915,10 +927,14 @@ impl Segments {
                 None
             }
             _ => {
-                if self.evict.should_rerank() {
-                    self.evict.rerank(&self.headers);
+                if self.evict.lock().unwrap().should_rerank() {
+                    self.evict.lock().unwrap().rerank(&self.headers);
                 }
-                while let Some(id) = self.evict.least_valuable_seg() {
+                loop {
+                    // Bind to a local so the guard drops before `get_mut`
+                    // (a `while let` would hold the temporary across the body).
+                    let next = self.evict.lock().unwrap().least_valuable_seg();
+                    let Some(id) = next else { break };
                     if let Ok(seg) = self.get_mut(id) {
                         if seg.can_evict() {
                             return Some(id);
@@ -963,8 +979,8 @@ impl Segments {
 
         // For merge eviction, check if the segment is below the compact ratio
         // low watermark. If so, perform a no-evict merge (compaction only).
-        if let Policy::Merge { .. } = self.evict.policy() {
-            let target_ratio = self.evict.compact_ratio();
+        if let Policy::Merge { .. } = self.policy {
+            let target_ratio = self.evict.lock().unwrap().compact_ratio();
 
             let id_idx = seg_id.get() as usize - 1;
 
@@ -1003,7 +1019,7 @@ impl Segments {
     fn merge_evict_chain_len(&mut self, start: NonZeroU32) -> usize {
         let mut len = 0;
         let mut id = start;
-        let max = self.evict.max_merge();
+        let max = self.evict.lock().unwrap().max_merge();
 
         while len < max {
             if let Ok(seg) = self.get_mut(id) {
@@ -1034,7 +1050,7 @@ impl Segments {
     fn merge_compact_chain_len(&mut self, start: NonZeroU32) -> usize {
         let mut len = 0;
         let mut id = start;
-        let max = self.evict.max_merge();
+        let max = self.evict.lock().unwrap().max_merge();
         let mut occupied = 0;
         let seg_size = self.segment_size();
 
@@ -1119,17 +1135,23 @@ impl Segments {
         let mut cutoff = 1.0;
         let mut merged = 0;
 
-        // Fixed merge parameters.
-        let max_merge = self.evict.max_merge();
-        let n_merge = self.evict.n_merge();
-        let stop_ratio = self.evict.stop_ratio();
+        // Fixed merge parameters. Read under one short-lived lock.
+        let (max_merge, n_merge, stop_ratio, cfg_target_ratio) = {
+            let ev = self.evict.lock().unwrap();
+            (
+                ev.max_merge(),
+                ev.n_merge(),
+                ev.stop_ratio(),
+                ev.target_ratio(),
+            )
+        };
         let stop_bytes = (stop_ratio * self.segment_size() as f64) as i32;
 
         // Dynamically set target ratio based on chain length.
         let target_ratio = if chain_len < n_merge {
             1.0 / chain_len as f64
         } else {
-            self.evict.target_ratio()
+            cfg_target_ratio
         };
 
         // Walk the chain, pruning each candidate and copying its survivors
@@ -1280,10 +1302,12 @@ impl Segments {
         // Merge state.
         let mut merged = 0;
 
-        // Fixed merge parameters.
+        // Fixed merge parameters. Read under one short-lived lock.
         let seg_size = self.segment_size();
-        let max_merge = self.evict.max_merge();
-        let stop_ratio = self.evict.stop_ratio();
+        let (max_merge, stop_ratio) = {
+            let ev = self.evict.lock().unwrap();
+            (ev.max_merge(), ev.stop_ratio())
+        };
         let stop_bytes = (stop_ratio * self.segment_size() as f64) as i32;
 
         // Walk the chain, copying each candidate's survivors into the spare
@@ -1528,7 +1552,8 @@ impl Segments {
 
     /// Add hashes of remaining live items in a segment to the ghost queue.
     fn s3fifo_ghost_remaining(&mut self, seg_id: NonZeroU32, hashtable: &MultiChoiceHashtable) {
-        // Collect hashes first to avoid borrow conflict with self.evict.ghost.
+        // Collect hashes first to avoid holding the segment view across the
+        // eviction lock.
         let mut hashes = Vec::new();
         {
             let segment = match self.get_mut(seg_id) {
@@ -1567,8 +1592,11 @@ impl Segments {
             }
         }
 
-        for hash in hashes {
-            self.evict.ghost.insert(hash);
+        if !hashes.is_empty() {
+            let mut ev = self.evict.lock().unwrap();
+            for hash in hashes {
+                ev.ghost.insert(hash);
+            }
         }
     }
 
@@ -1624,14 +1652,17 @@ impl Segments {
 
     // ── Ghost queue ──────────────────────────────────────────────────
 
-    /// Check if a key hash is in the ghost queue (S3-FIFO).
+    /// Check if a key hash is in the ghost queue (S3-FIFO). Locks the
+    /// eviction mutex internally. Called from `reserve_and_define` OUTSIDE
+    /// eviction, so it never nests with an eviction-held lock in one thread.
     pub(crate) fn ghost_contains(&self, hash: u64) -> bool {
-        self.evict.ghost.contains(hash)
+        self.evict.lock().unwrap().ghost.contains(hash)
     }
 
-    /// Remove a hash from the ghost queue (on ghost hit).
-    pub(crate) fn ghost_remove(&mut self, hash: u64) {
-        self.evict.ghost.remove(hash);
+    /// Remove a hash from the ghost queue (on ghost hit). Locks the eviction
+    /// mutex internally; see `ghost_contains` on lock nesting.
+    pub(crate) fn ghost_remove(&self, hash: u64) {
+        self.evict.lock().unwrap().ghost.remove(hash);
     }
 
     // ── Debug / test helpers ─────────────────────────────────────────

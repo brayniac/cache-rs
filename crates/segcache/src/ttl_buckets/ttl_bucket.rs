@@ -130,7 +130,9 @@ impl TtlBucket {
     }
 
     /// Next segment to merge (for merge eviction policy).
-    /// Relaxed: only touched under `&mut`-serialized eviction.
+    /// Relaxed: a soft merge-resume hint; concurrent `&self` evictors may race
+    /// it harmlessly — the `Sealed->Draining` claim CAS, not this field, guards
+    /// candidate mutation (spec §1: redundant selection is harmless).
     pub fn next_to_merge(&self) -> Option<NonZeroU32> {
         NonZeroU32::new(self.next_to_merge.load(Ordering::Relaxed))
     }

@@ -46,7 +46,61 @@ Their `&mut` comes from two sources: genuinely non-atomic mutable state, and the
   **Correction (adversarial review, 7c Task 4):** an earlier draft claimed this
   Mutex "admits one evictor at a time — the serialization the `&self` accessor
   leans on." That is wrong. The `&self` accessor's exclusivity rests on the
-  segment state machine, not the eviction lock (see §2).
+  segment state machine, not the eviction lock (see §2). It does NOT serialize
+  evictors, and it does NOT protect bucket-chain-structure mutations (see §1b).
+
+### 1b. Per-bucket chain `Mutex` (found by the Task-8 concurrent tests)
+
+The Task-8 concurrent-evictor tests found a real defect: bucket-chain **head/tail
+pointer** mutations are non-atomic read-modify-writes, only safe under the old
+`&mut` serialization. E.g. `link_dest_at_head` reads `old_head`, patches
+`old_head.prev`, then `set_head(dest)` (a plain atomic store); two evictors
+merging the *same bucket* both read the same `old_head` and both insert → lost
+update / cross-linked chain + leaked segment. This is NOT per-segment data (the
+`Sealed→Draining` claim doesn't guard it) and NOT covered by the per-call
+Eviction Mutex. `expire`/`drain_chain`/`remove_at`'s head fixups share the flaw.
+Root cause: item 4 made the *reserve* chain-extension lock-free (seal election),
+but eviction/expire chain mutations kept relying on `&mut` serialization.
+
+**Fix (crucible's model): a per-`TtlBucket` `chain_lock: Mutex<()>`** serializing
+ALL chain-STRUCTURE modifications of that bucket — the head/tail pointer and
+neighbour `prev`/`next` updates in: reserve's `try_expand` (link/seal/set_tail),
+eviction's dest head-insert (`link_dest_at_head` + `set_head`), the candidate
+drain unlink (`recycle`/`condemn` splice), `drain_chain`/`expire`/`clear`, and
+`remove_at`'s empty-free + head fixup. Held only around the brief pointer
+surgery, per bucket — not across the per-segment data copy or the whole
+eviction. The per-segment state CASes (the `Sealed→Draining` claim, the seal
+`Live→Sealed`, `Relinking→Sealed`) stay as-is (per-segment ownership); the lock
+covers the *chain pointers* the CAS state machine does not.
+
+- **The common reserve path takes no lock:** `try_alloc_item` (the CAS on
+  `write_offset`) never touches the chain; only the infrequent `try_expand` (tail
+  full → new segment) acquires the bucket lock.
+- **s3fifo crosses buckets** (source drain in bucket Bs, target head-insert in
+  Bt, possibly Bs≠Bt): the two locks are needed at DIFFERENT times (Bt for the
+  target insert, later Bs for the source finalize/unlink), never held
+  simultaneously — so no lock-ordering deadlock. If any path ever needs two
+  bucket locks at once, acquire them in bucket-index order.
+
+This resolves the earlier §1-vs-Testing contradiction: **chain-structure
+mutations are serialized per-bucket; everything else (reads, `try_alloc_item`,
+per-segment state transitions, policy selection) stays lock-free / per-call.**
+
+### Lock inventory (to revisit for lock-free later)
+
+All locks now in segcache, so a future pass can weigh replacing them with
+lock-free protocols:
+- **`Segments::evict: Mutex<Eviction>`** — eviction POLICY state (rng, ranked_segs,
+  index, ghost, last_update_time). Per-call, short-lived. Contended only among
+  concurrent evictors (rare).
+- **`TtlBucket::chain_lock: Mutex<()>`** (this section) — bucket chain-STRUCTURE
+  pointer mutations. Held only during brief per-bucket chain surgery. Contended
+  among concurrent chain-mutators of the SAME bucket (evict/expire/remove/expand).
+- Lock-FREE (no mutex): the reader pin (`ref_count` SeqCst Dekker), the segment
+  state machine (`cas_metadata`), `write_offset` reservation CAS, the free/spare
+  `Injector` queues, `spare_count` CAS, the hashtable slot CASes.
+
+Each `Mutex` site should carry a `// LOCK:` comment tagging it for this inventory.
 
 ### 2. The `&self` data accessor (the unsafe core)
 
@@ -141,8 +195,11 @@ tests. The public API stays `&mut`, so production has no concurrency yet.
   writer-vs-drain stays out — 7d.)
 - **Loom:** a model for the `return_segment` `spare_count` CAS — at most one
   thread bumps the count into each slot — SC-independent CAS-uniqueness, so
-  loom-provable (like the item-4 election models). The eviction `Mutex`
-  serializes evictors, so there is no lock-free eviction race to model beyond it.
+  loom-provable (like the item-4 election models). Beyond that, the concurrent
+  bucket-chain mutations are serialized by the per-bucket `chain_lock` (§1b), and
+  the per-segment transitions by the state-machine CAS — the remaining lock-free
+  invariants (reader pin Dekker, drain claim) are the #25/#28 SeqCst pairs loom
+  cannot model, so they are pinned by the concurrent stress tests, not loom.
 
 ## Non-goals / deferred
 

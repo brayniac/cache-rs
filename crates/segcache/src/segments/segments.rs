@@ -38,12 +38,10 @@ pub(crate) struct Segments {
     spare_queue: Box<crossbeam_deque::Injector<u32>>,
     /// Target number of segments to keep in the spare queue.
     spare_capacity: u32,
-    /// Current spare-queue depth. Single-writer today — eviction (the
-    /// only caller of `reserve_spare`/`return_segment`) is `&mut`-
-    /// serialized, so the check-then-act in `return_segment` is race-free
-    /// in practice. This is `Atomic` for the type to stay stable, but a
-    /// CAS/bounded-push is required here before item-7 makes returns
-    /// concurrent.
+    /// Current spare-queue depth. `return_segment` replenishes it with a
+    /// `compare_exchange` loop, so concurrent returners (a reader's
+    /// guard-drop racing an evictor's recycle) never overfill it beyond
+    /// `spare_capacity` — see `return_segment` and its loom model.
     spare_count: crate::sync::AtomicU32,
     /// Eviction configuration and state.
     evict: Box<Eviction>,
@@ -579,15 +577,30 @@ impl Segments {
     /// queue before the normal free queue. Callers push the id after
     /// their own state transition to Free; this only decides which queue
     /// it lands in.
+    ///
+    /// Concurrency-safe: the CAS ensures exactly one returner bumps
+    /// `spare_count` into each slot, so the spare queue never overfills
+    /// beyond `spare_capacity` even when a reader's guard-drop races an
+    /// evictor's recycle. See `loom_tests::loom_return_segment_no_overfill`.
     fn return_segment(&self, id: u32) {
-        // Check-then-act on `spare_count`: race-free only because eviction
-        // is `&mut`-serialized (see the field doc). Needs a CAS/bounded-
-        // push before this can be called concurrently (item-7).
-        if self.spare_count.load(Ordering::Relaxed) < self.spare_capacity {
-            self.spare_count.fetch_add(1, Ordering::Relaxed);
-            self.spare_queue.push(id);
-        } else {
-            self.free_queue.push(id);
+        let mut count = self.spare_count.load(Ordering::Relaxed);
+        loop {
+            if count >= self.spare_capacity {
+                self.free_queue.push(id);
+                return;
+            }
+            match self.spare_count.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.spare_queue.push(id);
+                    return;
+                }
+                Err(observed) => count = observed,
+            }
         }
     }
 
@@ -1898,5 +1911,62 @@ mod spare_tests {
             free_before + 1,
             "no leak: the condemned segment returns to the pool"
         );
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use loom::sync::atomic::AtomicU32 as LoomAtomicU32;
+    use loom::sync::atomic::Ordering;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    // The return_segment spare replenishment: N threads race to bump
+    // spare_count from below capacity to at most capacity. The CAS ensures
+    // at most `capacity` returners "win" the spare (bump the count); the
+    // rest fall through to the free queue. Models the exact CAS logic of
+    // Segments::return_segment. SC-independent CAS-uniqueness (like the
+    // item-4 election models) — loom-provable.
+    #[test]
+    fn loom_return_segment_no_overfill() {
+        loom::model(|| {
+            const CAPACITY: u32 = 1;
+            let spare_count = Arc::new(LoomAtomicU32::new(0));
+
+            // Two returners race (guard-drop vs evictor recycle).
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let sc = spare_count.clone();
+                    thread::spawn(move || {
+                        // mirror return_segment's CAS loop; return true if it
+                        // "won" a spare slot (would push to spare_queue).
+                        let mut count = sc.load(Ordering::Relaxed);
+                        loop {
+                            if count >= CAPACITY {
+                                break false;
+                            }
+                            match sc.compare_exchange_weak(
+                                count,
+                                count + 1,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break true,
+                                Err(observed) => count = observed,
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let wins: u32 = handles.into_iter().map(|h| h.join().unwrap() as u32).sum();
+
+            // At most CAPACITY returners win the spare; count never overfills.
+            assert!(
+                wins <= CAPACITY,
+                "spare overfilled: {wins} wins > {CAPACITY}"
+            );
+            assert_eq!(spare_count.load(Ordering::Relaxed), wins);
+            assert!(spare_count.load(Ordering::Relaxed) <= CAPACITY);
+        });
     }
 }

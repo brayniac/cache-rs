@@ -89,8 +89,22 @@ before copy-out rejects *new* reader pins on it during the copy window
 item mid-relink (old location unpinnable, new not yet published). Existing pins
 stay valid. This is acceptable under concurrent eviction.
 
-Until that restructuring lands, the eviction receivers stay `&mut` (exclusive via
-the borrow checker), so no unsoundness exists in the interim.
+**Two more holes the drain-first review (7c Task 6) found — both fixed:**
+- **The copy destination** (merge spare / s3fifo target) is filled while readable.
+  If published `Sealed`, a concurrent evictor selects it (it is the bucket head →
+  the *default first candidate*) and `claim_for_drain`s it mid-fill → aliasing +
+  free-list corruption. Fix: publish the destination as **`Relinking`** during
+  the fill (readable, so relinked survivors stay reachable; NOT evictable, so no
+  evictor selects or claims it), then transition `Relinking→Sealed` after the
+  fill. This is the real use of the `Relinking` state — it is NOT unnecessary
+  after all (the earlier "unnecessary" note held only for *serialized* eviction;
+  concurrent eviction needs it to keep the in-fill destination unclaimable).
+- **The `can_evict` pre-check** must read the header only
+  (`SegmentHeader::can_evict()`), never construct a `segment()` view (which
+  derives `&mut [u8]` + reads magic) on an un-claimed candidate before the claim.
+
+Until the restructuring + these fixes land, the eviction receivers stay `&mut`
+(exclusive via the borrow checker), so no unsoundness exists in the interim.
 
 The residual **same-segment writer-vs-drain race** (a reserver writing the `Live`
 tail while an evictor drains that same segment) is NOT closed here — that is 7d

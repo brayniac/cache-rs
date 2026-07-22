@@ -322,19 +322,26 @@ impl TtlBucket {
         // winner publishes before releasing) — no self-deadlock.
         let _chain = self.chain_lock();
 
-        // H3 (item 7d): the tail we observed may have been drained → recycled →
-        // reused since we captured its generation (before taking this lock).
-        // generation and the metadata word are separate atomics, so the seal CAS
-        // alone cannot detect it — but every drain that could recycle
-        // observed_tail takes this same chain_lock, so once we hold it the tail's
-        // identity is frozen. Re-check the generation and bail if it changed,
-        // returning our reserved segment; the caller re-reads the (now-advanced)
-        // tail and retries. Bail DIRECTLY — do not fall through to the
-        // election-lost spin-wait below: under our held lock the tail cannot
-        // advance, so that spin would never terminate if observed_tail was
-        // recycled and reused as this bucket's tail again.
+        // H3 (item 7d): the tail we observed may have been advanced, drained, or
+        // drained→recycled→reused since we observed it (before taking this lock).
+        // Under `chain_lock` this bucket's tail is frozen, so re-validate that
+        // `tail_id` is STILL this bucket's tail AND carries the generation we
+        // observed; bail otherwise, returning our reserved segment so the caller
+        // re-reads the (now-advanced) tail and retries. Two checks, two hazards:
+        //   * `self.tail() != observed_tail` — the tail left this bucket: another
+        //     expander advanced past it, a drain removed it, or it was recycled
+        //     and reused as ANOTHER bucket's tail. A segment lives in exactly one
+        //     chain, so if it were now some other bucket's Live tail it could not
+        //     also be ours — this closes the cross-bucket seal ABA (the non-atomic
+        //     observe-tail-then-observe-gen window in `reserve`).
+        //   * generation mismatch — the same-bucket ABA: `tail_id` was recycled
+        //     and reused as THIS bucket's tail again (so `self.tail()` matches),
+        //     but it is a different incarnation.
+        // Bail DIRECTLY — do not fall through to the election-lost spin-wait
+        // below: under our held lock the tail cannot advance, so that spin would
+        // never terminate if `tail_id` is our tail again.
         if let Some((tail_id, gen)) = observed {
-            if segments.header(tail_id).generation() != gen {
+            if self.tail() != observed_tail || segments.header(tail_id).generation() != gen {
                 segments.release_unused(id);
                 return Ok(());
             }

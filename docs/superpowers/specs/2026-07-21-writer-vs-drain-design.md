@@ -138,18 +138,52 @@ The spin is bounded: a pinned writer is doing straight-line `define` +
 `hashtable.insert`, no blocking. (Same "no yield fallback yet, writers are
 internal-test-only" caveat as `try_expand`'s election spin; revisit with 7e.)
 
+**Lock-order invariant (adversarial-review finding): never hold a `WriterPin`
+across a `chain_lock` acquisition.** The drain/evict wait spins on
+`active_writers` *while holding* the bucket `chain_lock` (`drain_chain` holds it
+across its whole walk; every `claim_for_drain` caller holds it). So a writer that
+held its pin while blocking on the same bucket's `chain_lock` would form an AB-BA
+cycle: the writer waits for `chain_lock` the drainer holds, the drainer waits for
+the `active_writers` the writer holds. The reserve→publish window is `chain_lock`-
+free by construction (the `Full`/`NotWritable` `AllocOutcome` arms drop the pin
+before `try_expand` takes the lock), but the *post-publish* `remove_at` — used by
+`insert`/`replace_at`/`cas` to drop the replaced old item, and to roll back on
+hashtable-full — **can** take `chain_lock` (empty-segment drain / merge-compact).
+Therefore the pin (the `ReservedItem`) is dropped the instant publish completes
+(`hashtable.insert`/`cas_location`), **before** any `remove_at` — H2 only requires
+the pin to span the new item's publish, not the old item's removal. Not reachable
+through today's `&mut self` public API (no concurrent drainer); the concurrent
+reproduction lands with 7e's `&self` public-API stress test.
+
 ### 2.4 Generation-checked seal (H3)
 
 Capture `observed_gen = header(tail).generation()` when the reserve path observes
-the full tail, and thread it through `TtlBucket::reserve` → `try_expand(observed_tail,
-observed_gen, …)`. Under `chain_lock`, immediately before the `Live→Sealed` seal
-CAS:
+the full tail, and thread it (paired with the tail id, as one `Option<(id, gen)>`
+so the two can't drift apart) through `TtlBucket::reserve` → `try_expand(observed,
+…)`. Under `chain_lock`, immediately before the `Live→Sealed` seal CAS:
 
 ```
-if header(observed_tail).generation() != observed_gen {
-    return;   // tail was recycled/reused; reserve loop re-reads the tail
+if self.tail() != observed_tail || header(tail_id).generation() != observed_gen {
+    release_unused(id);
+    return;   // tail advanced/drained/recycled; reserve loop re-reads the tail
 }
 ```
+
+Two checks, two hazards (adversarial-review hardening):
+- `self.tail() != observed_tail` — `tail_id` is no longer *this* bucket's tail: it
+  was advanced by another expander, drained, or drained→recycled→reused as
+  **another bucket's** tail. A segment lives in exactly one chain, so a segment
+  that is now some other bucket's `Live` tail cannot also be ours — this closes the
+  cross-bucket seal ABA that the non-atomic observe-tail-then-observe-gen window in
+  `reserve` would otherwise leave open (the generation alone can false-match if the
+  recycle completes *before* the gen capture).
+- generation mismatch — the same-bucket ABA: `tail_id` was recycled and reused as
+  **this** bucket's tail again (so `self.tail()` matches), but a new incarnation.
+
+The bail is a direct `return` (after `release_unused` returns the reserved
+segment), never a fall-through to the election-lost spin-wait: under the held
+`chain_lock` the tail can't advance, so that spin would hang if `tail_id` is our
+tail again.
 
 `generation` and the packed metadata word are separate atomics, so this cannot be
 one hardware CAS — but it does not need to be. Every drain that could recycle

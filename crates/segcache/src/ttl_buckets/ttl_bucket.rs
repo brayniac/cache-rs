@@ -166,13 +166,11 @@ impl TtlBucket {
 
     /// Shared drain walk for expire (with an age cutoff) and clear.
     ///
-    /// SCOPE(writer-vs-drain): assumes no concurrent writers — the walk
-    /// parses items up to write_offset, which is only sound while
-    /// reservations cannot race the drain. Safe today because eviction and
-    /// writers are serialized by `&mut Segcache`. Drain-safe merge (item
-    /// 5b) made eviction itself reader-safe (no more in-place compaction of
-    /// readable segments) but does not close this writer-vs-drain hazard;
-    /// that protocol is deferred past 5b to item 7.
+    /// Each drained segment's walk waits for `active_writers == 0` (the
+    /// claimer half of the writer-vs-drain Dekker pair, item 7d) after
+    /// winning its state CAS and before parsing the item stream, so a
+    /// concurrent reserver's in-flight define+publish is never torn or
+    /// recycled out from under it.
     fn drain_chain(
         &self,
         hashtable: &MultiChoiceHashtable,
@@ -220,6 +218,15 @@ impl TtlBucket {
             if !drained {
                 cursor = next;
                 continue;
+            }
+
+            // Wait for in-flight reservers to finish define+publish before we
+            // parse this segment's item stream (item 7d, H1/H2). Claimer half of
+            // the Dekker pair: our SeqCst state CAS above precedes this SeqCst
+            // load, so every writer that passed its recheck-Live is counted, and
+            // any later writer sees Draining and bails.
+            while segments.header(seg_id).active_writers() != 0 {
+                std::hint::spin_loop();
             }
 
             segment.clear(hashtable, true);

@@ -431,7 +431,6 @@ impl SegmentHeader {
     /// ordered after a preceding SeqCst claim CAS (the claimer half of the
     /// Dekker pair).
     #[inline]
-    #[allow(dead_code)] // wired to a drain/evict waiter caller in a follow-up task
     pub fn active_writers(&self) -> u32 {
         self.active_writers.load(Ordering::SeqCst)
     }

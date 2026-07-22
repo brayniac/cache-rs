@@ -816,3 +816,67 @@ fn reservers_vs_evictor_disjoint() {
         .check_integrity()
         .expect("cache must pass integrity check after concurrent reserve+evict");
 }
+
+/// Test 4 — `claim_for_drain` waits for `active_writers == 0` (roadmap item
+/// 7d, the claimer half of the writer-vs-drain Dekker pair).
+///
+/// Pins a Live tail as an in-flight writer that will NOT release, seals it
+/// (Live -> Sealed) so `claim_for_drain`'s `Sealed -> Draining` CAS applies,
+/// then spawns a drainer calling `claim_for_drain`. The drainer must win its
+/// CAS immediately but BLOCK inside the function until the writer pin
+/// releases — proving the wait actually gates on `active_writers`, not on the
+/// state CAS alone.
+#[test]
+fn claim_for_drain_waits_for_active_writers() {
+    use crate::sync::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    use std::sync::Arc;
+
+    let segments = Arc::new(
+        SegmentsBuilder::default()
+            .segment_size(4096)
+            .heap_size(4096 * 4)
+            .build()
+            .expect("build segments"),
+    );
+    let buckets = TtlBuckets::new();
+    let bucket = buckets.get_bucket(clocksource::coarse::Duration::from_secs(60));
+
+    // Reserve once to get a Live tail, then drop the reservation.
+    let r0 = bucket.reserve(64, &segments).unwrap();
+    let seg = r0.seg();
+    drop(r0);
+
+    // Pin the segment as an in-flight writer that will NOT release yet.
+    assert!(segments.header(seg).try_pin_writer());
+    assert_eq!(segments.header(seg).active_writers(), 1);
+
+    // Seal it (Live -> Sealed) so claim_for_drain's Sealed->Draining CAS applies.
+    assert!(segments.header(seg).cas_metadata(
+        State::Live,
+        State::Sealed,
+        None,
+        None,
+        Ordering::SeqCst,
+    ));
+
+    let drained = Arc::new(AtomicBool::new(false));
+    let segs2 = Arc::clone(&segments);
+    let drained2 = Arc::clone(&drained);
+    let handle = std::thread::spawn(move || {
+        assert!(segs2.claim_for_drain_for_test(seg));
+        drained2.store(true, O::SeqCst);
+    });
+
+    // Give the drainer time to reach the wait; it must still be blocked.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !drained.load(O::SeqCst),
+        "drain proceeded while a writer was pinned"
+    );
+
+    // Release the writer pin; the drainer must now complete.
+    segments.header(seg).release_writer();
+    handle.join().unwrap();
+    assert!(drained.load(O::SeqCst));
+}

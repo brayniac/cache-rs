@@ -748,15 +748,36 @@ impl Segments {
     fn claim_for_drain(&self, id: NonZeroU32) -> bool {
         let id_idx = id.get() as usize - 1;
 
-        // SeqCst: writer half of the Dekker pair with try_acquire_reader
+        // SeqCst: claimer half of the Dekker pair with try_acquire_reader
         // (transition the state, then observe the reader count).
-        self.headers[id_idx].cas_metadata(
+        let won = self.headers[id_idx].cas_metadata(
             State::Sealed,
             State::Draining,
             None,
             None,
             Ordering::SeqCst,
-        )
+        );
+
+        if won {
+            // Writer half already ran its SeqCst pin+recheck: any reserver that
+            // observed Live before our CAS is counted here; any that increments
+            // after sees Draining and bails. Wait for the counted ones to finish
+            // define+publish before we parse the item stream (item 7d, H1/H2).
+            // Bounded: a pinned writer is straight-line define+publish.
+            while self.headers[id_idx].active_writers() != 0 {
+                std::hint::spin_loop();
+            }
+        }
+        won
+    }
+
+    /// Test-only shim exposing the private `claim_for_drain` claim CAS + wait,
+    /// so `eviction_concurrency_tests` can exercise it directly without
+    /// widening the production method's visibility.
+    #[cfg(test)]
+    #[allow(dead_code)] // caller `eviction_concurrency_tests` is cfg'd out under loom
+    pub(crate) fn claim_for_drain_for_test(&self, id: NonZeroU32) -> bool {
+        self.claim_for_drain(id)
     }
 
     /// Finalize a segment this thread has already claimed (it is `Draining`,

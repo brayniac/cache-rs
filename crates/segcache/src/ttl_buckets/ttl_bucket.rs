@@ -285,11 +285,24 @@ impl TtlBucket {
     /// winner's tail publish, which is bounded straight-line work. The
     /// spins have no yield fallback yet — acceptable while writers are
     /// internal-test-only; revisit at item 7.
+    ///
+    /// `observed` pairs the observed tail with its generation at the time
+    /// the caller read it (`None` for an empty bucket). The tail and its
+    /// generation are carried as one value, not two independent `Option`s,
+    /// so a caller cannot supply a tail without the generation that guards
+    /// it. It closes the tail-recycle ABA (item 7d, H3): the generation is
+    /// re-checked under `chain_lock` before the seal fires, so a tail that
+    /// was drained, recycled, and reused since the caller observed it is
+    /// never sealed.
     fn try_expand(
         &self,
-        observed_tail: Option<NonZeroU32>,
+        observed: Option<(NonZeroU32, u16)>,
         segments: &Segments,
     ) -> Result<(), TtlBucketsError> {
+        // The election and the loser-spin only care about the tail id; the
+        // generation is used solely for the H3 re-check below.
+        let observed_tail = observed.map(|(tail_id, _)| tail_id);
+
         let id = segments
             .reserve_free()
             .ok_or(TtlBucketsError::NoFreeSegments)?;
@@ -308,6 +321,24 @@ impl TtlBucket {
         // for the winner's tail publish is always immediately satisfied (the
         // winner publishes before releasing) — no self-deadlock.
         let _chain = self.chain_lock();
+
+        // H3 (item 7d): the tail we observed may have been drained → recycled →
+        // reused since we captured its generation (before taking this lock).
+        // generation and the metadata word are separate atomics, so the seal CAS
+        // alone cannot detect it — but every drain that could recycle
+        // observed_tail takes this same chain_lock, so once we hold it the tail's
+        // identity is frozen. Re-check the generation and bail if it changed,
+        // returning our reserved segment; the caller re-reads the (now-advanced)
+        // tail and retries. Bail DIRECTLY — do not fall through to the
+        // election-lost spin-wait below: under our held lock the tail cannot
+        // advance, so that spin would never terminate if observed_tail was
+        // recycled and reused as this bucket's tail again.
+        if let Some((tail_id, gen)) = observed {
+            if segments.header(tail_id).generation() != gen {
+                segments.release_unused(id);
+                return Ok(());
+            }
+        }
 
         let won = match observed_tail {
             Some(tail_id) => {
@@ -415,26 +446,100 @@ impl TtlBucket {
         loop {
             let tail = self.tail();
             match tail {
-                Some(id) => match segments.try_alloc_item(id, size as i32) {
-                    AllocOutcome::Reserved(reserved) => return Ok(reserved),
-                    AllocOutcome::NotWritable => {
-                        // Mid-election (Reserved/Linking) or being drained: the
-                        // chain is about to advance. Re-read the tail rather
-                        // than expanding behind a transient state. Unreachable
-                        // single-threaded (seal+publish happen inside try_expand).
-                        std::hint::spin_loop();
-                        continue;
+                Some(id) => {
+                    // Capture the tail generation for the seal ABA guard (H3):
+                    // if it is recycled/reused before we seal, try_expand bails.
+                    let observed_gen = segments.header(id).generation();
+                    match segments.try_alloc_item(id, size as i32) {
+                        AllocOutcome::Reserved(reserved) => return Ok(reserved),
+                        AllocOutcome::NotWritable => {
+                            // Mid-election (Reserved/Linking) or being drained: the
+                            // chain is about to advance. Re-read the tail rather
+                            // than expanding behind a transient state. Unreachable
+                            // single-threaded (seal+publish happen inside try_expand).
+                            std::hint::spin_loop();
+                            continue;
+                        }
+                        AllocOutcome::Full => {
+                            // Live but full: expand, sealing exactly this tail
+                            // (paired with the generation we observed above).
+                            self.try_expand(Some((id, observed_gen)), segments)?;
+                        }
                     }
-                    AllocOutcome::Full => {
-                        // Live but full: expand, sealing exactly this tail.
-                        self.try_expand(tail, segments)?;
-                    }
-                },
+                }
                 None => {
-                    self.try_expand(tail, segments)?;
+                    self.try_expand(None, segments)?;
                 }
             }
         }
+    }
+
+    /// Test-only shim exposing `try_expand`'s `observed` (tail + generation)
+    /// argument directly, so the H3 generation-ABA guard can be exercised
+    /// without forcing the real drain/recycle race. `#[cfg(test)]` (not gated
+    /// to `not(feature = "loom")`) because the caller test module below IS
+    /// gated to `not(feature = "loom")` — under `--all-features` (loom on)
+    /// that caller disappears, and an unconditional `#[cfg(test)]` shim
+    /// would then be dead code that trips `clippy --all-features -D
+    /// warnings`. `#[allow(dead_code)]` covers that combination (same
+    /// reasoning as `header.rs`'s `store_metadata_for_test`, mirrored
+    /// direction).
+    #[cfg(test)]
+    #[allow(dead_code)] // caller test module is cfg'd out under loom
+    fn try_expand_for_test(
+        &self,
+        observed: Option<(NonZeroU32, u16)>,
+        segments: &Segments,
+    ) -> Result<(), TtlBucketsError> {
+        self.try_expand(observed, segments)
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+    use crate::segments::{AllocOutcome, SegmentsBuilder};
+
+    /// H3 (item 7d): try_expand must refuse to seal a tail whose generation
+    /// no longer matches what the caller observed before taking the chain
+    /// lock — that mismatch is the signature of a drain->recycle->reuse
+    /// that happened between the caller's observation and the seal. A
+    /// matching generation must still seal normally.
+    #[test]
+    fn try_expand_bails_on_stale_generation() {
+        let segments = SegmentsBuilder::default()
+            .segment_size(4096)
+            .heap_size(4096 * 4)
+            .build()
+            .expect("build segments");
+        let bucket = TtlBucket::new(60);
+
+        // Establish a Live, full tail (reserve once, then fill it).
+        let seg_size = segments.segment_size();
+        let first = bucket.reserve(64, &segments).unwrap();
+        let tail = first.seg();
+        drop(first);
+        while let AllocOutcome::Reserved(reserved) = segments.try_alloc_item(tail, seg_size / 4) {
+            drop(reserved);
+        }
+        let good_gen = segments.header(tail).generation();
+
+        // Stale generation must be refused: try_expand returns Ok WITHOUT
+        // sealing the tail.
+        assert!(bucket
+            .try_expand_for_test(Some((tail, good_gen.wrapping_add(1))), &segments)
+            .is_ok());
+        assert_eq!(
+            segments.header(tail).state(),
+            State::Live,
+            "stale-gen expand must not seal the tail"
+        );
+
+        // The correct generation seals it.
+        assert!(bucket
+            .try_expand_for_test(Some((tail, good_gen)), &segments)
+            .is_ok());
+        assert_eq!(segments.header(tail).state(), State::Sealed);
     }
 }
 

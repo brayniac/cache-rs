@@ -24,7 +24,7 @@ fn small_cache(segments: usize, policy: Policy) -> Segcache {
 
 #[test]
 fn random_evicts_short_ttl_segment_when_full() {
-    let mut cache = small_cache(2, Policy::Random);
+    let cache = small_cache(2, Policy::Random);
     let ttl = Duration::from_secs(10); // < former SEG_MATURE_TIME (20s)
 
     // Fill both segments (mirroring integration_basic sizes).
@@ -103,7 +103,7 @@ fn fifo_evicts_oldest_segment_first() {
     // 3 segments: seg1 (old items) → seg2 (new items) → seg3 (tail/current write target).
     // Eviction must choose between seg1 and seg2; seg3 is never eligible because
     // it has no next_seg.  Correct FIFO picks seg1 (oldest).
-    let mut cache = small_cache(3, Policy::Fifo);
+    let cache = small_cache(3, Policy::Fifo);
     let ttl = Duration::ZERO;
 
     // Fill segment 1 with "old" items.

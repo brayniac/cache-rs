@@ -2123,7 +2123,7 @@ mod spare_tests {
         // 1 held-back spare (Merge policy) + 4 free.
         let total_segments = 5usize;
 
-        let mut cache = Segcache::builder()
+        let cache = Segcache::builder()
             .segment_size(segment_size)
             .heap_size(segment_size as usize * total_segments)
             .hash_power(16)

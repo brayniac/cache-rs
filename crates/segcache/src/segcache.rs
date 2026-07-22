@@ -68,7 +68,7 @@ impl Segcache {
     /// ```
     /// use segcache::{Policy, Segcache};
     ///
-    /// let mut cache = Segcache::builder().build().expect("failed to create cache");
+    /// let cache = Segcache::builder().build().expect("failed to create cache");
     /// assert_eq!(cache.items(), 0);
     /// ```
     #[cfg(any(test, feature = "debug"))]
@@ -83,7 +83,7 @@ impl Segcache {
     /// use segcache::{Policy, Segcache};
     /// use std::time::Duration;
     ///
-    /// let mut cache = Segcache::builder().build().expect("failed to create cache");
+    /// let cache = Segcache::builder().build().expect("failed to create cache");
     /// assert!(cache.get(b"coffee").is_none());
     ///
     /// cache.insert(b"coffee", b"strong", None, Duration::ZERO);
@@ -121,7 +121,7 @@ impl Segcache {
     /// ```
     /// use segcache::{Policy, Segcache};
     ///
-    /// let mut cache = Segcache::builder().build().expect("failed to create cache");
+    /// let cache = Segcache::builder().build().expect("failed to create cache");
     /// assert!(cache.get_no_freq_incr(b"coffee").is_none());
     /// ```
     pub fn get_no_freq_incr(&self, key: &[u8]) -> Option<Item> {
@@ -142,7 +142,7 @@ impl Segcache {
     /// use segcache::{Policy, Segcache};
     /// use std::time::Duration;
     ///
-    /// let mut cache = Segcache::builder().build().expect("failed to create cache");
+    /// let cache = Segcache::builder().build().expect("failed to create cache");
     /// assert!(cache.get(b"drink").is_none());
     ///
     /// cache.insert(b"drink", b"coffee", None, Duration::ZERO);
@@ -439,7 +439,7 @@ impl Segcache {
     /// use segcache::{Policy, Segcache, SegcacheError};
     /// use std::time::Duration;
     ///
-    /// let mut cache = Segcache::builder().build().expect("failed to create cache");
+    /// let cache = Segcache::builder().build().expect("failed to create cache");
     ///
     /// // If the item is not in the cache, CAS will fail as 'NotFound'
     /// assert_eq!(
@@ -518,7 +518,7 @@ impl Segcache {
     /// use segcache::{Policy, Segcache, SegcacheError};
     /// use std::time::Duration;
     ///
-    /// let mut cache = Segcache::builder().build().expect("failed to create cache");
+    /// let cache = Segcache::builder().build().expect("failed to create cache");
     ///
     /// // If the item is not in the cache, delete will return false
     /// assert_eq!(cache.delete(b"coffee"), false);
@@ -569,7 +569,7 @@ impl Segcache {
     /// use segcache::{Policy, Segcache, SegcacheError};
     /// use std::time::Duration;
     ///
-    /// let mut cache = Segcache::builder().build().expect("failed to create cache");
+    /// let cache = Segcache::builder().build().expect("failed to create cache");
     ///
     /// // Insert an item with a short ttl
     /// cache.insert(b"coffee", b"strong", None, Duration::from_secs(5));

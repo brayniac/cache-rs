@@ -69,7 +69,7 @@ fn merge_halts_at_pinned_candidate_and_relocates_survivors() {
     let free_segments = 5usize;
     let total_segments = free_segments + 1; // + 1 held-back spare
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(segment_size as usize * total_segments)
         .hash_power(16)
@@ -466,7 +466,7 @@ fn concurrent_evictors_merge_policy() {
     let free_segments = 16usize;
     let total_segments = free_segments + 1;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(segment_size as usize * total_segments)
         .hash_power(16)
@@ -575,7 +575,7 @@ fn concurrent_evictors_s3fifo_policy() {
     let total_segments = 24usize;
     let admission_ratio = 0.25;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(segment_size as usize * total_segments)
         .hash_power(16)
@@ -688,7 +688,7 @@ fn reservers_vs_evictor_disjoint() {
     let prefill_segments = 30usize;
     let total_segments = 60usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(segment_size as usize * total_segments)
         .hash_power(16)
@@ -876,7 +876,7 @@ fn concurrent_reservers_vs_drain_same_bucket() {
     let total_segments = 40usize;
     let prefill_segments = 4usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(segment_size as usize * total_segments)
         .hash_power(16)

@@ -13,7 +13,7 @@ fn integration_basic() {
     // d,e,f,g fill segment 1. Item h then triggers eviction.
     let heap_size = 2 * 264;
     let segment_size = 264;
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .hash_power(16)

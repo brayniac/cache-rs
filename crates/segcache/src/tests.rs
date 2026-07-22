@@ -533,6 +533,10 @@ fn try_alloc_item_bounds_and_grants() {
         .expect("build segments");
 
     let id = segments.reserve_free().expect("free segment");
+    // `try_alloc_item` now pins a writer, which requires the Live state
+    // (mirroring the `reserve()` caller, which only calls it once the tail
+    // is writable) — a freshly reserved segment starts in `Reserved`.
+    segments.header(id).set_state(State::Live);
 
     // live_bytes starts at the initial offset (0, or 8 with `integrity`)
     let live_bytes_before = segments.header(id).live_bytes();

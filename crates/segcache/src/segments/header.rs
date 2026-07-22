@@ -401,7 +401,6 @@ impl SegmentHeader {
     /// writers — which is exactly the parse-undefined-region hazard (spec H1).
     /// loom cannot verify this distinction (see `try_acquire_reader`).
     #[inline]
-    #[allow(dead_code)] // wired to a `WriterPin` guard caller in a follow-up task
     pub fn try_pin_writer(&self) -> bool {
         if !self.metadata(Ordering::Acquire).state.is_writable() {
             return false;
@@ -423,7 +422,6 @@ impl SegmentHeader {
     /// `release_reader_for_guard`; it is the store half the drain/evict wait
     /// (`active_writers` load) pairs against.
     #[inline]
-    #[allow(dead_code)] // wired to a `WriterPin` guard caller in a follow-up task
     pub fn release_writer(&self) {
         let prev = self.active_writers.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(prev > 0, "release_writer without matching pin");

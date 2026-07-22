@@ -325,6 +325,14 @@ impl Segments {
     pub(crate) fn try_alloc_item(&self, seg_id: NonZeroU32, size: i32) -> Option<ReservedItem> {
         debug_assert!(seg_id.get() <= self.cap);
         let header = self.header(seg_id);
+
+        if !header.try_pin_writer() {
+            return None;
+        }
+        // SAFETY: try_pin_writer returned true; the headers allocation outlives
+        // this pin (the ReservedItem is consumed within the caller's insert/cas).
+        let pin = unsafe { WriterPin::new(header as *const _) };
+
         let offset = header.try_reserve_space(size, self.segment_size)?;
 
         header.incr_live_items();
@@ -348,6 +356,7 @@ impl Segments {
             RawItem::from_ptr(ptr),
             seg_id,
             offset as usize,
+            pin,
         ))
     }
 

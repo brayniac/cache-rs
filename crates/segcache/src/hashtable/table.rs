@@ -594,14 +594,18 @@ impl MultiChoiceHashtable {
     ) -> Option<Result<Option<Location>, ()>> {
         let bucket = self.bucket(bucket_index);
 
-        // First pass: look for existing entry or matching ghost
+        // First pass: existing entry or matching ghost — retry the SAME slot
+        // on a CAS race so a concurrent same-key writer's update is seen
+        // (item 7f, F4). Advancing to the next slot on a matching-slot CAS
+        // failure would let a losing writer miss that the slot now holds a
+        // racing writer's new location and fall through to the second pass,
+        // publishing a second live entry for the same key.
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
-            let speculative = bucket.items[slot_index].load(Ordering::Relaxed);
-
-            if Hashbucket::tag(speculative) == tag {
+            loop {
                 let packed = bucket.items[slot_index].load(Ordering::Acquire);
+
                 if Hashbucket::tag(packed) != tag {
-                    continue;
+                    break; // slot doesn't match our key (any more) — next slot
                 }
 
                 if Hashbucket::is_ghost(packed) {
@@ -615,7 +619,7 @@ impl MultiChoiceHashtable {
                         Ordering::Relaxed,
                     ) {
                         Ok(_) => return Some(Ok(None)),
-                        Err(_) => continue,
+                        Err(_) => continue, // re-read THIS slot
                     }
                 }
 
@@ -632,8 +636,11 @@ impl MultiChoiceHashtable {
                         Ordering::Relaxed,
                     ) {
                         Ok(_) => return Some(Ok(Some(location))),
+                        // Re-read THIS slot — a racing same-key writer changed it.
                         Err(_) => continue,
                     }
+                } else {
+                    break; // a DIFFERENT key occupies this slot — next slot
                 }
             }
         }
@@ -1156,6 +1163,114 @@ mod tests {
         let result = ht.insert(b"test", loc2, &verifier);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(loc1));
+    }
+
+    // F4: concurrent same-key inserts must never leave two live entries for
+    // the same key. `try_link_in_bucket`'s first pass previously advanced to
+    // the NEXT slot on a matching-slot CAS failure instead of re-reading the
+    // SAME slot; a losing writer could then fall through to the empty-slot
+    // pass and publish a second, distinct live entry for the same key.
+    //
+    // The key is seeded with an initial entry BEFORE the threads start, so
+    // every concurrent insert below is a genuine *overwrite* race (the F4
+    // scenario: "two threads overwriting the same key") rather than a race
+    // over which thread claims the very first (empty-slot) entry — that is
+    // a distinct, pre-existing race (see NOTE below) outside this fix's
+    // scope.
+    //
+    // The verifier here is a standalone `MockVerifier` built directly at the
+    // hashtable layer (no `Segments`/real storage involved) — every location
+    // this test will ever insert is pre-registered for the key before the
+    // threads start, so `verify()` is a pure read over an immutable `Vec`
+    // and safe to share (read-only) across threads via `Arc`.
+    //
+    // NOTE: a separate, pre-existing race was observed while developing this
+    // test: if the key has NO seed entry and multiple threads race the very
+    // first insert, each can pass `try_link_in_bucket`'s first pass (no
+    // match found yet) and then independently win the second pass by
+    // claiming two *different* empty slots via `compare_exchange(0, ..)`,
+    // producing a duplicate. That is a TOCTOU race across the first-pass /
+    // second-pass boundary within a single `try_link_in_bucket` call, not
+    // the matching-slot CAS-retry bug this test/fix targets, and it is not
+    // fixed here — flagged for a follow-up item.
+    #[test]
+    fn test_concurrent_same_key_insert_no_duplicates() {
+        use std::sync::Arc;
+
+        const NUM_THREADS: usize = 4;
+        const ITERS: usize = 500;
+        const KEY: &[u8] = b"same-key";
+
+        // power=7 -> 16 buckets total; with num_choices=2 the key's two
+        // candidate buckets are small and heavily contended by all threads,
+        // maximizing the chance of hitting the matching-slot CAS race.
+        let ht = Arc::new(MultiChoiceHashtable::new(7));
+
+        let mut verifier = MockVerifier::new();
+        let seed_loc = Location::new(1);
+        verifier.add(KEY, seed_loc, false);
+        let mut all_locations = Vec::with_capacity(NUM_THREADS * ITERS);
+        for t in 0..NUM_THREADS {
+            for i in 0..ITERS {
+                // Offset locations past `seed_loc` so they're all distinct.
+                let loc = Location::new((t * ITERS + i + 2) as u64);
+                verifier.add(KEY, loc, false);
+                all_locations.push(loc);
+            }
+        }
+        let verifier = Arc::new(verifier);
+
+        // Seed the key single-threaded so the race under test is always an
+        // overwrite of an existing entry (the F4 scenario), not a race to
+        // create the first entry.
+        ht.insert(KEY, seed_loc, &*verifier).unwrap();
+
+        std::thread::scope(|scope| {
+            for t in 0..NUM_THREADS {
+                let ht = ht.clone();
+                let verifier = verifier.clone();
+                let locs: Vec<Location> = all_locations[t * ITERS..(t + 1) * ITERS].to_vec();
+                scope.spawn(move || {
+                    for loc in locs {
+                        // Errors (bucket full) are fine for this test — the
+                        // property under test is "never more than one live
+                        // entry", not "every insert succeeds".
+                        let _ = ht.insert(KEY, loc, &*verifier);
+                    }
+                });
+            }
+        });
+
+        // Count live (non-empty, non-ghost) slots across the key's candidate
+        // buckets whose tag matches AND whose location verifies for KEY.
+        let hash = ht.hash_key(KEY);
+        let tag = MultiChoiceHashtable::tag_from_hash(hash);
+        let buckets = ht.bucket_indices(hash);
+        let num_choices = ht.num_choices as usize;
+
+        let mut live_count = 0;
+        for &bucket_index in &buckets[..num_choices] {
+            let bucket = ht.bucket(bucket_index);
+            for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+                let packed = bucket.items[slot_index].load(Ordering::Acquire);
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+                if Hashbucket::tag(packed) != tag {
+                    continue;
+                }
+                let location = Hashbucket::location(packed);
+                if verifier.verify(KEY, location, true) {
+                    live_count += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            live_count, 1,
+            "expected exactly one live entry for the key after concurrent \
+             same-key inserts, found {live_count}"
+        );
     }
 }
 

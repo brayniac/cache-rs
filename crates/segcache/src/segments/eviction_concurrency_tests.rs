@@ -1104,3 +1104,265 @@ fn claim_for_drain_waits_for_active_writers() {
     handle.join().unwrap();
     assert!(drained.load(O::SeqCst));
 }
+/// Test 5 — Concurrent mixed insert/get/delete/cas over the shared `&self`
+/// PUBLIC API (roadmap item 7e).
+///
+/// The first concurrent stress test that drives `Segcache` itself (not just
+/// the `Segments`/`TtlBuckets` internals) through an `Arc<Segcache>` shared
+/// across threads, exercising `insert`/`get`/`delete`/`cas` concurrently on
+/// ONE instance while the Merge policy's background eviction churns the
+/// segment pool underneath. This is the main correctness evidence that the
+/// `&self` flip (7a-7d) composes safely at the public-API surface.
+///
+/// Key/value scheme (deliberately makes torn/aliased/cross-key reads
+/// detectable WITHOUT any shared mutable bookkeeping):
+///
+/// - **Private keys** `p{t:02}{pk:06}` are owned exclusively by thread `t`
+///   (no other thread ever writes a `p{t}*` key), where `pk` is a small
+///   per-thread pool index (`i % PRIVATE_POOL`) so ops repeatedly revisit the
+///   same handful of keys instead of every op minting an write-once key. The
+///   value is a PURE FUNCTION OF THE KEY, `V{t:02}{pk:06}` — not of write
+///   history — so it is always reconstructable by parsing the key bytes back
+///   apart, with no thread-local state and no races to track: whenever a
+///   private key resolves at all, there is exactly one legal value for it.
+/// - **Shared hot keys** `h{h:02}` (16 of them) are contended by ALL threads.
+///   Every write encodes `H{writer:02}{ctr:06}` (writer = the writing
+///   thread's id, ctr = its op index), so any resolved hot value must parse
+///   as that fixed shape with `writer < THREADS` — a torn read, a stray
+///   private-key value (`V...`), or raw garbage bytes at a hot key all fail
+///   the shape check.
+///
+/// Per the task spec, this deliberately asserts VALUE INTEGRITY of whatever
+/// resolves, never presence/absence (which is genuinely racy under
+/// concurrent insert/delete/eviction): `insert`/`delete` results are ignored,
+/// `cas` tolerates any `Err` (a racy CAS token going stale under concurrent
+/// writers/eviction is expected), and `get` is only checked when it returns
+/// `Some`.
+#[test]
+fn concurrent_mixed_public_api() {
+    use crate::SegcacheError;
+    use std::sync::Arc;
+
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const THREADS: usize = 4;
+    const OPS: usize = 4000;
+    const PRIVATE_POOL: usize = 64;
+    const HOT_COUNT: usize = 16;
+
+    // Fixed-width key/value encodings (see the doc comment above): private
+    // "p"+2+6 / "V"+2+6, hot "h"+2 / "H"+2+6. Sized off the largest (private,
+    // 9 bytes key + 9 bytes value) so the segment layout has real headroom.
+    let private_key = |t: usize, pk: usize| format!("p{t:02}{pk:06}");
+    let private_val = |t: usize, pk: usize| format!("V{t:02}{pk:06}");
+    let hot_key = |h: usize| format!("h{h:02}");
+    let hot_val = |writer: usize, ctr: usize| format!("H{writer:02}{ctr:06}");
+    assert_eq!(private_key(0, 0).len(), 9);
+    assert_eq!(private_val(0, 0).len(), 9);
+    assert_eq!(hot_val(0, 0).len(), 9);
+
+    // A hot value is legal iff it parses as "H" + 2-digit writer (< THREADS)
+    // + 6-digit counter. Anything else (wrong length, wrong prefix, a
+    // private "V..." value, garbage) is a corruption signal, never legal.
+    let is_legal_hot_value = |v: Value| -> bool {
+        let Value::Bytes(b) = v else {
+            return false;
+        };
+        // Classify raw bytes directly — NEVER slice a `str` at fixed offsets
+        // here: a torn/aliased read can be valid UTF-8 with a multibyte
+        // codepoint straddling the boundary, which would panic ("not a char
+        // boundary") instead of cleanly reporting the corruption this check
+        // exists to catch. `H` + 8 ASCII digits (2-digit writer < THREADS +
+        // 6-digit counter).
+        if b.len() != 9 || b[0] != b'H' || !b[1..].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let writer = (b[1] - b'0') as usize * 10 + (b[2] - b'0') as usize;
+        writer < THREADS
+    };
+
+    let sample_val = private_val(0, 0);
+    let item_size = keyvalue::item_size(9, &Value::Bytes(sample_val.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // 32 fillable segments + 1 held-back spare (Merge) — enough room for the
+    // whole private (4*64=256) + hot (16) keyspace to coexist, but small
+    // enough that inserts routinely trigger real eviction rather than the
+    // pool just absorbing everything.
+    let free_segments = 32usize;
+    let total_segments = free_segments + 1;
+
+    let cache = Arc::new(
+        Segcache::builder()
+            .segment_size(segment_size)
+            .heap_size(segment_size as usize * total_segments)
+            .hash_power(16)
+            .eviction(Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            })
+            .build()
+            .expect("failed to create cache"),
+    );
+
+    let ttl = Duration::from_secs(3600);
+
+    std::thread::scope(|scope| {
+        for t in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            // private_key/private_val/hot_key/hot_val/is_legal_hot_value are
+            // non-capturing closures (`Copy`) — each spawn gets its own copy
+            // implicitly via `move`, no explicit clone needed.
+            scope.spawn(move || {
+                for i in 0..OPS {
+                    // Deterministic op/key-space selection from (t, i) — no
+                    // rng, but well-mixed across the 4-way op choice and the
+                    // hot/private split.
+                    let op = (t * 31 + i * 17) % 4; // 0 insert,1 get,2 delete,3 cas
+                    let use_hot = (t * 13 + i * 7) % 5 == 0; // ~20% hot traffic
+
+                    if use_hot {
+                        let h = (t * 11 + i * 19) % HOT_COUNT;
+                        let key = hot_key(h);
+                        match op {
+                            0 => {
+                                let v = hot_val(t, i);
+                                let _ = cache.insert(key.as_bytes(), v.as_bytes(), None, ttl);
+                            }
+                            1 => {
+                                if let Some(item) = cache.get(key.as_bytes()) {
+                                    assert!(
+                                        is_legal_hot_value(item.value()),
+                                        "illegal hot value at key {key}: {:?}",
+                                        item.value()
+                                    );
+                                }
+                            }
+                            2 => {
+                                let _ = cache.delete(key.as_bytes());
+                            }
+                            _ => {
+                                // get+cas sequence: only attempt the CAS if
+                                // the preceding get resolved (a token from a
+                                // non-existent read makes no sense).
+                                if let Some(item) = cache.get(key.as_bytes()) {
+                                    assert!(
+                                        is_legal_hot_value(item.value()),
+                                        "illegal hot value pre-cas at key {key}: {:?}",
+                                        item.value()
+                                    );
+                                    let token = item.cas();
+                                    let v = hot_val(t, i);
+                                    match cache.cas(key.as_bytes(), v.as_bytes(), None, ttl, token)
+                                    {
+                                        Ok(())
+                                        | Err(SegcacheError::Exists)
+                                        | Err(SegcacheError::NotFound)
+                                        | Err(SegcacheError::NoFreeSegments) => {}
+                                        Err(e) => panic!("unexpected cas error on hot key: {e:?}"),
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let pk = i % PRIVATE_POOL;
+                        let key = private_key(t, pk);
+                        let val = private_val(t, pk);
+                        match op {
+                            0 => {
+                                let _ = cache.insert(key.as_bytes(), val.as_bytes(), None, ttl);
+                            }
+                            1 => {
+                                if let Some(item) = cache.get(key.as_bytes()) {
+                                    assert_value_eq(
+                                        item.value(),
+                                        val.as_bytes(),
+                                        "private key must resolve to its own key-derived value",
+                                    );
+                                }
+                            }
+                            2 => {
+                                let _ = cache.delete(key.as_bytes());
+                            }
+                            _ => {
+                                if let Some(item) = cache.get(key.as_bytes()) {
+                                    assert_value_eq(
+                                        item.value(),
+                                        val.as_bytes(),
+                                        "private key pre-cas value must match its key-derived value",
+                                    );
+                                    let token = item.cas();
+                                    match cache.cas(key.as_bytes(), val.as_bytes(), None, ttl, token)
+                                    {
+                                        Ok(())
+                                        | Err(SegcacheError::Exists)
+                                        | Err(SegcacheError::NotFound)
+                                        | Err(SegcacheError::NoFreeSegments) => {}
+                                        Err(e) => {
+                                            panic!("unexpected cas error on private key: {e:?}")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // ── Whole-pool structural invariants after the storm (no leak, no
+    //    corruption, nothing stuck in Relinking).
+    let total = total_segments as u32;
+    let chained = assert_chains_well_formed(&cache.segments, &cache.ttl_buckets, total);
+    assert_no_leak(&cache.segments, &chained, total);
+
+    // No leaked pins: every segment's writer/reader pin counts must have
+    // unwound to zero once every thread has finished.
+    for raw in 1..=total {
+        let id = NonZeroU32::new(raw).unwrap();
+        let header = cache.segments.header(id);
+        assert_eq!(
+            header.active_writers(),
+            0,
+            "segment {raw} leaked a writer pin after concurrent mixed public-API workload"
+        );
+        assert_eq!(
+            header.ref_count(),
+            0,
+            "segment {raw} leaked a reader pin after concurrent mixed public-API workload"
+        );
+    }
+
+    // Final value-integrity sweep: every key that still resolves — private
+    // or hot — must return a legal value for that exact key.
+    for t in 0..THREADS {
+        for pk in 0..PRIVATE_POOL {
+            let key = private_key(t, pk);
+            let val = private_val(t, pk);
+            if let Some(item) = cache.get(key.as_bytes()) {
+                assert_value_eq(
+                    item.value(),
+                    val.as_bytes(),
+                    "post-storm private key must resolve to its own key-derived value",
+                );
+            }
+        }
+    }
+    for h in 0..HOT_COUNT {
+        let key = hot_key(h);
+        if let Some(item) = cache.get(key.as_bytes()) {
+            assert!(
+                is_legal_hot_value(item.value()),
+                "post-storm illegal hot value at key {key}: {:?}",
+                item.value()
+            );
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    cache
+        .check_integrity()
+        .expect("integrity after concurrent mixed workload");
+}

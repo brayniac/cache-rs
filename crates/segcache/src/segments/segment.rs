@@ -398,9 +398,6 @@ impl<'a> Segment<'a> {
 
                     #[cfg(feature = "metrics")]
                     ITEM_EVICT.increment();
-                } else {
-                    warn!("unlinked item was present in segment");
-                    self.remove_item_at(offset);
                 }
                 n_dropped += item_size;
                 offset += item_size;
@@ -445,21 +442,15 @@ impl<'a> Segment<'a> {
 
             let loc = pack_location(self.id(), offset as u64);
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
-            if !deleted {
+            if !deleted && hashtable.remove(item.key(), loc) {
                 trace!("evicting from hashtable");
-                let removed = hashtable.remove(item.key(), loc);
-                if removed {
-                    self.remove_item_at(offset);
+                self.remove_item_at(offset);
 
-                    #[cfg(feature = "metrics")]
-                    if expire {
-                        ITEM_EXPIRE.increment();
-                    } else {
-                        ITEM_EVICT.increment();
-                    }
+                #[cfg(feature = "metrics")]
+                if expire {
+                    ITEM_EXPIRE.increment();
                 } else {
-                    warn!("unlinked item was present in segment");
-                    self.remove_item_at(offset);
+                    ITEM_EVICT.increment();
                 }
             }
 

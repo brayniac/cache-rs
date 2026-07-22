@@ -17,7 +17,7 @@
 //! │          AtomicU64          │ 16b  │8b│8b│  AtomicU32/32b │
 //! ├─────────────────────────────┴──────┴──┴──┴────────────────┤
 //! │        ACTIVE REMOVERS      │          PADDING            │
-//! │        AtomicU32/32b        │            72 bit           │
+//! │        AtomicU32/32b        │            96 bit           │
 //! └───────────────────────────────────────────────────────────┘
 //!
 //! METADATA = [8 unused][8 state][24 prev][24 next] (see segments::state)

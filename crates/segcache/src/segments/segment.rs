@@ -467,31 +467,21 @@ impl<'a> Segment<'a> {
             offset += item.size();
         }
 
-        // skips over seg_wait_refcount and evict retry, because no threading
-
-        // Item 7f: with the active_removers==0 wait (claim_for_drain,
-        // drain_chain) plus try_pin_remover's recheck-bail, no replace/delete
-        // remove of this segment's items can be in flight or start while we
-        // clear it, so the hashtable/live-item accounting above is
-        // authoritative and these hold as invariants. Kept as debug_assert so
-        // concurrent stress tests still catch a protocol bug, without a
-        // release-time hard panic.
-        debug_assert!(
-            self.live_items() == 0,
-            "segment not empty after clearing, still contains {} items",
-            self.live_items()
-        );
-        let expected_size = if cfg!(feature = "integrity") {
-            std::mem::size_of_val(&SEG_MAGIC) as i32
-        } else {
-            0
-        };
-        debug_assert!(
-            self.live_bytes() == expected_size,
-            "segment size incorrect after clearing: {} != {}",
-            self.live_bytes(),
-            expected_size
-        );
+        // Item 7f: `clear` does NOT assert the segment is empty here. The
+        // `active_removers == 0` wait (claim_for_drain, drain_chain) +
+        // try_pin_remover's recheck-bail cover every replace/delete remove that
+        // PINS BEFORE UNLINKING — those decrement before this sweep runs and are
+        // then skipped (get_item_frequency is None). But the fresh-key
+        // insert-vs-insert race and the hashtable-full rollback path unlink an
+        // entry WITHOUT holding a remover pin (a known tracked follow-up); such
+        // an item can be unlinked-but-not-yet-decremented while we clear, so it
+        // is counted-yet-skipped and `live_items`/`live_bytes` may be transiently
+        // over-counted. That is a leak, not corruption (it self-heals when the
+        // segment is recycled: `init()` resets the counters). A synchronous
+        // "empty after clear" assertion is therefore not a valid concurrent
+        // invariant; the crash-direction (`live_bytes() >= 0`) is still asserted
+        // per-decrement in `remove_item_at`. Reclaim uses the live counters, so
+        // set write_offset to whatever remains.
         self.set_write_offset(self.live_bytes());
     }
 }

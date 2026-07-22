@@ -1006,6 +1006,80 @@ mod loom_tests {
         });
     }
 
+    // Removers race a drain claim: the remover's fetch_add+recheck SeqCst
+    // pair mirrors try_acquire_reader (and try_pin_writer above); the
+    // claimer's CAS+active_removers() load mirrors the drain CAS +
+    // ref_count_seqcst()/active_writers() load in the models above. Header
+    // starts Sealed — the common interior-item-removal case a replace/
+    // delete pins (see `state_is_removable`). Same limitation applies (see
+    // module NOTE): the message-passing property this pair exists for — a
+    // claimer that has committed the drain is never raced by a remover
+    // still mid-pin — is SC-dependent and NOT asserted here; the claimer's
+    // single post-CAS observation of `active_removers()` is recorded, not
+    // asserted on. Like the writer model (and unlike the reader model's
+    // revert-on-race), production's remover-vs-drain claim does not revert
+    // on the claimer's side; the remover's own recheck inside
+    // `try_pin_remover` is what backs out, so a single discarded
+    // observation on the claimer side is the faithful message-passing
+    // shape here. (`committed` accordingly means only "the claim CAS won",
+    // not "drain confirmed safe" — harmless since it is never asserted
+    // on.) What IS asserted is the SC-independent invariant: every
+    // `try_pin_remover` call, whether it succeeds or backs out, is exactly
+    // balanced by a `release_remover` in every interleaving loom explores
+    // — no leaked or underflowed pin count. The SeqCst mutual exclusion
+    // itself is pinned by the stress tests exercising concurrent
+    // replace/delete against an evictor draining the same segment, not by
+    // loom.
+    #[test]
+    fn loom_removers_vs_cas_gated_drain() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            header.set_state(State::Sealed);
+            let committed = Arc::new(LoomAtomicU32::new(0));
+
+            let removers: Vec<_> = (0..2)
+                .map(|_| {
+                    let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
+                    thread::spawn(move || {
+                        if h.try_pin_remover() {
+                            // SC-dependent property recorded, not asserted
+                            // (see comment above and module NOTE).
+                            let _ = c.load(Ordering::SeqCst);
+                            h.release_remover();
+                        }
+                    })
+                })
+                .collect();
+
+            let claimer = {
+                let h = Arc::clone(&header);
+                let c = Arc::clone(&committed);
+                thread::spawn(move || {
+                    if h.cas_metadata(State::Sealed, State::Draining, None, None, Ordering::SeqCst)
+                    {
+                        // Single post-CAS observation, mirroring the reader
+                        // model's one recheck rather than a spin-wait: not
+                        // asserted on (SC-dependent), just exercised.
+                        let _ = h.active_removers();
+                        c.store(1, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            for r in removers {
+                r.join().unwrap();
+            }
+            claimer.join().unwrap();
+
+            // SC-independent: no interleaving leaves a pin dangling or
+            // double-releases one.
+            assert_eq!(header.active_removers(), 0);
+        });
+    }
+
     // Two writers CAS-reserve space from the same segment: both fit, so
     // the final state is fully determined regardless of interleaving —
     // the grants are exactly {base, base+24} and the offset lands at

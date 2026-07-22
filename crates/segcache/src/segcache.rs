@@ -170,6 +170,10 @@ impl Segcache {
         let location = pack_location(reserved.seg(), reserved.offset() as u64);
         let verifier = self.verifier();
 
+        // `reserved` (and its WriterPin) is held until this function returns —
+        // the pin must span publish so a concurrent drain cannot recycle the
+        // segment between define and insert (item 7d, H2). Do not drop/destructure
+        // it before the hashtable op.
         match self
             .hashtable
             .insert(reserved.item().key(), location, &verifier)
@@ -333,6 +337,11 @@ impl Segcache {
         };
 
         loop {
+            // `reserved` (and its WriterPin) is held until this function
+            // returns — the pin must span publish so a concurrent drain
+            // cannot recycle the segment between define and this exchange
+            // (item 7d, H2). Do not drop/destructure it before the
+            // hashtable op.
             if self
                 .hashtable
                 .cas_location(key, old_location, new_location, true)
@@ -472,6 +481,9 @@ impl Segcache {
         // fails with `Exists` (fail-safe) where it previously succeeded
         // through the plain insert.
         let reserved = self.reserve_and_define(key, value, optional, ttl)?;
+        // `reserved` (and its WriterPin) is handed to `replace_at` by value and
+        // stays alive there until publish — never dropped/destructured here
+        // before the hashtable exchange (item 7d, H2).
         self.replace_at(key, location, reserved)
     }
 
@@ -704,5 +716,12 @@ impl Segcache {
         let reserved =
             self.reserve_and_define(key, Value::U64(parsed), &opt_buf[..olen], seg_ttl)?;
         self.replace_at(key, location, reserved)
+    }
+
+    /// Test-only access to the segment collection, for asserting on segment
+    /// headers (e.g. `active_writers()`) after write operations return.
+    #[cfg(test)]
+    pub(crate) fn segments_for_test(&self) -> &Segments {
+        &self.segments
     }
 }

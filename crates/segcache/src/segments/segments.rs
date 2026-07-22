@@ -257,6 +257,13 @@ impl Segments {
         &self.headers[id.get() as usize - 1]
     }
 
+    /// Iterate every segment header, for asserting global invariants (e.g.
+    /// no leaked writer pins) after a sequence of operations.
+    #[cfg(test)]
+    pub(crate) fn iter_headers_for_test(&self) -> impl Iterator<Item = &SegmentHeader> {
+        self.headers.iter()
+    }
+
     /// Returns a segment's creation time and TTL, read directly from the
     /// header — no `Segment` view construction or magic-byte check, since
     /// this sits on the numeric-op hot path.

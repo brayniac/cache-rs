@@ -1936,3 +1936,41 @@ fn concurrent_readers_see_correct_values() {
         .expect("insert after concurrent reads");
     assert!(cache.get(b"post").unwrap().value() == *b"ok".as_slice());
 }
+
+// Item 7d: every reserve pins its segment (WriterPin, carried by
+// ReservedItem); every write must RELEASE that pin before returning. Run the
+// real public write paths — insert (fresh and replace), cas, and delete — and
+// assert no segment is left with a stuck writer pin afterward.
+//
+// Scope: this is a LEAK check, not an ordering check. Single-threaded and
+// `&mut`, with Rust's drop-at-end-of-scope, it catches a pin that is never
+// released — forgotten (`mem::forget`), stashed somewhere that outlives the
+// call, or dropped on a path that skips the release. It CANNOT distinguish a
+// pin dropped just before publish from one dropped just after: both leave
+// `active_writers == 0` by the time this samples the quiesced end state. The
+// H2 ordering guarantee (the pin actually SPANS publish, so a racing drain
+// can't recycle mid-write) is enforced by the concurrent reserver-vs-drain
+// test in `eviction_concurrency_tests.rs`, which has a real racing thread.
+#[test]
+fn writer_pins_released_after_write_ops() {
+    let mut cache = Segcache::builder().build().expect("failed to create cache");
+
+    cache
+        .insert(b"k1", b"v1", None, Duration::from_secs(60))
+        .unwrap();
+    cache
+        .insert(b"k1", b"v2", None, Duration::from_secs(60))
+        .unwrap(); // replace path
+    let cur = cache.get(b"k1").unwrap().cas();
+    cache
+        .cas(b"k1", b"v3", None, Duration::from_secs(60), cur)
+        .unwrap(); // cas path
+    cache.delete(b"k1");
+
+    // Every reserve pinned its segment; every publish/rollback path must have
+    // released it. No segment may retain a writer pin once the calls return
+    // (item 7d, H2: the pin spans publish, then drops).
+    for h in cache.segments_for_test().iter_headers_for_test() {
+        assert_eq!(h.active_writers(), 0, "leaked writer pin after write ops");
+    }
+}

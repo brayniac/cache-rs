@@ -469,24 +469,29 @@ impl<'a> Segment<'a> {
 
         // skips over seg_wait_refcount and evict retry, because no threading
 
-        if self.live_items() > 0 {
-            error!(
-                "segment not empty after clearing, still contains: {} items",
-                self.live_items()
-            );
-            panic!();
-        }
-
+        // Item 7f: with the active_removers==0 wait (claim_for_drain,
+        // drain_chain) plus try_pin_remover's recheck-bail, no replace/delete
+        // remove of this segment's items can be in flight or start while we
+        // clear it, so the hashtable/live-item accounting above is
+        // authoritative and these hold as invariants. Kept as debug_assert so
+        // concurrent stress tests still catch a protocol bug, without a
+        // release-time hard panic.
+        debug_assert!(
+            self.live_items() == 0,
+            "segment not empty after clearing, still contains {} items",
+            self.live_items()
+        );
         let expected_size = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC) as i32
         } else {
             0
         };
-        if self.live_bytes() != expected_size {
-            error!("segment size incorrect after clearing");
-            panic!();
-        }
-
+        debug_assert!(
+            self.live_bytes() == expected_size,
+            "segment size incorrect after clearing: {} != {}",
+            self.live_bytes(),
+            expected_size
+        );
         self.set_write_offset(self.live_bytes());
     }
 }

@@ -228,6 +228,11 @@ impl TtlBucket {
             while segments.header(seg_id).active_writers() != 0 {
                 std::hint::spin_loop();
             }
+            // Item 7f: wait for in-flight replace/delete removes of this
+            // segment's items before parsing (see claim_for_drain).
+            while segments.header(seg_id).active_removers() != 0 {
+                std::hint::spin_loop();
+            }
 
             segment.clear(hashtable, true);
 

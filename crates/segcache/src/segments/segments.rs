@@ -791,6 +791,14 @@ impl Segments {
             while self.headers[id_idx].active_writers() != 0 {
                 std::hint::spin_loop();
             }
+            // Item 7f: also wait for in-flight replace/delete removes of this
+            // segment's items to finish decrementing before we parse/reclaim it
+            // (claimer half of the remover Dekker pair). A remover that pins
+            // after our claim CAS sees Draining (try_pin_remover recheck) and
+            // bails, so this converges.
+            while self.headers[id_idx].active_removers() != 0 {
+                std::hint::spin_loop();
+            }
         }
         won
     }

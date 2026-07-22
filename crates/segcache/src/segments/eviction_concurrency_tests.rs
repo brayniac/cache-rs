@@ -332,8 +332,10 @@ fn assert_value_eq(v: Value, expected: &[u8], msg: &str) {
 //                  under contention, so this is asserted rather than an exact
 //                  survivor count).
 //
-// The same-segment writer-vs-drain race (a reserver writing a `Live` tail an
-// evictor then drains) is DEFERRED to 7d; Test 3 stays in the disjoint regime.
+// The same-segment writer-vs-drain race (a reserver writing a `Live` tail a
+// drain then claims) is covered by `concurrent_reservers_vs_drain_same_bucket`
+// (item 7d); Test 3 stays in the disjoint regime and the 7d test takes the
+// same-segment regime.
 
 use crate::segments::Segments;
 use crate::ttl_buckets::TtlBuckets;

@@ -409,10 +409,16 @@ impl Segments {
     /// select the same `Sealed` candidate cannot both derive `&mut` to it — the
     /// loser's `claim_for_drain` returns false and it skips.
     ///
-    /// The ONE race this does NOT cover — a reserver writing the `Live` tail
-    /// while an evictor drains that same segment — is deferred to item 7d
-    /// (generation in the seal CAS + guarding the reserve->publish window); see
-    /// the `SCOPE(writer-vs-drain)` comments.
+    /// The reserver-vs-drain race on a `Live` tail is closed by item 7d: a
+    /// reserver pins the segment as a writer (`try_pin_writer`, incrementing
+    /// `active_writers`) across its whole reserve→define→publish window, and
+    /// every parse site (`drain_chain`, `claim_for_drain`) waits for
+    /// `active_writers == 0` after winning its state CAS — the claimer half of
+    /// the same SeqCst Dekker pair the reader pin uses. So a drain never parses
+    /// a reserved-but-undefined region (H1), and a reserver never writes or
+    /// publishes into a recycled segment (H2). The seal itself re-checks the
+    /// tail's generation under `chain_lock` before firing (H3), so a recycled,
+    /// reused tail is never sealed.
     pub(crate) fn segment(&self, id: NonZeroU32) -> Result<Segment<'_>, SegmentsError> {
         let idx = id.get() as usize - 1;
         if idx < self.headers.len() {

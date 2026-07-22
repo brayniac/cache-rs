@@ -656,8 +656,12 @@ fn concurrent_evictors_s3fifo_policy() {
 /// so an intact readback proves the evictor's `&mut [u8]` into the head region
 /// never aliased the reserver's `&mut [u8]` into the tail.
 ///
-/// The same-segment writer-vs-drain race is DEFERRED to 7d; the large buffer +
-/// bounded work keeps this test in the disjoint regime.
+/// The same-segment writer-vs-drain race is deliberately kept OUT of scope
+/// here: the large buffer + bounded work keeps this test in the disjoint
+/// regime. That regime is covered separately by
+/// `concurrent_reservers_vs_drain_same_bucket` below, which targets a single
+/// shared bucket so reservers and the drainer contend on the very same
+/// segments.
 #[test]
 fn reservers_vs_evictor_disjoint() {
     const ITEMS_PER_SEGMENT: usize = 8;
@@ -815,6 +819,224 @@ fn reservers_vs_evictor_disjoint() {
     cache
         .check_integrity()
         .expect("cache must pass integrity check after concurrent reserve+evict");
+}
+
+/// Test 3b — Reservers vs drain, SAME bucket (the writer-vs-drain milestone
+/// Test 3 deliberately deferred).
+///
+/// N reserver threads and 1 drainer thread all target the SAME TTL bucket:
+/// reservers grow its `Live` tail via `TtlBucket::reserve` while the drainer
+/// repeatedly calls `TtlBuckets::clear`, which walks this bucket's chain
+/// oldest-first INCLUDING its `Live` tail (`drain_chain` CASes
+/// `Sealed|Live -> Draining`). Unlike Test 3's disjoint prefill buffer, there
+/// is no separation here by construction — the drainer can claim the very
+/// segment a reserver is mid-write on. This directly exercises:
+///
+///   * H1 (drain must not parse a reserved-but-undefined region) — a
+///     reserver's readback happens WHILE its `WriterPin` (inside
+///     `ReservedItem`) is still held, i.e. `active_writers >= 1` on that
+///     segment. If the drainer's wait — `drain_chain`'s
+///     `while active_writers() != 0 { spin }` (the same Dekker-pair shape as
+///     `claim_for_drain`'s, but its own inline call site) — did not
+///     actually gate on the pin, a racing `clear` could parse the segment's
+///     item stream mid-`define` and the readback would observe torn or
+///     aliased bytes.
+///   * H2 (writer must not publish into a drained segment) — the reserver
+///     publishes into the hashtable AFTER the readback, and `reserved` (thus
+///     the pin) drops only at the end of the loop body, after publish. A
+///     violation would surface as a leaked pin, a corrupted chain, or a
+///     wrong value on a later `get`.
+///
+/// Reservers tolerate `reserve` failure (bounded retry, then skip the op) —
+/// the pool legitimately churns as the drainer clears segments back to Free;
+/// the property under test is safety, not that every reserve succeeds.
+#[test]
+fn concurrent_reservers_vs_drain_same_bucket() {
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const KEY_LEN: usize = 7;
+    const VAL_LEN: usize = 7;
+    const RESERVERS: usize = 4;
+    const OPS_PER_RESERVER: usize = 300;
+    const DRAIN_ITERS: usize = 4000;
+
+    let sample_val = cval(0);
+    assert_eq!(sample_val.len(), VAL_LEN);
+    assert_eq!(ckey(0).len(), KEY_LEN);
+
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(sample_val.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // Modest pool: enough headroom that the drainer's `clear` can recycle
+    // segments back to Free for reservers to reclaim, but small enough that
+    // reservers and the drainer are constantly contending on the SAME
+    // handful of segments — no large disjoint buffer like Test 3.
+    let total_segments = 40usize;
+    let prefill_segments = 4usize;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(segment_size as usize * total_segments)
+        .hash_power(16)
+        .eviction(Policy::Merge {
+            max: 8,
+            merge: 4,
+            compact: 0,
+        })
+        .build()
+        .expect("failed to create cache");
+
+    // Single TTL -> single bucket, so prefill, reservers, and the drainer all
+    // contend on exactly one `TtlBucket` chain.
+    let ttl = Duration::from_secs(3600);
+
+    // Small prefill (a handful of segments' worth) so the drainer has real
+    // items to walk on its first pass, without building a large disjoint
+    // buffer.
+    let prefill = ITEMS_PER_SEGMENT * prefill_segments;
+    for i in 0..prefill {
+        cache
+            .insert(ckey(i).as_bytes(), cval(i).as_bytes(), None, ttl)
+            .expect("prefill inserts must succeed");
+    }
+
+    // Reserver payloads use a disjoint key space ("r" prefix) and distinct
+    // values, so a corrupted/aliased readback is detectable.
+    let rkey = |t: usize, j: usize| format!("r{t:03}{j:03}");
+    let rval = |t: usize, j: usize| format!("R{t:03}{j:03}");
+    assert_eq!(rkey(0, 0).len(), KEY_LEN);
+    assert_eq!(rval(0, 0).len(), VAL_LEN);
+
+    let total = total_segments as u32;
+    {
+        let segments = &cache.segments;
+        let ttl_buckets = &cache.ttl_buckets;
+        let hashtable = &cache.hashtable;
+
+        std::thread::scope(|scope| {
+            // Drainer: repeatedly clears this bucket, which walks the chain
+            // including its `Live` tail — the same segments reservers write.
+            scope.spawn(move || {
+                for _ in 0..DRAIN_ITERS {
+                    let _ = ttl_buckets.clear(hashtable, segments);
+                    std::hint::spin_loop();
+                }
+            });
+
+            // Reservers: grow the SAME bucket's Live tail concurrently with
+            // the drainer clearing it.
+            for t in 0..RESERVERS {
+                scope.spawn(move || {
+                    let coarse_ttl = clocksource::coarse::Duration::from_secs(3600);
+                    let bucket = ttl_buckets.get_bucket(coarse_ttl);
+                    for j in 0..OPS_PER_RESERVER {
+                        let key = rkey(t, j);
+                        let val = rval(t, j);
+                        let size = keyvalue::item_size(key.len(), &Value::Bytes(val.as_bytes()), 0);
+
+                        // Tolerate reserve failure: the pool legitimately
+                        // churns under the drainer's clears. Retry a bounded
+                        // number of times, then skip this op rather than
+                        // panicking.
+                        let mut reserved = None;
+                        for _ in 0..1000 {
+                            match bucket.reserve(size, segments) {
+                                Ok(r) => {
+                                    reserved = Some(r);
+                                    break;
+                                }
+                                Err(_) => {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
+                        let Some(mut reserved) = reserved else {
+                            continue;
+                        };
+                        reserved.define(key.as_bytes(), Value::Bytes(val.as_bytes()), &[]);
+
+                        // Readback WHILE the WriterPin (inside `reserved`) is
+                        // still held. A concurrent `clear` claiming this exact
+                        // segment must block in the writers-wait until this
+                        // pin releases (H1) — a corrupted readback here means
+                        // the drainer parsed/aliased the region mid-write.
+                        let item = reserved.item();
+                        assert_eq!(
+                            item.key(),
+                            key.as_bytes(),
+                            "reserved item key corrupted (concurrent drain aliased the same-bucket tail)"
+                        );
+                        assert_value_eq(
+                            item.value(),
+                            val.as_bytes(),
+                            "reserved item value corrupted (concurrent drain aliased the same-bucket tail)",
+                        );
+                        #[cfg(feature = "integrity")]
+                        item.check_magic();
+
+                        // Publish, THEN let `reserved` drop at the end of
+                        // this iteration — the pin releases only after
+                        // publish, so the segment only becomes drainable once
+                        // the item is a real, resolvable entry (H2).
+                        let location =
+                            crate::pack_location(reserved.seg(), reserved.offset() as u64);
+                        let verifier = segments.verifier();
+                        let _ = hashtable.insert(item.key(), location, &verifier);
+                    }
+                });
+            }
+        });
+
+        // No leak / no corruption over the whole pool after the storm.
+        let chained = assert_chains_well_formed(segments, ttl_buckets, total);
+        assert_no_leak(segments, &chained, total);
+
+        // No leaked pins: every segment's writer/reader pin counts must have
+        // unwound to zero once all reservers and the drainer have finished.
+        for raw in 1..=total {
+            let id = NonZeroU32::new(raw).unwrap();
+            let header = segments.header(id);
+            assert_eq!(
+                header.active_writers(),
+                0,
+                "segment {raw} leaked a writer pin"
+            );
+            assert_eq!(header.ref_count(), 0, "segment {raw} leaked a reader pin");
+        }
+    }
+
+    // Every prefill key that still resolves returns its own value.
+    for i in 0..prefill {
+        if let Some(item) = cache.get(ckey(i).as_bytes()) {
+            assert_value_eq(
+                item.value(),
+                cval(i).as_bytes(),
+                "resolvable prefill key must return its own value after concurrent reserve+drain",
+            );
+        }
+    }
+
+    // Every reserver key that still resolves returns ITS OWN value — the real
+    // safety property. Most will have been cleared by the drainer along the
+    // way; that is expected and fine. A wrong/aliased value on a resolvable
+    // key would be an H1/H2 violation.
+    for t in 0..RESERVERS {
+        for j in 0..OPS_PER_RESERVER {
+            let key = rkey(t, j);
+            if let Some(item) = cache.get(key.as_bytes()) {
+                assert_value_eq(
+                    item.value(),
+                    rval(t, j).as_bytes(),
+                    "resolvable reserver key must return its own value after concurrent reserve+drain",
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    cache.check_integrity().expect(
+        "cache must pass integrity check after concurrent reserve+drain on the same bucket",
+    );
 }
 
 /// Test 4 — `claim_for_drain` waits for `active_writers == 0` (roadmap item

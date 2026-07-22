@@ -19,7 +19,6 @@ pub struct Segcache {
     pub(crate) hashtable: MultiChoiceHashtable,
     pub(crate) segments: Segments,
     pub(crate) ttl_buckets: TtlBuckets,
-    pub(crate) time: Instant,
 }
 
 // Compile-time guard: Segcache must be Sync so &Segcache can be shared across
@@ -586,7 +585,6 @@ impl Segcache {
     /// outstanding [`Item`]s are drained from the hashtable but not freed
     /// (and not counted) until a later pass runs after the pins drop.
     pub fn expire(&mut self) -> usize {
-        self.time = Instant::now();
         self.ttl_buckets.expire(&self.hashtable, &self.segments)
     }
 
@@ -596,7 +594,6 @@ impl Segcache {
     /// outstanding [`Item`]s are drained but not freed (and not counted)
     /// until a later pass runs after the pins drop.
     pub fn clear(&mut self) -> usize {
-        self.time = Instant::now();
         self.ttl_buckets.clear(&self.hashtable, &self.segments)
     }
 

@@ -888,6 +888,76 @@ mod loom_tests {
         });
     }
 
+    // Writers race a drain claim: the writer's fetch_add+recheck SeqCst pair
+    // mirrors try_acquire_reader; the claimer's CAS+active_writers() load
+    // mirrors the drain CAS + ref_count_seqcst() load in the model above.
+    // Same limitation applies (see module NOTE): the message-passing
+    // property this pair exists for — a claimer that has committed the
+    // drain is never raced by a writer still mid-pin — is SC-dependent and
+    // NOT asserted here; the claimer's single post-CAS observation of
+    // `active_writers()` is recorded, not asserted on. Unlike the reader
+    // model's `ref_count_seqcst()` check — which IS branched into a
+    // revert-on-race — production's writer-drain claim does not revert; it
+    // spins until writers drain (`claim_for_drain` / `drain_chain`), so a
+    // single discarded observation is the faithful message-passing shape
+    // here. (`committed` accordingly means only "the claim CAS won", not
+    // "drain confirmed safe" as in the reader model — harmless since it is
+    // never asserted on.) What IS asserted is the SC-independent invariant:
+    // every `try_pin_writer` call, whether it succeeds or backs out, is
+    // exactly balanced by a `release_writer` in every interleaving loom
+    // explores — no leaked or underflowed pin count. The SeqCst mutual
+    // exclusion itself is pinned by `concurrent_reservers_vs_drain_same_bucket`
+    // (stress test) and `claim_for_drain_waits_for_active_writers`
+    // (deterministic), not by loom.
+    #[test]
+    fn loom_writers_vs_cas_gated_drain() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            header.set_state(State::Live);
+            let committed = Arc::new(LoomAtomicU32::new(0));
+
+            let writers: Vec<_> = (0..2)
+                .map(|_| {
+                    let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
+                    thread::spawn(move || {
+                        if h.try_pin_writer() {
+                            // SC-dependent property recorded, not asserted
+                            // (see comment above and module NOTE).
+                            let _ = c.load(Ordering::SeqCst);
+                            h.release_writer();
+                        }
+                    })
+                })
+                .collect();
+
+            let claimer = {
+                let h = Arc::clone(&header);
+                let c = Arc::clone(&committed);
+                thread::spawn(move || {
+                    if h.cas_metadata(State::Live, State::Draining, None, None, Ordering::SeqCst) {
+                        // Single post-CAS observation, mirroring the reader
+                        // model's one recheck rather than a spin-wait: not
+                        // asserted on (SC-dependent), just exercised.
+                        let _ = h.active_writers();
+                        c.store(1, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            for w in writers {
+                w.join().unwrap();
+            }
+            claimer.join().unwrap();
+
+            // SC-independent: no interleaving leaves a pin dangling or
+            // double-releases one.
+            assert_eq!(header.active_writers(), 0);
+        });
+    }
+
     // Two writers CAS-reserve space from the same segment: both fit, so
     // the final state is fully determined regardless of interleaving —
     // the grants are exactly {base, base+24} and the offset lands at

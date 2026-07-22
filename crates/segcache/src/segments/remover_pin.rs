@@ -21,7 +21,6 @@ impl RemoverPin {
     ///   ownership of that pin transfers to this guard.
     /// - `header` points into the `Segments` headers allocation, which outlives
     ///   the guard.
-    #[allow(dead_code)] // no production caller yet; wired in item 7f Task 5
     pub(crate) unsafe fn new(header: *const SegmentHeader) -> Self {
         Self { header }
     }

@@ -18,7 +18,6 @@ pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;
 pub(crate) use guard::SegmentGuard;
 pub(crate) use header::{SegmentHeader, SegmentPool};
-#[allow(unused_imports)] // no production caller yet; wired in item 7f Task 5
 pub(crate) use remover_pin::RemoverPin;
 pub(crate) use segment::Segment;
 pub(crate) use segments::{AllocOutcome, ClearOutcome, Segments};

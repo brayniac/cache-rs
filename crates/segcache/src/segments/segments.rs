@@ -390,6 +390,22 @@ impl Segments {
         ))
     }
 
+    /// Pin a segment for a replace/delete about to unlink+decrement one of
+    /// its items (item 7f). Returns the guard if the segment is removable
+    /// (Sealed/Live), `None` if a drain claimed it in the interim (the
+    /// caller should re-look-up the key and retry). SAFETY: the headers
+    /// allocation outlives the pin (`Segments::headers` is never resized or
+    /// reassigned after construction).
+    pub(crate) fn try_pin_remover(&self, seg_id: NonZeroU32) -> Option<RemoverPin> {
+        let header = self.header(seg_id);
+        if header.try_pin_remover() {
+            // SAFETY: try_pin_remover returned true; headers outlive the pin.
+            Some(unsafe { RemoverPin::new(header as *const _) })
+        } else {
+            None
+        }
+    }
+
     // ── Segment views ────────────────────────────────────────────────
 
     /// Returns a `Segment` view for the segment with the specified id.
@@ -1114,17 +1130,31 @@ impl Segments {
     /// Remove a single item from a segment based on the segment id and offset.
     /// May trigger merge compaction if the merge eviction policy is active and
     /// the segment occupancy drops below the compact ratio.
+    ///
+    /// `pin` is a remover pin (item 7f) taken by the caller on `seg_id`
+    /// BEFORE unlinking the item from the hashtable, so it brackets the
+    /// unlink (caller's side) and this decrement (here) as one span a
+    /// concurrent drain must wait out. It is dropped immediately after the
+    /// decrement below, before any `chain_lock` acquisition — a drainer
+    /// waits for `active_removers == 0` WHILE HOLDING `chain_lock`
+    /// (`claim_for_drain`, run under `_chain` by `evict` and by this
+    /// function's own empty-free path below), so holding the pin across
+    /// that acquisition would deadlock (the same lock-order rule as item
+    /// 7d's `WriterPin`).
     pub(crate) fn remove_at(
         &self,
         seg_id: NonZeroU32,
         offset: usize,
         ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
+        pin: RemoverPin,
     ) -> Result<(), SegmentsError> {
         // Remove the item.
         {
             let segment = self.segment(seg_id)?;
             segment.remove_item_at(offset);
+            // Release the remover pin now — before any `chain_lock` below.
+            drop(pin);
 
             // If the segment is now empty and evictable, free it
             // immediately via the drain/condemn protocol.

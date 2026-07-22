@@ -457,7 +457,6 @@ impl SegmentHeader {
     /// drain's claim CAS + `active_removers` load. loom cannot verify this
     /// distinction (see `try_acquire_reader`/`try_pin_writer`).
     #[inline]
-    #[allow(dead_code)] // no production caller yet; wired in item 7f Task 5
     pub fn try_pin_remover(&self) -> bool {
         if !Self::state_is_removable(self.metadata(Ordering::Acquire).state) {
             return false;
@@ -473,7 +472,6 @@ impl SegmentHeader {
     /// Release a remover pin taken with `try_pin_remover`. SeqCst mirrors
     /// `release_writer`.
     #[inline]
-    #[allow(dead_code)] // no production caller yet; wired in item 7f Task 5
     pub fn release_remover(&self) {
         let prev = self.active_removers.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(prev > 0, "release_remover without matching pin");
@@ -481,7 +479,6 @@ impl SegmentHeader {
 
     /// Reservers-mid-remove count, ordered after a preceding SeqCst claim CAS.
     #[inline]
-    #[allow(dead_code)] // no production caller yet; wired in item 7f Task 5
     pub fn active_removers(&self) -> u32 {
         self.active_removers.load(Ordering::SeqCst)
     }

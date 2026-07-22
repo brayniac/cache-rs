@@ -24,6 +24,7 @@
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 
+use crate::segments::AllocOutcome;
 use crate::sync::{AtomicU32, Ordering};
 use crate::*;
 use core::num::NonZeroU32;
@@ -406,26 +407,26 @@ impl TtlBucket {
 
         loop {
             let tail = self.tail();
-            if let Some(id) = tail {
-                let state = segments.header(id).state();
-                if state.is_writable() {
-                    if let Some(reserved) = segments.try_alloc_item(id, size as i32) {
-                        return Ok(reserved);
+            match tail {
+                Some(id) => match segments.try_alloc_item(id, size as i32) {
+                    AllocOutcome::Reserved(reserved) => return Ok(reserved),
+                    AllocOutcome::NotWritable => {
+                        // Mid-election (Reserved/Linking) or being drained: the
+                        // chain is about to advance. Re-read the tail rather
+                        // than expanding behind a transient state. Unreachable
+                        // single-threaded (seal+publish happen inside try_expand).
+                        std::hint::spin_loop();
+                        continue;
                     }
-                    // Live but full: expand, sealing exactly this tail.
-                } else {
-                    // Mid-election (Reserved or Linking — the
-                    // empty-bucket winner publishes the tail word
-                    // before its link CAS) or being drained: the chain
-                    // is about to advance. Re-read the tail rather
-                    // than expanding behind a transient state.
-                    // Unreachable single-threaded: seal and publish
-                    // happen inside one try_expand call.
-                    std::hint::spin_loop();
-                    continue;
+                    AllocOutcome::Full => {
+                        // Live but full: expand, sealing exactly this tail.
+                        self.try_expand(tail, segments)?;
+                    }
+                },
+                None => {
+                    self.try_expand(tail, segments)?;
                 }
             }
-            self.try_expand(tail, segments)?;
         }
     }
 }

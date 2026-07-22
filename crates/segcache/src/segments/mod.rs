@@ -18,7 +18,7 @@ pub(crate) use error::SegmentsError;
 pub(crate) use guard::SegmentGuard;
 pub(crate) use header::{SegmentHeader, SegmentPool};
 pub(crate) use segment::Segment;
-pub(crate) use segments::{ClearOutcome, Segments};
+pub(crate) use segments::{AllocOutcome, ClearOutcome, Segments};
 pub(crate) use state::State;
 pub(crate) use writer_pin::WriterPin;
 

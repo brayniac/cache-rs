@@ -77,6 +77,18 @@ pub(crate) enum ClearOutcome {
     Deferred,
 }
 
+/// Outcome of a pinned allocation attempt on a specific tail segment.
+#[derive(Debug)]
+pub(crate) enum AllocOutcome {
+    /// Space granted; the item is pinned (`WriterPin` inside).
+    Reserved(ReservedItem),
+    /// Segment is `Live` but full — the caller should expand the chain.
+    Full,
+    /// Segment is no longer writable (raced a seal/claim) — the caller should
+    /// re-read the tail rather than expand.
+    NotWritable,
+}
+
 impl Segments {
     /// Allocate and initialize segments by consuming the builder. The backing
     /// heap is an anonymous mmap region instead of a boxed slice so that large
@@ -303,9 +315,12 @@ impl Segments {
         Some((raw, guard))
     }
 
-    /// Atomically reserve space for an item in the given segment,
-    /// returning a `ReservedItem` for the granted region. `None` means
-    /// the segment is full — the caller should expand the chain.
+    /// Atomically reserve space for an item in the given segment, pinning
+    /// it as a writer for the reserve→publish window (item 7d's Dekker
+    /// pair). Returns an `AllocOutcome`: `Reserved` on a granted region,
+    /// `Full` if the segment is `Live` but out of space (caller should
+    /// expand the chain), or `NotWritable` if the segment stopped being
+    /// writable (raced a seal/claim — caller should re-read the tail).
     ///
     /// Takes `&self`: the reservation is a header CAS and the item
     /// pointer is derived from the data base pointer, the same pattern
@@ -314,26 +329,23 @@ impl Segments {
     /// The `integrity` magic-byte check is intentionally skipped here
     /// (hot path); the debug-feature `check_integrity` scan covers it,
     /// the same idiom as `expiry_info`.
-    ///
-    /// SCOPE(writer-vs-drain): the reserve→define→publish window is not
-    /// yet protected against a concurrent drain of this segment. Safe
-    /// today because eviction and writers are serialized by `&mut
-    /// Segcache`. Drain-safe merge (item 5b) made eviction itself
-    /// reader-safe (no more in-place compaction of readable segments) but
-    /// does not close this writer-vs-drain hazard; that protocol is
-    /// deferred past 5b to item 7.
-    pub(crate) fn try_alloc_item(&self, seg_id: NonZeroU32, size: i32) -> Option<ReservedItem> {
+    pub(crate) fn try_alloc_item(&self, seg_id: NonZeroU32, size: i32) -> AllocOutcome {
         debug_assert!(seg_id.get() <= self.cap);
         let header = self.header(seg_id);
 
+        // Writer half of the Dekker pair (item 7d): pin before touching
+        // write_offset, and bail if the segment stopped being writable.
         if !header.try_pin_writer() {
-            return None;
+            return AllocOutcome::NotWritable;
         }
         // SAFETY: try_pin_writer returned true; the headers allocation outlives
         // this pin (the ReservedItem is consumed within the caller's insert/cas).
         let pin = unsafe { WriterPin::new(header as *const _) };
 
-        let offset = header.try_reserve_space(size, self.segment_size)?;
+        let offset = match header.try_reserve_space(size, self.segment_size) {
+            Some(offset) => offset,
+            None => return AllocOutcome::Full, // pin dropped here → released
+        };
 
         header.incr_live_items();
         header.incr_live_bytes(size);
@@ -352,7 +364,7 @@ impl Segments {
         // `offset + size <= segment_size`, so the granted region lies
         // inside this segment's slice of the data mmap.
         let ptr = unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) };
-        Some(ReservedItem::new(
+        AllocOutcome::Reserved(ReservedItem::new(
             RawItem::from_ptr(ptr),
             seg_id,
             offset as usize,

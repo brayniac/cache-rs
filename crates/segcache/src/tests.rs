@@ -526,6 +526,8 @@ fn get_free_seg() {
 
 #[test]
 fn try_alloc_item_bounds_and_grants() {
+    use crate::segments::AllocOutcome;
+
     let segments = SegmentsBuilder::default()
         .segment_size(4096)
         .heap_size(4096 * 4)
@@ -542,19 +544,77 @@ fn try_alloc_item_bounds_and_grants() {
     let live_bytes_before = segments.header(id).live_bytes();
 
     // grants are sequential and within capacity
-    let a = segments.try_alloc_item(id, 64).expect("first alloc");
-    let b = segments.try_alloc_item(id, 64).expect("second alloc");
+    let a = match segments.try_alloc_item(id, 64) {
+        AllocOutcome::Reserved(r) => r,
+        other => panic!("expected Reserved, got {other:?}"),
+    };
+    let b = match segments.try_alloc_item(id, 64) {
+        AllocOutcome::Reserved(r) => r,
+        other => panic!("expected Reserved, got {other:?}"),
+    };
     assert_eq!(b.offset(), a.offset() + 64);
     assert_eq!(a.seg(), id);
 
     // an oversized request fails and does not move the offset
     let before = segments.header(id).write_offset();
-    assert!(segments.try_alloc_item(id, 4096).is_none());
+    assert!(matches!(
+        segments.try_alloc_item(id, 4096),
+        AllocOutcome::Full
+    ));
     assert_eq!(segments.header(id).write_offset(), before);
 
     // live statistics track successful grants only
     assert_eq!(segments.header(id).live_items(), 2);
     assert_eq!(segments.header(id).live_bytes(), live_bytes_before + 128);
+}
+
+// try_alloc_item now pins a writer (Dekker pair, item 7d): the pin is held
+// only across the reserve→publish window and must be released whether the
+// call grants space (Reserved, dropped by the caller) or finds the segment
+// full (Full, dropped internally before returning) — never leaked.
+#[test]
+fn try_alloc_item_pins_writer_until_dropped() {
+    use crate::segments::AllocOutcome;
+
+    let segments = SegmentsBuilder::default()
+        .segment_size(4096)
+        .heap_size(4096 * 4)
+        .build()
+        .expect("build segments");
+
+    let seg = segments.reserve_free().expect("free segment");
+    segments.header(seg).set_state(State::Live);
+
+    assert_eq!(segments.header(seg).active_writers(), 0);
+
+    match segments.try_alloc_item(seg, 64) {
+        AllocOutcome::Reserved(r) => {
+            assert_eq!(
+                segments.header(seg).active_writers(),
+                1,
+                "pinned while reserved"
+            );
+            drop(r);
+            assert_eq!(segments.header(seg).active_writers(), 0, "released on drop");
+        }
+        other => panic!("expected Reserved, got {other:?}"),
+    }
+
+    // Fill the segment so the next alloc returns Full, and assert the pin
+    // is released (not leaked) on the Full path.
+    let seg_size = segments.segment_size();
+    loop {
+        match segments.try_alloc_item(seg, seg_size / 4) {
+            AllocOutcome::Reserved(r) => drop(r),
+            AllocOutcome::Full => break,
+            AllocOutcome::NotWritable => panic!("unexpected NotWritable while Live"),
+        }
+    }
+    assert_eq!(
+        segments.header(seg).active_writers(),
+        0,
+        "Full path must not leak a pin"
+    );
 }
 
 #[test]

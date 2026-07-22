@@ -368,7 +368,16 @@ impl<'a> Segment<'a> {
                 n_th_update += 1;
                 let t = ((n_retained as f64) / (n_scanned as f64) - target_ratio) / target_ratio;
                 if !(-0.5..=0.5).contains(&t) {
-                    cutoff *= 1.0 + t;
+                    // Floor the multiplier: a degenerate early reading — e.g.
+                    // `n_retained == 0` at the first checkpoint (all cold items
+                    // dropped so far) gives `t == -1`, and a bare `1.0 + t == 0`
+                    // would zero `cutoff` PERMANENTLY (0 stays 0), disabling the
+                    // `cutoff >= 0.0001` drop-gate for the rest of the segment so
+                    // prune retains the WHOLE candidate. That over-retention can
+                    // starve the free queue and livelock `reserve_and_define`.
+                    // Bounding the shrink to 0.25x/step keeps the adaptive
+                    // direction while never collapsing cutoff to zero.
+                    cutoff *= (1.0 + t).max(0.25);
                 }
                 trace!("cutoff adj to: {cutoff}");
             }

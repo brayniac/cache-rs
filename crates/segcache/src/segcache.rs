@@ -293,17 +293,24 @@ impl Segcache {
                     return Err(SegcacheError::ItemOversized { size });
                 }
                 Err(TtlBucketsError::NoFreeSegments) => {
-                    if self
+                    // Try to make room. Count a retry unless eviction actually
+                    // raised the general free queue — i.e. produced a segment a
+                    // reserve can use. An `evict()` that returns Ok but frees
+                    // nothing usable (e.g. a merge pass that only refills the
+                    // spare) must NOT grant an unbounded free retry, or this
+                    // loop livelocks; bounding it turns "can't make room" into a
+                    // NoFreeSegments error instead of a hang.
+                    let before = self.segments.free_queue_len();
+                    let evicted = self
                         .segments
                         .evict(&self.ttl_buckets, &self.hashtable)
-                        .is_err()
-                    {
-                        retries -= 1;
-                    } else {
-                        // we successfully evicted a segment, return to start of
-                        // loop to reserve the item
+                        .is_ok();
+                    if evicted && self.segments.free_queue_len() > before {
+                        // A segment became available to normal writes — retry
+                        // the reserve without spending a retry.
                         continue;
                     }
+                    retries -= 1;
                 }
             }
             if retries == 0 {

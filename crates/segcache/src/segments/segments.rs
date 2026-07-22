@@ -232,6 +232,17 @@ impl Segments {
         self.free_queue.len() + self.spare_queue.len()
     }
 
+    /// Segments available to normal writes (the general free queue only,
+    /// excluding the held-back spare). Used by `reserve_and_define` as an
+    /// eviction-progress signal: if an `evict()` pass does not raise this, it
+    /// freed nothing a reserve can use (e.g. a merge that only refilled the
+    /// spare), so the retry loop must not spin on it. `Injector::len` is an
+    /// estimate, which is fine here — a stale read only costs a bounded extra
+    /// retry or an early give-up, never an unbounded loop.
+    pub(crate) fn free_queue_len(&self) -> usize {
+        self.free_queue.len()
+    }
+
     /// Returns the number of segments available to normal writes (free
     /// queue only, excluding the held-back spare).
     #[cfg(all(test, not(feature = "loom")))]

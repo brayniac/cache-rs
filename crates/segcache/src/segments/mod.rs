@@ -8,6 +8,7 @@ mod segment;
 #[allow(clippy::module_inception)]
 mod segments;
 pub(crate) mod state;
+mod writer_pin;
 
 #[cfg(all(test, not(feature = "loom")))]
 mod eviction_concurrency_tests;
@@ -17,8 +18,9 @@ pub(crate) use error::SegmentsError;
 pub(crate) use guard::SegmentGuard;
 pub(crate) use header::{SegmentHeader, SegmentPool};
 pub(crate) use segment::Segment;
-pub(crate) use segments::{ClearOutcome, Segments};
+pub(crate) use segments::{AllocOutcome, ClearOutcome, Segments};
 pub(crate) use state::State;
+pub(crate) use writer_pin::WriterPin;
 
 #[cfg(test)]
 mod test {

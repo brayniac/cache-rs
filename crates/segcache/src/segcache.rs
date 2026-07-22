@@ -170,10 +170,23 @@ impl Segcache {
         let location = pack_location(reserved.seg(), reserved.offset() as u64);
         let verifier = self.verifier();
 
-        match self
+        // Publish under the pin: `reserved` (and its WriterPin) is held across
+        // this hashtable op so a concurrent drain cannot recycle the segment
+        // between define and publish (item 7d, H2).
+        let published = self
             .hashtable
-            .insert(reserved.item().key(), location, &verifier)
-        {
+            .insert(reserved.item().key(), location, &verifier);
+
+        // Release the pin the instant publish completes, BEFORE any `remove_at`.
+        // H2 only requires the pin to span the new item's publish (done above);
+        // holding it across `remove_at` — which can take a bucket `chain_lock`
+        // (empty-segment drain / merge-compact) — would deadlock a drainer that
+        // waits on `active_writers` WHILE holding that same `chain_lock`
+        // (lock-order inversion). Invariant: never hold a WriterPin across a
+        // `chain_lock` acquisition.
+        drop(reserved);
+
+        match published {
             Ok(Some(old_location)) => {
                 // Replaced existing key — remove old item from segment
                 let (old_seg_id, old_offset) = unpack_location(old_location);
@@ -192,13 +205,16 @@ impl Segcache {
             }
             Ok(None) => Ok(()),
             Err(()) => {
-                // Hashtable full — roll back the segment allocation
-                let _ = self.segments.remove_at(
-                    reserved.seg(),
-                    reserved.offset(),
-                    &self.ttl_buckets,
-                    &self.hashtable,
-                );
+                // Hashtable full — roll back the (unpublished) reservation.
+                let (new_seg, new_offset) = unpack_location(location);
+                if let Some(new_seg) = NonZeroU32::new(new_seg) {
+                    let _ = self.segments.remove_at(
+                        new_seg,
+                        new_offset,
+                        &self.ttl_buckets,
+                        &self.hashtable,
+                    );
+                }
                 Err(SegcacheError::HashTableInsertEx)
             }
         }
@@ -317,14 +333,19 @@ impl Segcache {
         reserved: ReservedItem,
     ) -> Result<(), SegcacheError> {
         let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
+        // Capture the reservation's own location up front so the rollback paths
+        // can reclaim it AFTER the pin is released (see the drop-before-remove_at
+        // invariant below), without borrowing `reserved`.
+        let (new_seg, new_offset) = (reserved.seg(), reserved.offset());
         let (old_seg_id, old_offset) = unpack_location(old_location);
         let old_seg_id = match NonZeroU32::new(old_seg_id) {
             Some(id) => id,
             None => {
-                // invalid old location: roll back the reservation
+                // invalid old location: roll back the (unpublished) reservation.
+                drop(reserved); // release the pin before remove_at (see below)
                 let _ = self.segments.remove_at(
-                    reserved.seg(),
-                    reserved.offset(),
+                    new_seg,
+                    new_offset,
                     &self.ttl_buckets,
                     &self.hashtable,
                 );
@@ -333,6 +354,9 @@ impl Segcache {
         };
 
         loop {
+            // Publish under the pin: `reserved` (and its WriterPin) is held
+            // across the exchange so a concurrent drain cannot recycle the
+            // segment between define and publish (item 7d, H2).
             if self
                 .hashtable
                 .cas_location(key, old_location, new_location, true)
@@ -340,6 +364,12 @@ impl Segcache {
                 #[cfg(feature = "metrics")]
                 ITEM_REPLACE.increment();
 
+                // Release the pin the instant publish succeeds, BEFORE remove_at
+                // (which can take a bucket `chain_lock`; holding a WriterPin
+                // across a `chain_lock` acquisition deadlocks a drainer waiting
+                // on `active_writers` under that lock — item 7d lock-order
+                // invariant).
+                drop(reserved);
                 let _ = self.segments.remove_at(
                     old_seg_id,
                     old_offset,
@@ -355,10 +385,12 @@ impl Segcache {
                 .is_none()
             {
                 // The entry genuinely no longer maps to old_location
-                // (replaced, relocated, or removed) — roll back.
+                // (replaced, relocated, or removed) — roll back the
+                // (unpublished) reservation. Release the pin before remove_at.
+                drop(reserved);
                 let _ = self.segments.remove_at(
-                    reserved.seg(),
-                    reserved.offset(),
+                    new_seg,
+                    new_offset,
                     &self.ttl_buckets,
                     &self.hashtable,
                 );
@@ -472,6 +504,9 @@ impl Segcache {
         // fails with `Exists` (fail-safe) where it previously succeeded
         // through the plain insert.
         let reserved = self.reserve_and_define(key, value, optional, ttl)?;
+        // `reserved` (and its WriterPin) is handed to `replace_at` by value and
+        // stays alive there until publish — never dropped/destructured here
+        // before the hashtable exchange (item 7d, H2).
         self.replace_at(key, location, reserved)
     }
 
@@ -704,5 +739,12 @@ impl Segcache {
         let reserved =
             self.reserve_and_define(key, Value::U64(parsed), &opt_buf[..olen], seg_ttl)?;
         self.replace_at(key, location, reserved)
+    }
+
+    /// Test-only access to the segment collection, for asserting on segment
+    /// headers (e.g. `active_writers()`) after write operations return.
+    #[cfg(test)]
+    pub(crate) fn segments_for_test(&self) -> &Segments {
+        &self.segments
     }
 }

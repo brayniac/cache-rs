@@ -12,16 +12,17 @@
 //! │  CREATE AT   │   MERGE AT   │     TTL      │  REF COUNT   │
 //! │ AtomicInstant│ AtomicInstant│  AtomicU32   │  AtomicU32   │
 //! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
-//! ├──────────────┴──────────────┼──────┬──┬────┴──────────────┤
-//! │          METADATA           │ GEN  │PL│      PADDING      │
-//! │          AtomicU64          │ 16b  │8b│       40 bit      │
-//! ├─────────────────────────────┴──────┴──┴───────────────────┤
+//! ├──────────────┴──────────────┼──────┬──┬──┬────────────────┤
+//! │          METADATA           │ GEN  │PL│PD│ ACTIVE WRITERS │
+//! │          AtomicU64          │ 16b  │8b│8b│  AtomicU32/32b │
+//! ├─────────────────────────────┴──────┴──┴──┴────────────────┤
 //! │                        PADDING                            │
 //! │                        128 bit                            │
 //! └───────────────────────────────────────────────────────────┘
 //!
 //! METADATA = [8 unused][8 state][24 prev][24 next] (see segments::state)
 //! GEN = generation (AtomicU16)   PL = SegmentPool (AtomicU8)
+//! PD = 8-bit alignment pad before ACTIVE WRITERS (AtomicU32)
 //! Total: 512 bits = 64 bytes = 1 cache line
 //! ```
 //!
@@ -73,7 +74,9 @@ impl SegmentPool {
 /// 32       8    metadata      (AtomicU64: state + prev + next)
 /// 40       2    generation    (AtomicU16, bumped on reserve)
 /// 42       1    pool          (AtomicU8, SegmentPool)
-/// 43      21    _pad
+/// 43       1    (implicit alignment pad before active_writers)
+/// 44       4    active_writers (AtomicU32, in-flight reserve/write pins)
+/// 48      13    _pad          (+3 implicit trailing bytes to align(64) → 64)
 /// ```
 #[repr(C, align(64))]
 pub(crate) struct SegmentHeader {
@@ -88,7 +91,8 @@ pub(crate) struct SegmentHeader {
     metadata: AtomicU64,
     generation: AtomicU16,
     pool: AtomicU8,
-    _pad: [u8; 21],
+    active_writers: AtomicU32,
+    _pad: [u8; 13],
 }
 
 // Loom atomics are larger than std atomics, so skip size check under loom.
@@ -118,7 +122,8 @@ impl SegmentHeader {
             metadata: AtomicU64::new(Metadata::new_free().pack()),
             generation: AtomicU16::new(0),
             pool: AtomicU8::new(SegmentPool::Main as u8),
-            _pad: [0; 21],
+            active_writers: AtomicU32::new(0),
+            _pad: [0; 13],
         }
     }
 
@@ -378,6 +383,56 @@ impl SegmentHeader {
     #[inline]
     pub fn ref_count_seqcst(&self) -> u32 {
         self.ref_count.load(Ordering::SeqCst)
+    }
+
+    // -- Writer pinning --
+
+    /// Try to pin this segment for writing (a reserve→define→publish in
+    /// flight), the exact mirror of [`Self::try_acquire_reader`]: check the
+    /// state is writable, increment `active_writers`, then re-check. If the
+    /// segment was sealed/claimed between the two checks, back out and fail so
+    /// the reserver re-reads the tail instead of writing into a segment a drain
+    /// is about to parse.
+    ///
+    /// The `fetch_add` + re-check `SeqCst` pair is the writer half of the Dekker
+    /// pair with the drain/evict claim (`cas state -> Draining` then load
+    /// `active_writers`). AcqRel would permit both sides to observe the other's
+    /// stale value — the reserver seeing `Live` while the claimer sees zero
+    /// writers — which is exactly the parse-undefined-region hazard (spec H1).
+    /// loom cannot verify this distinction (see `try_acquire_reader`).
+    #[inline]
+    pub fn try_pin_writer(&self) -> bool {
+        if !self.metadata(Ordering::Acquire).state.is_writable() {
+            return false;
+        }
+        self.active_writers.fetch_add(1, Ordering::SeqCst);
+        if !self.metadata(Ordering::SeqCst).state.is_writable() {
+            // Backout uses Release, not SeqCst (the design spec's pseudocode
+            // writes SeqCst): this pin never became visible to a claimer that
+            // acted on it — the SeqCst re-check above just proved the segment
+            // left the writable state — so unwinding it needs no place in the
+            // SC total order. Mirrors `try_acquire_reader`'s backout.
+            self.active_writers.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// Release a writer pin taken with [`Self::try_pin_writer`]. SeqCst mirrors
+    /// `release_reader_for_guard`; it is the store half the drain/evict wait
+    /// (`active_writers` load) pairs against.
+    #[inline]
+    pub fn release_writer(&self) {
+        let prev = self.active_writers.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(prev > 0, "release_writer without matching pin");
+    }
+
+    /// Number of reservers mid-(reserve→define→publish) on this segment,
+    /// ordered after a preceding SeqCst claim CAS (the claimer half of the
+    /// Dekker pair).
+    #[inline]
+    pub fn active_writers(&self) -> u32 {
+        self.active_writers.load(Ordering::SeqCst)
     }
 
     // -- Identity --
@@ -833,6 +888,76 @@ mod loom_tests {
         });
     }
 
+    // Writers race a drain claim: the writer's fetch_add+recheck SeqCst pair
+    // mirrors try_acquire_reader; the claimer's CAS+active_writers() load
+    // mirrors the drain CAS + ref_count_seqcst() load in the model above.
+    // Same limitation applies (see module NOTE): the message-passing
+    // property this pair exists for — a claimer that has committed the
+    // drain is never raced by a writer still mid-pin — is SC-dependent and
+    // NOT asserted here; the claimer's single post-CAS observation of
+    // `active_writers()` is recorded, not asserted on. Unlike the reader
+    // model's `ref_count_seqcst()` check — which IS branched into a
+    // revert-on-race — production's writer-drain claim does not revert; it
+    // spins until writers drain (`claim_for_drain` / `drain_chain`), so a
+    // single discarded observation is the faithful message-passing shape
+    // here. (`committed` accordingly means only "the claim CAS won", not
+    // "drain confirmed safe" as in the reader model — harmless since it is
+    // never asserted on.) What IS asserted is the SC-independent invariant:
+    // every `try_pin_writer` call, whether it succeeds or backs out, is
+    // exactly balanced by a `release_writer` in every interleaving loom
+    // explores — no leaked or underflowed pin count. The SeqCst mutual
+    // exclusion itself is pinned by `concurrent_reservers_vs_drain_same_bucket`
+    // (stress test) and `claim_for_drain_waits_for_active_writers`
+    // (deterministic), not by loom.
+    #[test]
+    fn loom_writers_vs_cas_gated_drain() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            header.set_state(State::Live);
+            let committed = Arc::new(LoomAtomicU32::new(0));
+
+            let writers: Vec<_> = (0..2)
+                .map(|_| {
+                    let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
+                    thread::spawn(move || {
+                        if h.try_pin_writer() {
+                            // SC-dependent property recorded, not asserted
+                            // (see comment above and module NOTE).
+                            let _ = c.load(Ordering::SeqCst);
+                            h.release_writer();
+                        }
+                    })
+                })
+                .collect();
+
+            let claimer = {
+                let h = Arc::clone(&header);
+                let c = Arc::clone(&committed);
+                thread::spawn(move || {
+                    if h.cas_metadata(State::Live, State::Draining, None, None, Ordering::SeqCst) {
+                        // Single post-CAS observation, mirroring the reader
+                        // model's one recheck rather than a spin-wait: not
+                        // asserted on (SC-dependent), just exercised.
+                        let _ = h.active_writers();
+                        c.store(1, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            for w in writers {
+                w.join().unwrap();
+            }
+            claimer.join().unwrap();
+
+            // SC-independent: no interleaving leaves a pin dangling or
+            // double-releases one.
+            assert_eq!(header.active_writers(), 0);
+        });
+    }
+
     // Two writers CAS-reserve space from the same segment: both fit, so
     // the final state is fully determined regardless of interleaving —
     // the grants are exactly {base, base+24} and the offset lands at
@@ -955,5 +1080,43 @@ mod tests {
         assert_eq!(h.try_reserve_space(i32::MAX, i32::MAX), None);
         // a failed reservation must not advance the offset
         assert_eq!(h.write_offset(), base + 8);
+    }
+
+    #[test]
+    fn writer_pin_two_phase() {
+        use crate::segments::state::{Metadata, State};
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+
+        // A fresh header is Free — not writable, so the pin is refused and the
+        // counter is left untouched (the post-increment backout ran).
+        assert!(!h.try_pin_writer());
+        assert_eq!(h.active_writers(), 0);
+
+        // Make it Live: try_pin_writer now succeeds and bumps the counter.
+        h.store_metadata_for_test(Metadata {
+            next: None,
+            prev: None,
+            state: State::Live,
+        });
+        assert!(h.try_pin_writer());
+        assert_eq!(h.active_writers(), 1);
+
+        // A second concurrent writer also pins.
+        assert!(h.try_pin_writer());
+        assert_eq!(h.active_writers(), 2);
+
+        // Releasing brings it back down.
+        h.release_writer();
+        h.release_writer();
+        assert_eq!(h.active_writers(), 0);
+
+        // Once Sealed the segment is no longer writable — pin refused, counter untouched.
+        h.store_metadata_for_test(Metadata {
+            next: None,
+            prev: None,
+            state: State::Sealed,
+        });
+        assert!(!h.try_pin_writer());
+        assert_eq!(h.active_writers(), 0);
     }
 }

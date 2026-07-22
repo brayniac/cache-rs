@@ -526,6 +526,8 @@ fn get_free_seg() {
 
 #[test]
 fn try_alloc_item_bounds_and_grants() {
+    use crate::segments::AllocOutcome;
+
     let segments = SegmentsBuilder::default()
         .segment_size(4096)
         .heap_size(4096 * 4)
@@ -533,24 +535,86 @@ fn try_alloc_item_bounds_and_grants() {
         .expect("build segments");
 
     let id = segments.reserve_free().expect("free segment");
+    // `try_alloc_item` now pins a writer, which requires the Live state
+    // (mirroring the `reserve()` caller, which only calls it once the tail
+    // is writable) — a freshly reserved segment starts in `Reserved`.
+    segments.header(id).set_state(State::Live);
 
     // live_bytes starts at the initial offset (0, or 8 with `integrity`)
     let live_bytes_before = segments.header(id).live_bytes();
 
     // grants are sequential and within capacity
-    let a = segments.try_alloc_item(id, 64).expect("first alloc");
-    let b = segments.try_alloc_item(id, 64).expect("second alloc");
+    let a = match segments.try_alloc_item(id, 64) {
+        AllocOutcome::Reserved(r) => r,
+        other => panic!("expected Reserved, got {other:?}"),
+    };
+    let b = match segments.try_alloc_item(id, 64) {
+        AllocOutcome::Reserved(r) => r,
+        other => panic!("expected Reserved, got {other:?}"),
+    };
     assert_eq!(b.offset(), a.offset() + 64);
     assert_eq!(a.seg(), id);
 
     // an oversized request fails and does not move the offset
     let before = segments.header(id).write_offset();
-    assert!(segments.try_alloc_item(id, 4096).is_none());
+    assert!(matches!(
+        segments.try_alloc_item(id, 4096),
+        AllocOutcome::Full
+    ));
     assert_eq!(segments.header(id).write_offset(), before);
 
     // live statistics track successful grants only
     assert_eq!(segments.header(id).live_items(), 2);
     assert_eq!(segments.header(id).live_bytes(), live_bytes_before + 128);
+}
+
+// try_alloc_item now pins a writer (Dekker pair, item 7d): the pin is held
+// only across the reserve→publish window and must be released whether the
+// call grants space (Reserved, dropped by the caller) or finds the segment
+// full (Full, dropped internally before returning) — never leaked.
+#[test]
+fn try_alloc_item_pins_writer_until_dropped() {
+    use crate::segments::AllocOutcome;
+
+    let segments = SegmentsBuilder::default()
+        .segment_size(4096)
+        .heap_size(4096 * 4)
+        .build()
+        .expect("build segments");
+
+    let seg = segments.reserve_free().expect("free segment");
+    segments.header(seg).set_state(State::Live);
+
+    assert_eq!(segments.header(seg).active_writers(), 0);
+
+    match segments.try_alloc_item(seg, 64) {
+        AllocOutcome::Reserved(r) => {
+            assert_eq!(
+                segments.header(seg).active_writers(),
+                1,
+                "pinned while reserved"
+            );
+            drop(r);
+            assert_eq!(segments.header(seg).active_writers(), 0, "released on drop");
+        }
+        other => panic!("expected Reserved, got {other:?}"),
+    }
+
+    // Fill the segment so the next alloc returns Full, and assert the pin
+    // is released (not leaked) on the Full path.
+    let seg_size = segments.segment_size();
+    loop {
+        match segments.try_alloc_item(seg, seg_size / 4) {
+            AllocOutcome::Reserved(r) => drop(r),
+            AllocOutcome::Full => break,
+            AllocOutcome::NotWritable => panic!("unexpected NotWritable while Live"),
+        }
+    }
+    assert_eq!(
+        segments.header(seg).active_writers(),
+        0,
+        "Full path must not leak a pin"
+    );
 }
 
 #[test]
@@ -1871,4 +1935,42 @@ fn concurrent_readers_see_correct_values() {
         .insert(b"post", b"ok", None, Duration::ZERO)
         .expect("insert after concurrent reads");
     assert!(cache.get(b"post").unwrap().value() == *b"ok".as_slice());
+}
+
+// Item 7d: every reserve pins its segment (WriterPin, carried by
+// ReservedItem); every write must RELEASE that pin before returning. Run the
+// real public write paths — insert (fresh and replace), cas, and delete — and
+// assert no segment is left with a stuck writer pin afterward.
+//
+// Scope: this is a LEAK check, not an ordering check. Single-threaded and
+// `&mut`, with Rust's drop-at-end-of-scope, it catches a pin that is never
+// released — forgotten (`mem::forget`), stashed somewhere that outlives the
+// call, or dropped on a path that skips the release. It CANNOT distinguish a
+// pin dropped just before publish from one dropped just after: both leave
+// `active_writers == 0` by the time this samples the quiesced end state. The
+// H2 ordering guarantee (the pin actually SPANS publish, so a racing drain
+// can't recycle mid-write) is enforced by the concurrent reserver-vs-drain
+// test in `eviction_concurrency_tests.rs`, which has a real racing thread.
+#[test]
+fn writer_pins_released_after_write_ops() {
+    let mut cache = Segcache::builder().build().expect("failed to create cache");
+
+    cache
+        .insert(b"k1", b"v1", None, Duration::from_secs(60))
+        .unwrap();
+    cache
+        .insert(b"k1", b"v2", None, Duration::from_secs(60))
+        .unwrap(); // replace path
+    let cur = cache.get(b"k1").unwrap().cas();
+    cache
+        .cas(b"k1", b"v3", None, Duration::from_secs(60), cur)
+        .unwrap(); // cas path
+    cache.delete(b"k1");
+
+    // Every reserve pinned its segment; every publish/rollback path must have
+    // released it. No segment may retain a writer pin once the calls return
+    // (item 7d, H2: the pin spans publish, then drops).
+    for h in cache.segments_for_test().iter_headers_for_test() {
+        assert_eq!(h.active_writers(), 0, "leaked writer pin after write ops");
+    }
 }

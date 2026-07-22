@@ -77,6 +77,18 @@ pub(crate) enum ClearOutcome {
     Deferred,
 }
 
+/// Outcome of a pinned allocation attempt on a specific tail segment.
+#[derive(Debug)]
+pub(crate) enum AllocOutcome {
+    /// Space granted; the item is pinned (`WriterPin` inside).
+    Reserved(ReservedItem),
+    /// Segment is `Live` but full — the caller should expand the chain.
+    Full,
+    /// Segment is no longer writable (raced a seal/claim) — the caller should
+    /// re-read the tail rather than expand.
+    NotWritable,
+}
+
 impl Segments {
     /// Allocate and initialize segments by consuming the builder. The backing
     /// heap is an anonymous mmap region instead of a boxed slice so that large
@@ -245,6 +257,13 @@ impl Segments {
         &self.headers[id.get() as usize - 1]
     }
 
+    /// Iterate every segment header, for asserting global invariants (e.g.
+    /// no leaked writer pins) after a sequence of operations.
+    #[cfg(test)]
+    pub(crate) fn iter_headers_for_test(&self) -> impl Iterator<Item = &SegmentHeader> {
+        self.headers.iter()
+    }
+
     /// Returns a segment's creation time and TTL, read directly from the
     /// header — no `Segment` view construction or magic-byte check, since
     /// this sits on the numeric-op hot path.
@@ -303,9 +322,12 @@ impl Segments {
         Some((raw, guard))
     }
 
-    /// Atomically reserve space for an item in the given segment,
-    /// returning a `ReservedItem` for the granted region. `None` means
-    /// the segment is full — the caller should expand the chain.
+    /// Atomically reserve space for an item in the given segment, pinning
+    /// it as a writer for the reserve→publish window (item 7d's Dekker
+    /// pair). Returns an `AllocOutcome`: `Reserved` on a granted region,
+    /// `Full` if the segment is `Live` but out of space (caller should
+    /// expand the chain), or `NotWritable` if the segment stopped being
+    /// writable (raced a seal/claim — caller should re-read the tail).
     ///
     /// Takes `&self`: the reservation is a header CAS and the item
     /// pointer is derived from the data base pointer, the same pattern
@@ -314,18 +336,23 @@ impl Segments {
     /// The `integrity` magic-byte check is intentionally skipped here
     /// (hot path); the debug-feature `check_integrity` scan covers it,
     /// the same idiom as `expiry_info`.
-    ///
-    /// SCOPE(writer-vs-drain): the reserve→define→publish window is not
-    /// yet protected against a concurrent drain of this segment. Safe
-    /// today because eviction and writers are serialized by `&mut
-    /// Segcache`. Drain-safe merge (item 5b) made eviction itself
-    /// reader-safe (no more in-place compaction of readable segments) but
-    /// does not close this writer-vs-drain hazard; that protocol is
-    /// deferred past 5b to item 7.
-    pub(crate) fn try_alloc_item(&self, seg_id: NonZeroU32, size: i32) -> Option<ReservedItem> {
+    pub(crate) fn try_alloc_item(&self, seg_id: NonZeroU32, size: i32) -> AllocOutcome {
         debug_assert!(seg_id.get() <= self.cap);
         let header = self.header(seg_id);
-        let offset = header.try_reserve_space(size, self.segment_size)?;
+
+        // Writer half of the Dekker pair (item 7d): pin before touching
+        // write_offset, and bail if the segment stopped being writable.
+        if !header.try_pin_writer() {
+            return AllocOutcome::NotWritable;
+        }
+        // SAFETY: try_pin_writer returned true; the headers allocation outlives
+        // this pin (the ReservedItem is consumed within the caller's insert/cas).
+        let pin = unsafe { WriterPin::new(header as *const _) };
+
+        let offset = match header.try_reserve_space(size, self.segment_size) {
+            Some(offset) => offset,
+            None => return AllocOutcome::Full, // pin dropped here → released
+        };
 
         header.incr_live_items();
         header.incr_live_bytes(size);
@@ -344,10 +371,11 @@ impl Segments {
         // `offset + size <= segment_size`, so the granted region lies
         // inside this segment's slice of the data mmap.
         let ptr = unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) };
-        Some(ReservedItem::new(
+        AllocOutcome::Reserved(ReservedItem::new(
             RawItem::from_ptr(ptr),
             seg_id,
             offset as usize,
+            pin,
         ))
     }
 
@@ -381,10 +409,16 @@ impl Segments {
     /// select the same `Sealed` candidate cannot both derive `&mut` to it — the
     /// loser's `claim_for_drain` returns false and it skips.
     ///
-    /// The ONE race this does NOT cover — a reserver writing the `Live` tail
-    /// while an evictor drains that same segment — is deferred to item 7d
-    /// (generation in the seal CAS + guarding the reserve->publish window); see
-    /// the `SCOPE(writer-vs-drain)` comments.
+    /// The reserver-vs-drain race on a `Live` tail is closed by item 7d: a
+    /// reserver pins the segment as a writer (`try_pin_writer`, incrementing
+    /// `active_writers`) across its whole reserve→define→publish window, and
+    /// every parse site (`drain_chain`, `claim_for_drain`) waits for
+    /// `active_writers == 0` after winning its state CAS — the claimer half of
+    /// the same SeqCst Dekker pair the reader pin uses. So a drain never parses
+    /// a reserved-but-undefined region (H1), and a reserver never writes or
+    /// publishes into a recycled segment (H2). The seal itself re-checks the
+    /// tail's generation under `chain_lock` before firing (H3), so a recycled,
+    /// reused tail is never sealed.
     pub(crate) fn segment(&self, id: NonZeroU32) -> Result<Segment<'_>, SegmentsError> {
         let idx = id.get() as usize - 1;
         if idx < self.headers.len() {
@@ -727,15 +761,36 @@ impl Segments {
     fn claim_for_drain(&self, id: NonZeroU32) -> bool {
         let id_idx = id.get() as usize - 1;
 
-        // SeqCst: writer half of the Dekker pair with try_acquire_reader
+        // SeqCst: claimer half of the Dekker pair with try_acquire_reader
         // (transition the state, then observe the reader count).
-        self.headers[id_idx].cas_metadata(
+        let won = self.headers[id_idx].cas_metadata(
             State::Sealed,
             State::Draining,
             None,
             None,
             Ordering::SeqCst,
-        )
+        );
+
+        if won {
+            // Writer half already ran its SeqCst pin+recheck: any reserver that
+            // observed Live before our CAS is counted here; any that increments
+            // after sees Draining and bails. Wait for the counted ones to finish
+            // define+publish before we parse the item stream (item 7d, H1/H2).
+            // Bounded: a pinned writer is straight-line define+publish.
+            while self.headers[id_idx].active_writers() != 0 {
+                std::hint::spin_loop();
+            }
+        }
+        won
+    }
+
+    /// Test-only shim exposing the private `claim_for_drain` claim CAS + wait,
+    /// so `eviction_concurrency_tests` can exercise it directly without
+    /// widening the production method's visibility.
+    #[cfg(test)]
+    #[allow(dead_code)] // caller `eviction_concurrency_tests` is cfg'd out under loom
+    pub(crate) fn claim_for_drain_for_test(&self, id: NonZeroU32) -> bool {
+        self.claim_for_drain(id)
     }
 
     /// Finalize a segment this thread has already claimed (it is `Draining`,

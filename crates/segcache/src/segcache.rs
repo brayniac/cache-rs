@@ -21,14 +21,17 @@ pub struct Segcache {
     pub(crate) ttl_buckets: TtlBuckets,
 }
 
-// Compile-time guard: Segcache must be Sync so &Segcache can be shared across
-// threads for concurrent reads (item 7b). This relies on auto-derive — the
-// hashtable carries its own `unsafe impl Send + Sync` for its raw-pointer
-// internals, and every other field is a Sync type (anonymous mmap, atomic
-// headers, lock-free Injector queues, Xoshiro RNG, atomic TTL-bucket links).
-// A future !Sync field breaks the build here rather than silently at 7e.
+// Compile-time guard: Segcache must be Send + Sync so Arc<Segcache> can be
+// shared across threads for concurrent reads AND writes (item 7e). This
+// relies on auto-derive — the hashtable carries its own `unsafe impl Send +
+// Sync` for its raw-pointer internals, and every other field is a Send + Sync
+// type (anonymous mmap, atomic headers, lock-free Injector queues, Xoshiro
+// RNG, atomic TTL-bucket links). A future !Send or !Sync field breaks the
+// build here rather than silently at 7e.
 const _: () = {
+    fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
+    let _ = assert_send::<Segcache>;
     let _ = assert_sync::<Segcache>;
 };
 
@@ -151,7 +154,7 @@ impl Segcache {
     /// assert_eq!(item.value(), b"whisky");
     /// ```
     pub fn insert<'a, T: Into<Value<'a>>>(
-        &mut self,
+        &self,
         key: &'a [u8],
         value: T,
         optional: Option<&[u8]>,
@@ -227,7 +230,7 @@ impl Segcache {
     // boundary was forced away; #[inline] alone did not recover it.
     #[inline(always)]
     fn reserve_and_define(
-        &mut self,
+        &self,
         key: &[u8],
         value: Value,
         optional: &[u8],
@@ -326,7 +329,7 @@ impl Segcache {
     /// `old_location`, the reservation is rolled back and `Exists` is
     /// returned.
     fn replace_at(
-        &mut self,
+        &self,
         key: &[u8],
         old_location: Location,
         reserved: ReservedItem,
@@ -416,7 +419,7 @@ impl Segcache {
     /// effectively-non-expiring counters stay effectively non-expiring.
     /// The zero check below is defensive (linked segments always carry a
     /// bucket TTL >= 1s).
-    fn remaining_ttl(&mut self, seg_id: NonZeroU32) -> Result<Duration, SegcacheError> {
+    fn remaining_ttl(&self, seg_id: NonZeroU32) -> Result<Duration, SegcacheError> {
         let (create_at, ttl) = self.segments.expiry_info(seg_id);
         if ttl.as_secs() == 0 {
             return Ok(Duration::from_secs(0));
@@ -459,7 +462,7 @@ impl Segcache {
     /// assert_eq!(item.value(), b"whisky"); // item is updated
     /// ```
     pub fn cas<'a, T: Into<Value<'a>>>(
-        &mut self,
+        &self,
         key: &'a [u8],
         value: T,
         optional: Option<&[u8]>,
@@ -527,7 +530,7 @@ impl Segcache {
     /// assert!(cache.get(b"coffee").is_none());
     /// ```
     // TODO(bmartin): a result would be better here
-    pub fn delete(&mut self, key: &[u8]) -> bool {
+    pub fn delete(&self, key: &[u8]) -> bool {
         // Look up the item to get its location
         let verifier = self.verifier();
         let (location, _freq) = match self.hashtable.lookup_no_freq_update(key, &verifier) {
@@ -584,7 +587,7 @@ impl Segcache {
     /// Returns the number of segments actually freed. Segments pinned by
     /// outstanding [`Item`]s are drained from the hashtable but not freed
     /// (and not counted) until a later pass runs after the pins drop.
-    pub fn expire(&mut self) -> usize {
+    pub fn expire(&self) -> usize {
         self.ttl_buckets.expire(&self.hashtable, &self.segments)
     }
 
@@ -593,7 +596,7 @@ impl Segcache {
     /// Returns the number of segments actually freed. Segments pinned by
     /// outstanding [`Item`]s are drained but not freed (and not counted)
     /// until a later pass runs after the pins drop.
-    pub fn clear(&mut self) -> usize {
+    pub fn clear(&self) -> usize {
         self.ttl_buckets.clear(&self.hashtable, &self.segments)
     }
 
@@ -622,7 +625,7 @@ impl Segcache {
     /// Returns the new value, as memcached's incr does. Held `Item`s
     /// alias the same memory and observe updates (seqlock-consistent,
     /// never torn).
-    pub fn wrapping_add(&mut self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
+    pub fn wrapping_add(&self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
         self.numeric_update(key, |raw| raw.fetch_wrapping_add(rhs))
     }
 
@@ -632,7 +635,7 @@ impl Segcache {
     ///
     /// See [`Self::wrapping_add`] for the update and CAS-token semantics.
     /// Returns the new value.
-    pub fn saturating_sub(&mut self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
+    pub fn saturating_sub(&self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
         self.numeric_update(key, |raw| raw.fetch_saturating_sub(rhs))
     }
 
@@ -650,7 +653,7 @@ impl Segcache {
     ///
     /// Returns the value this call published.
     fn numeric_update(
-        &mut self,
+        &self,
         key: &[u8],
         op: impl Fn(&RawItem) -> Result<u64, keyvalue::NotNumericError>,
     ) -> Result<u64, SegcacheError> {
@@ -696,7 +699,7 @@ impl Segcache {
     /// Composes with [`Self::wrapping_add`]/[`Self::saturating_sub`] to
     /// implement memcached-style incr-with-initial at a protocol layer.
     pub fn try_into_numeric(
-        &mut self,
+        &self,
         key: &[u8],
         initial: u64,
         ttl: std::time::Duration,

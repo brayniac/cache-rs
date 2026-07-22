@@ -1366,3 +1366,697 @@ fn concurrent_mixed_public_api() {
         .check_integrity()
         .expect("integrity after concurrent mixed workload");
 }
+
+/// Test 6 — Concurrent reader-vs-eviction PIN SAFETY over the shared `&self`
+/// public API (roadmap item 7e; closes the item-5b deferral).
+///
+/// Item 5b ("drain-safe merge") could only be tested single-threaded: the
+/// merge's gates (`merge_evict_chain_len`, then `can_evict`) observe any
+/// *pre-existing* pin and bail before touching that segment, so a
+/// single-threaded test can never distinguish copy-to-spare from in-place
+/// compaction — the racing-pin window (a reader pin arriving AFTER the gate
+/// check, while copy-to-spare is mid-flight) requires real concurrency. Now
+/// that the public API is `&self` / `Arc<Segcache>`-shareable (7a-7e), this
+/// test drives that exact race: a reader thread HOLDS a `get()` result (an
+/// `Item` carrying a `SegmentGuard` reader pin) and reads its bytes WHILE
+/// writer threads force eviction/merge of whatever segment the reader may be
+/// pinning.
+///
+/// - A hot key `"hot"` is rewritten repeatedly by `WRITERS` threads with
+///   distinct, byte-checkable values `H{writer:02}{ctr:06}` (9 bytes),
+///   seeded once before any thread spawns. Reader threads' own `get()` calls
+///   bump its hashtable frequency counter — exactly what keeps Merge copying
+///   it FORWARD as a survivor rather than pruning it, so its segment is
+///   repeatedly a copy-to-spare target while a reader may be pinning it: the
+///   5b race.
+/// - Filler keys (`ckey`/`cval`, a disjoint numeric range per writer) drive
+///   real segment turnover so the hot key's segment is repeatedly a merge
+///   candidate rather than sitting untouched.
+/// - The reader loop is bounded by BOTH a stop flag (set only after every
+///   writer thread has joined) AND an iteration cap, so it can never hang.
+///
+/// The load-bearing assertion: every byte slice read out of a LIVE PIN must
+/// be a legal hot value. A torn/aliased read (copy-to-spare relocating bytes
+/// out from under a racing reader pin) would fail `is_legal_hot_value` — that
+/// is a genuine 5b regression, not a flaky test; per the task, such a failure
+/// must be reported, not weakened away.
+#[test]
+fn concurrent_reader_vs_eviction_pin_safety() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const KEY_LEN: usize = 7;
+    const VAL_LEN: usize = 7;
+    const WRITERS: usize = 3;
+    const READERS: usize = 2;
+    const WRITER_ITERS: usize = 3000;
+    const FILLER_POOL: usize = 64;
+    const READER_CAP: usize = 500_000;
+
+    let sample_val = cval(0);
+    assert_eq!(sample_val.len(), VAL_LEN);
+    assert_eq!(ckey(0).len(), KEY_LEN);
+
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(sample_val.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // 16 fillable segments + 1 held-back spare (Merge) — small enough that
+    // writer churn forces real eviction/merge passes, matching the sibling
+    // Merge tests (Test 1 / Test 5) rather than letting the pool just absorb
+    // everything.
+    let free_segments = 16usize;
+    let total_segments = free_segments + 1;
+
+    let cache = Arc::new(
+        Segcache::builder()
+            .segment_size(segment_size)
+            .heap_size(segment_size as usize * total_segments)
+            .hash_power(16)
+            .eviction(Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            })
+            .build()
+            .expect("failed to create cache"),
+    );
+
+    let ttl = Duration::from_secs(3600);
+
+    // A hot value is legal iff it parses as "H" + 2-digit writer (< WRITERS)
+    // + 6-digit counter. Classify raw bytes directly — NEVER slice a `str`
+    // at fixed offsets here: a torn/aliased read can be valid UTF-8 with a
+    // multibyte codepoint straddling the boundary, which would panic ("not a
+    // char boundary") instead of cleanly reporting the corruption this check
+    // exists to catch.
+    let is_legal_hot_value = |v: Value| -> bool {
+        let Value::Bytes(b) = v else {
+            return false;
+        };
+        if b.len() != 9 || b[0] != b'H' || !b[1..].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let writer = (b[1] - b'0') as usize * 10 + (b[2] - b'0') as usize;
+        writer < WRITERS
+    };
+
+    // Seed the hot key once, before any thread spawns (writer 0, ctr 0 — a
+    // value already legal under `is_legal_hot_value`).
+    let seed_val = format!("H{:02}{:06}", 0, 0);
+    cache
+        .insert(b"hot", seed_val.as_bytes(), None, ttl)
+        .expect("seed insert of the hot key must succeed");
+    assert!(
+        cache.get(b"hot").is_some(),
+        "seeded hot key must resolve before spawning"
+    );
+
+    let stop = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        let mut writer_handles = Vec::with_capacity(WRITERS);
+        for t in 0..WRITERS {
+            let cache = Arc::clone(&cache);
+            writer_handles.push(scope.spawn(move || {
+                for ctr in 0..WRITER_ITERS {
+                    let hot_val = format!("H{t:02}{ctr:06}");
+                    let _ = cache.insert(b"hot", hot_val.as_bytes(), None, ttl);
+
+                    // Filler insert drives segment turnover. Disjoint
+                    // per-writer numeric range (t*100_000 + ...) so no two
+                    // writer threads ever touch the same filler key.
+                    let fi = t * 100_000 + (ctr % FILLER_POOL);
+                    let _ = cache.insert(ckey(fi).as_bytes(), cval(fi).as_bytes(), None, ttl);
+                }
+            }));
+        }
+
+        let mut reader_handles = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let cache = Arc::clone(&cache);
+            let stop = &stop;
+            reader_handles.push(scope.spawn(move || {
+                let mut iters = 0usize;
+                // Bounded by a stop flag AND an iteration cap — belt and
+                // suspenders so this loop can never hang regardless of
+                // scheduling.
+                while !stop.load(Ordering::Relaxed) && iters < READER_CAP {
+                    if let Some(item) = cache.get(b"hot") {
+                        // The load-bearing 5b check: bytes read WHILE THE
+                        // PIN IS HELD must always be a legal hot value.
+                        let ok = is_legal_hot_value(item.value());
+                        assert!(ok, "torn/aliased read: {:?}", item.value());
+                        std::hint::spin_loop();
+                        drop(item);
+                    }
+                    iters += 1;
+                }
+            }));
+        }
+
+        // Writers run to completion (bounded), THEN signal the readers to
+        // stop.
+        for h in writer_handles {
+            h.join().expect("writer thread must not panic");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in reader_handles {
+            h.join().expect("reader thread must not panic");
+        }
+    });
+
+    // ── Whole-pool structural invariants after the storm.
+    let total = total_segments as u32;
+    let chained = assert_chains_well_formed(&cache.segments, &cache.ttl_buckets, total);
+    assert_no_leak(&cache.segments, &chained, total);
+
+    // No leaked pins: every segment's writer/reader pin counts must have
+    // unwound to zero once every thread has finished.
+    for raw in 1..=total {
+        let id = NonZeroU32::new(raw).unwrap();
+        let header = cache.segments.header(id);
+        assert_eq!(
+            header.active_writers(),
+            0,
+            "segment {raw} leaked a writer pin after concurrent reader-vs-eviction workload"
+        );
+        assert_eq!(
+            header.ref_count(),
+            0,
+            "segment {raw} leaked a reader pin after concurrent reader-vs-eviction workload"
+        );
+    }
+
+    // The hot key, if it still resolves post-storm, must carry a legal
+    // value.
+    if let Some(item) = cache.get(b"hot") {
+        assert!(
+            is_legal_hot_value(item.value()),
+            "post-storm illegal hot value: {:?}",
+            item.value()
+        );
+    }
+
+    #[cfg(feature = "debug")]
+    cache
+        .check_integrity()
+        .expect("integrity after concurrent reader-vs-eviction workload");
+}
+
+// ── Concurrent write-correctness stress tests (roadmap item 7f, Task 6) ───
+//
+// Item 7f fixed a concurrent-write bug: an insert-replace unlinking an old
+// item could double-decrement its segment's live-item count against a
+// racing eviction scan of the same segment (F1-F4: `try_pin_remover`
+// across the old item's unlink + `remove_at` decrement, waiting for
+// `active_removers == 0` before a drain claims a segment, and retrying the
+// same hashtable slot on a same-key CAS loss instead of publishing a
+// duplicate entry). The tests below drive that fixed path directly and
+// hard, over the shared `&self` PUBLIC API (`Segcache::insert` / `delete` /
+// `get`), under real eviction/merge pressure from a deliberately tiny pool.
+//
+// Every test SEEDS its shared key(s) single-threaded before spawning any
+// thread, so every concurrent op in the storm is an OVERWRITE (or a delete)
+// of an ALREADY-PUBLISHED key — never a fresh insert of a not-yet-existing
+// key. This is a deliberate scope boundary, not an oversight: concurrent
+// FRESH-key inserts (and the hashtable-full rollback path) have a separate,
+// already-tracked, narrow TRANSIENT-LEAK window (an item unlinked-but-not-
+// decremented, self-healing on recycle) that is NOT corruption and NOT the
+// crash 7f fixed. Pre-seeding keeps these tests deterministic and focused
+// on the overwrite/replace path that was actually broken.
+
+/// Test 7 — Concurrent same-key INSERT accounting (Task 6, Step 2).
+///
+/// `THREADS` threads hammer `insert` on a SMALL SHARED key set (`KEYS`
+/// keys, all one TTL bucket) under real eviction pressure from a
+/// deliberately tiny pool: `THREADS * ITERS` inserts land on only `KEYS`
+/// live keys, so free segments are exhausted almost immediately and
+/// `evict`/merge must run repeatedly to reclaim mostly-garbage sealed
+/// segments — this was confirmed empirically with a temporary
+/// `SEGMENT_EVICT` counter delta (thousands of evictions over one run); the
+/// instrumentation was removed once eviction engagement was verified.
+///
+/// Every key is seeded single-threaded first (see the module note above),
+/// so every concurrent insert below is an OVERWRITE of an
+/// already-published key — directly driving the pinned-replace path
+/// (`try_pin_remover` + `remove_at` under the pin) concurrently with itself
+/// and with the eviction scan on the very same keys' segments, i.e. exactly
+/// the `:223`/`:486` double-decrement scenario 7f fixed.
+///
+/// Values are self-describing (`H{writer:02}{ctr:06}`, 9 bytes — the same
+/// idiom as `concurrent_mixed_public_api` / `concurrent_reader_vs_eviction_pin_safety`
+/// above) so a resolved value can be checked for legal SHAPE without any
+/// shared bookkeeping. Post-join, asserts: no leak, no corruption, every
+/// pin type (writer / remover / reader) unwound to zero, every hammered key
+/// still resolves to a legal value, `items()` equals exactly `KEYS` (F4: no
+/// duplicate-publish explosion), and (`debug`) `check_integrity` passes.
+///
+/// Each writer thread also `get`s its just-written key once per iteration:
+/// without any reads, a key's hashtable frequency stays at 0 and the
+/// merge's low-frequency `prune` can delete it from the hashtable entirely
+/// (see `concurrent_overwrite_uniqueness_single_key`'s doc comment for the
+/// mechanism and the flake this exact fix resolved there) — which would
+/// turn the NEXT insert of that key into a fresh insert, sliding out of the
+/// overwrite-only scope this test targets. The periodic `get` keeps every
+/// key's freq > 0 so it always survives a merge as a copied-forward
+/// survivor, keeping every subsequent insert a genuine overwrite.
+#[test]
+fn concurrent_same_key_insert_accounting() {
+    use std::sync::Arc;
+
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const KEY_LEN: usize = 7; // ckey: "k" + 6 digits
+    const VAL_LEN: usize = 9; // "H" + 2-digit writer + 6-digit counter
+    const THREADS: usize = 4;
+    const KEYS: usize = 8;
+    const ITERS: usize = 3000;
+
+    let legal_seed = format!("H{:02}{:06}", 0, 0);
+    assert_eq!(ckey(0).len(), KEY_LEN);
+    assert_eq!(legal_seed.len(), VAL_LEN);
+
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(legal_seed.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // Deliberately tiny pool relative to the churn — see the doc comment
+    // above for the eviction-engagement rationale.
+    let free_segments = 3usize;
+    let total_segments = free_segments + 1; // + 1 held-back spare (Merge)
+
+    let cache = Arc::new(
+        Segcache::builder()
+            .segment_size(segment_size)
+            .heap_size(segment_size as usize * total_segments)
+            .hash_power(16)
+            .eviction(Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            })
+            .build()
+            .expect("failed to create cache"),
+    );
+
+    let ttl = Duration::from_secs(3600);
+
+    // A value is legal iff it parses as "H" + 2-digit writer (< THREADS) +
+    // 6-digit counter. Classify raw bytes directly — never slice a `str` at
+    // fixed offsets, since a torn/aliased read can be valid UTF-8 with a
+    // multibyte codepoint straddling the boundary.
+    let is_legal_value = |v: Value| -> bool {
+        let Value::Bytes(b) = v else {
+            return false;
+        };
+        if b.len() != VAL_LEN || b[0] != b'H' || !b[1..].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let writer = (b[1] - b'0') as usize * 10 + (b[2] - b'0') as usize;
+        writer < THREADS
+    };
+
+    // Seed every shared key SINGLE-THREADED before spawning (see the module
+    // note above): every concurrent op below is then an overwrite of an
+    // already-published key, never a fresh insert.
+    for k in 0..KEYS {
+        cache
+            .insert(ckey(k).as_bytes(), legal_seed.as_bytes(), None, ttl)
+            .expect("seed insert must succeed");
+    }
+    for k in 0..KEYS {
+        assert!(
+            cache.get(ckey(k).as_bytes()).is_some(),
+            "seeded key {k} must resolve before spawning"
+        );
+    }
+
+    std::thread::scope(|scope| {
+        for t in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            scope.spawn(move || {
+                for ctr in 0..ITERS {
+                    // Deterministic, well-mixed key selection — every
+                    // thread regularly revisits every shared key.
+                    let k = (t * 5 + ctr * 3) % KEYS;
+                    let val = format!("H{t:02}{ctr:06}");
+                    let _ = cache.insert(ckey(k).as_bytes(), val.as_bytes(), None, ttl);
+                    // Keep this key's hashtable frequency > 0 (see doc
+                    // comment above) so it always survives merge pruning as
+                    // a genuine overwrite target, never a fresh insert.
+                    let _ = cache.get(ckey(k).as_bytes());
+                }
+            });
+        }
+    });
+
+    // ── Whole-pool structural invariants (no leak, no corruption, nothing
+    //    stuck in Relinking).
+    let total = total_segments as u32;
+    let chained = assert_chains_well_formed(&cache.segments, &cache.ttl_buckets, total);
+    assert_no_leak(&cache.segments, &chained, total);
+
+    // No leaked pins of ANY kind — writers, removers (7f's new pin type),
+    // and readers — must all have unwound to zero.
+    for raw in 1..=total {
+        let id = NonZeroU32::new(raw).unwrap();
+        let header = cache.segments.header(id);
+        assert_eq!(
+            header.active_writers(),
+            0,
+            "segment {raw} leaked a writer pin after concurrent same-key insert storm"
+        );
+        assert_eq!(
+            header.active_removers(),
+            0,
+            "segment {raw} leaked a remover pin (item 7f) after concurrent same-key insert storm"
+        );
+        assert_eq!(
+            header.ref_count(),
+            0,
+            "segment {raw} leaked a reader pin after concurrent same-key insert storm"
+        );
+    }
+
+    // Every hammered key must still resolve (never deleted in this test) to
+    // a legal value written by SOME thread.
+    for k in 0..KEYS {
+        let item = cache
+            .get(ckey(k).as_bytes())
+            .unwrap_or_else(|| panic!("hammered key {k} must still resolve (never deleted)"));
+        assert!(
+            is_legal_value(item.value()),
+            "illegal/corrupted value at hammered key {k}: {:?}",
+            item.value()
+        );
+    }
+
+    // F4: no duplicate-entry explosion from the overwrite race — exactly
+    // one live item per key, never more.
+    assert_eq!(
+        cache.items(),
+        KEYS,
+        "live item count must equal the number of distinct keys — a duplicate \
+         publish on the overwrite path would inflate this"
+    );
+
+    #[cfg(feature = "debug")]
+    cache
+        .check_integrity()
+        .expect("cache must pass integrity check after concurrent same-key insert storm");
+}
+
+/// Test 8 — Concurrent mixed insert/delete/get on a SHARED, PRE-SEEDED key
+/// set under eviction (Task 6, Step 3).
+///
+/// Complements `concurrent_same_key_insert_accounting` (insert-only) by
+/// adding `delete` into the same-key race: `THREADS` threads apply a
+/// deterministic mix of insert/delete/get to a small shared, pre-seeded key
+/// set while the same tiny pool forces real eviction/merge churn. Deletes
+/// make presence genuinely racy (an insert can lose to a delete or vice
+/// versa), so — per the module's established idiom (`concurrent_mixed_public_api`)
+/// — this test asserts VALUE INTEGRITY of whatever resolves, never
+/// presence/absence: `insert`/`delete` results are ignored, and `get` is
+/// only checked when it returns `Some`.
+#[test]
+fn concurrent_insert_delete_evict() {
+    use std::sync::Arc;
+
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const KEY_LEN: usize = 7;
+    const VAL_LEN: usize = 9;
+    const THREADS: usize = 4;
+    const KEYS: usize = 8;
+    const OPS: usize = 4000;
+
+    let legal_seed = format!("H{:02}{:06}", 0, 0);
+    assert_eq!(ckey(0).len(), KEY_LEN);
+    assert_eq!(legal_seed.len(), VAL_LEN);
+
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(legal_seed.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    let free_segments = 3usize;
+    let total_segments = free_segments + 1;
+
+    let cache = Arc::new(
+        Segcache::builder()
+            .segment_size(segment_size)
+            .heap_size(segment_size as usize * total_segments)
+            .hash_power(16)
+            .eviction(Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            })
+            .build()
+            .expect("failed to create cache"),
+    );
+
+    let ttl = Duration::from_secs(3600);
+
+    let is_legal_value = |v: Value| -> bool {
+        let Value::Bytes(b) = v else {
+            return false;
+        };
+        if b.len() != VAL_LEN || b[0] != b'H' || !b[1..].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let writer = (b[1] - b'0') as usize * 10 + (b[2] - b'0') as usize;
+        writer < THREADS
+    };
+
+    // Seed every shared key single-threaded (see the module note above): so
+    // every concurrent insert below is an overwrite of an already-published
+    // key, and every concurrent delete initially targets a real entry
+    // rather than racing a not-yet-created one.
+    for k in 0..KEYS {
+        cache
+            .insert(ckey(k).as_bytes(), legal_seed.as_bytes(), None, ttl)
+            .expect("seed insert must succeed");
+    }
+
+    std::thread::scope(|scope| {
+        for t in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            scope.spawn(move || {
+                for i in 0..OPS {
+                    let k = (t * 5 + i * 3) % KEYS;
+                    let key = ckey(k);
+                    // Deterministic op selection from (t, i): roughly half
+                    // insert, a quarter delete, a quarter get.
+                    let op = (t * 31 + i * 17) % 4; // 0,1 insert; 2 delete; 3 get
+                    match op {
+                        0 | 1 => {
+                            let val = format!("H{t:02}{i:06}");
+                            let _ = cache.insert(key.as_bytes(), val.as_bytes(), None, ttl);
+                        }
+                        2 => {
+                            let _ = cache.delete(key.as_bytes());
+                        }
+                        _ => {
+                            if let Some(item) = cache.get(key.as_bytes()) {
+                                assert!(
+                                    is_legal_value(item.value()),
+                                    "illegal/corrupted value at key {k}: {:?}",
+                                    item.value()
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let total = total_segments as u32;
+    let chained = assert_chains_well_formed(&cache.segments, &cache.ttl_buckets, total);
+    assert_no_leak(&cache.segments, &chained, total);
+
+    for raw in 1..=total {
+        let id = NonZeroU32::new(raw).unwrap();
+        let header = cache.segments.header(id);
+        assert_eq!(
+            header.active_writers(),
+            0,
+            "segment {raw} leaked a writer pin after concurrent insert/delete/evict storm"
+        );
+        assert_eq!(
+            header.active_removers(),
+            0,
+            "segment {raw} leaked a remover pin (item 7f) after concurrent insert/delete/evict storm"
+        );
+        assert_eq!(
+            header.ref_count(),
+            0,
+            "segment {raw} leaked a reader pin after concurrent insert/delete/evict storm"
+        );
+    }
+
+    // Every key that still resolves — presence is racy under concurrent
+    // insert/delete/eviction, so only checked when `Some` — must carry a
+    // legal value.
+    for k in 0..KEYS {
+        if let Some(item) = cache.get(ckey(k).as_bytes()) {
+            assert!(
+                is_legal_value(item.value()),
+                "post-storm illegal/corrupted value at key {k}: {:?}",
+                item.value()
+            );
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    cache
+        .check_integrity()
+        .expect("cache must pass integrity check after concurrent insert/delete/evict storm");
+}
+
+/// Test 9 — F4 overwrite-uniqueness: no duplicate publish under a same-key
+/// insert race (Task 6, Step 4).
+///
+/// Isolates the F4 same-key-CAS-retry fix (Task 3) to a SINGLE pre-seeded
+/// hot key hammered purely by concurrent `insert` — no other keys exist in
+/// the cache — so the live-item count is an exact, unambiguous witness: if
+/// the matching-slot retry ever let two threads both publish a NEW
+/// hashtable entry for the same key (instead of the CAS-losing thread
+/// retrying against the winner's fresh location), `items()` would read
+/// `>= 2` and stay there once the storm settles. Pre-seeding keeps this on
+/// the overwrite path — the fresh-key duplicate-publish race is the
+/// separate, tracked, non-corrupting transient-leak window described in the
+/// module note above and is intentionally out of scope here.
+///
+/// Each writer thread also `get`s the hot key once per iteration (mirroring
+/// `concurrent_evictors_merge_policy` / `concurrent_reader_vs_eviction_pin_safety`
+/// above): this is NOT incidental — without it the key is never read, its
+/// hashtable frequency counter stays at 0, and the merge's low-frequency
+/// `prune` (see `Segments::merge_evict`) can delete it from the hashtable
+/// entirely during an eviction pass. Once pruned, the NEXT insert of "hot"
+/// is a FRESH insert (the key is genuinely absent), silently sliding the
+/// whole rest of the storm into the tracked fresh-key race window this test
+/// is explicitly not targeting — observed directly as a flaky `items() ==
+/// 2..3` failure before this fix. The periodic `get` keeps freq > 0, which
+/// keeps the sole live item a merge survivor (copied forward, never
+/// pruned), so every subsequent insert stays a genuine overwrite.
+#[test]
+fn concurrent_overwrite_uniqueness_single_key() {
+    use std::sync::Arc;
+
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const KEY_LEN: usize = 3; // "hot"
+    const VAL_LEN: usize = 9;
+    const THREADS: usize = 4;
+    const ITERS: usize = 4000;
+
+    let legal_seed = format!("H{:02}{:06}", 0, 0);
+    assert_eq!(legal_seed.len(), VAL_LEN);
+
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(legal_seed.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // A single live key means almost every segment is near-100% garbage
+    // moments after it fills — maximal eviction pressure from a tiny pool.
+    let free_segments = 2usize;
+    let total_segments = free_segments + 1;
+
+    let cache = Arc::new(
+        Segcache::builder()
+            .segment_size(segment_size)
+            .heap_size(segment_size as usize * total_segments)
+            .hash_power(16)
+            .eviction(Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            })
+            .build()
+            .expect("failed to create cache"),
+    );
+
+    let ttl = Duration::from_secs(3600);
+
+    let is_legal_value = |v: Value| -> bool {
+        let Value::Bytes(b) = v else {
+            return false;
+        };
+        if b.len() != VAL_LEN || b[0] != b'H' || !b[1..].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let writer = (b[1] - b'0') as usize * 10 + (b[2] - b'0') as usize;
+        writer < THREADS
+    };
+
+    cache
+        .insert(b"hot", legal_seed.as_bytes(), None, ttl)
+        .expect("seed insert must succeed");
+    assert!(
+        cache.get(b"hot").is_some(),
+        "seeded hot key must resolve before spawning"
+    );
+
+    std::thread::scope(|scope| {
+        for t in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            scope.spawn(move || {
+                for ctr in 0..ITERS {
+                    let val = format!("H{t:02}{ctr:06}");
+                    let _ = cache.insert(b"hot", val.as_bytes(), None, ttl);
+                    // Keep the hot key's hashtable frequency > 0 so the
+                    // merge's low-frequency prune never deletes it outright
+                    // (see the doc comment above) — every subsequent insert
+                    // must stay a genuine overwrite, not a fresh insert.
+                    let _ = cache.get(b"hot");
+                }
+            });
+        }
+    });
+
+    let total = total_segments as u32;
+    let chained = assert_chains_well_formed(&cache.segments, &cache.ttl_buckets, total);
+    assert_no_leak(&cache.segments, &chained, total);
+
+    for raw in 1..=total {
+        let id = NonZeroU32::new(raw).unwrap();
+        let header = cache.segments.header(id);
+        assert_eq!(
+            header.active_writers(),
+            0,
+            "segment {raw} leaked a writer pin after concurrent single-key overwrite storm"
+        );
+        assert_eq!(
+            header.active_removers(),
+            0,
+            "segment {raw} leaked a remover pin (item 7f) after concurrent single-key overwrite storm"
+        );
+        assert_eq!(
+            header.ref_count(),
+            0,
+            "segment {raw} leaked a reader pin after concurrent single-key overwrite storm"
+        );
+    }
+
+    let item = cache
+        .get(b"hot")
+        .expect("the hammered key must still resolve");
+    assert!(
+        is_legal_value(item.value()),
+        "illegal/corrupted value at the hammered key: {:?}",
+        item.value()
+    );
+
+    // F4: exactly one live item — a duplicate publish would inflate this.
+    assert_eq!(
+        cache.items(),
+        1,
+        "exactly one live item must exist for the single hammered key — a \
+         duplicate publish on the overwrite race would inflate this"
+    );
+
+    #[cfg(feature = "debug")]
+    cache
+        .check_integrity()
+        .expect("cache must pass integrity check after the single-key overwrite storm");
+}

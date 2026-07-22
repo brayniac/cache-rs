@@ -184,7 +184,7 @@ impl Segcache {
                     let _ = self.segments.remove_at(
                         old_seg_id,
                         old_offset,
-                        &mut self.ttl_buckets,
+                        &self.ttl_buckets,
                         &self.hashtable,
                     );
                 }
@@ -196,7 +196,7 @@ impl Segcache {
                 let _ = self.segments.remove_at(
                     reserved.seg(),
                     reserved.offset(),
-                    &mut self.ttl_buckets,
+                    &self.ttl_buckets,
                     &self.hashtable,
                 );
                 Err(SegcacheError::HashTableInsertEx)
@@ -246,7 +246,7 @@ impl Segcache {
         if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. })
             && !self.segments.pool_has_room(target_pool)
         {
-            let _ = self.segments.evict(&mut self.ttl_buckets, &self.hashtable);
+            let _ = self.segments.evict(&self.ttl_buckets, &self.hashtable);
         }
 
         let mut retries = RESERVE_RETRIES;
@@ -261,7 +261,7 @@ impl Segcache {
                     // Set the segment pool for S3-FIFO (only transitions
                     // Main→Admission need a counter update; fresh segments
                     // default to Main)
-                    if let Ok(seg) = self.segments.get_mut(reserved_item.seg()) {
+                    if let Ok(seg) = self.segments.segment(reserved_item.seg()) {
                         if target_pool == SegmentPool::Admission
                             && seg.pool() != SegmentPool::Admission
                         {
@@ -277,7 +277,7 @@ impl Segcache {
                 Err(TtlBucketsError::NoFreeSegments) => {
                     if self
                         .segments
-                        .evict(&mut self.ttl_buckets, &self.hashtable)
+                        .evict(&self.ttl_buckets, &self.hashtable)
                         .is_err()
                     {
                         retries -= 1;
@@ -325,7 +325,7 @@ impl Segcache {
                 let _ = self.segments.remove_at(
                     reserved.seg(),
                     reserved.offset(),
-                    &mut self.ttl_buckets,
+                    &self.ttl_buckets,
                     &self.hashtable,
                 );
                 return Err(SegcacheError::NotFound);
@@ -343,7 +343,7 @@ impl Segcache {
                 let _ = self.segments.remove_at(
                     old_seg_id,
                     old_offset,
-                    &mut self.ttl_buckets,
+                    &self.ttl_buckets,
                     &self.hashtable,
                 );
                 return Ok(());
@@ -359,7 +359,7 @@ impl Segcache {
                 let _ = self.segments.remove_at(
                     reserved.seg(),
                     reserved.offset(),
-                    &mut self.ttl_buckets,
+                    &self.ttl_buckets,
                     &self.hashtable,
                 );
                 return Err(SegcacheError::Exists);
@@ -520,7 +520,7 @@ impl Segcache {
             }
             let _ = self
                 .segments
-                .remove_at(seg_id, offset, &mut self.ttl_buckets, &self.hashtable);
+                .remove_at(seg_id, offset, &self.ttl_buckets, &self.hashtable);
         }
 
         true
@@ -552,7 +552,7 @@ impl Segcache {
     /// (and not counted) until a later pass runs after the pins drop.
     pub fn expire(&mut self) -> usize {
         self.time = Instant::now();
-        self.ttl_buckets.expire(&self.hashtable, &mut self.segments)
+        self.ttl_buckets.expire(&self.hashtable, &self.segments)
     }
 
     /// Clear the cache, draining every segment from the hashtable.
@@ -562,7 +562,7 @@ impl Segcache {
     /// until a later pass runs after the pins drop.
     pub fn clear(&mut self) -> usize {
         self.time = Instant::now();
-        self.ttl_buckets.clear(&self.hashtable, &mut self.segments)
+        self.ttl_buckets.clear(&self.hashtable, &self.segments)
     }
 
     /// Checks the integrity of all segments

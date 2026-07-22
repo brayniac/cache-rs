@@ -183,10 +183,11 @@ fn merge_halts_at_pinned_candidate_and_relocates_survivors() {
 
     // ── Run one merge pass. It drains seg2/3/4 via copy-to-spare and STOPS at
     //    the pinned seg5. raw_item_x / guard_x hold raw pointers, not a borrow
-    //    of cache.segments, so this &mut call compiles while the pin is live.
+    //    of cache.segments, so this call compiles while the pin is live (item
+    //    7c: evict() and its ttl_buckets argument are both &self now, too).
     cache
         .segments
-        .evict(&mut cache.ttl_buckets, &cache.hashtable)
+        .evict(&cache.ttl_buckets, &cache.hashtable)
         .expect("merge eviction must succeed on the 3-candidate prefix");
 
     // ── With guard_x STILL ALIVE, re-read X through the pinned pointer. The
@@ -304,4 +305,514 @@ fn assert_value_eq(v: Value, expected: &[u8], msg: &str) {
         Value::Bytes(b) => assert_eq!(b, expected, "{msg}"),
         other => panic!("{msg}: expected bytes {expected:?}, got {other:?}"),
     }
+}
+
+// ── Concurrent `&self` eviction tests (roadmap item 7c) ───────────────────
+//
+// The eviction / drain machinery is `&self` (7c): `evict`, `merge_evict`,
+// `merge_compact`, `s3fifo_*`, `claim_for_drain`/`finalize_drained`, and
+// `TtlBucket::reserve` (item 4) all take `&self`. Per-segment mutation
+// exclusivity comes from the `Sealed -> Draining` claim CAS (`claim_for_drain`)
+// plus holding the copy destination in the `Relinking` state while it fills —
+// NOT from any coarse lock (the eviction Mutex only serializes policy-state
+// selection). These tests drive that machinery CONCURRENTLY by sharing
+// `&cache.segments` / `&cache.ttl_buckets` / `&cache.hashtable` across
+// `std::thread::scope` threads (Segments/TtlBuckets/Hashtable are Sync), and
+// assert the whole-pool safety invariants afterward:
+//
+//   * no leak    — every segment is either Free (in a queue) or in exactly one
+//                  readable chain; free-state count == free-queue depth;
+//                  free + chained == total.
+//   * no corruption — chain links are prev/next symmetric, no segment appears
+//                  in two chains / a cycle, every chained segment is readable
+//                  and NONE is stuck in `Relinking` (all evictions completed,
+//                  so no in-fill destination remains).
+//   * correct values — every key that still resolves returns its OWN value
+//                  (the real safety property; exact survivor sets are racy
+//                  under contention, so this is asserted rather than an exact
+//                  survivor count).
+//
+// The same-segment writer-vs-drain race (a reserver writing a `Live` tail an
+// evictor then drains) is DEFERRED to 7d; Test 3 stays in the disjoint regime.
+
+use crate::segments::Segments;
+use crate::ttl_buckets::TtlBuckets;
+use crate::Hashtable;
+use std::collections::HashSet;
+
+/// Format helpers shared by the concurrent tests: distinct value per key so a
+/// torn / aliased / relocated read is detectable.
+fn ckey(i: usize) -> String {
+    format!("k{i:06}")
+}
+fn cval(i: usize) -> String {
+    format!("V{i:06}")
+}
+
+/// Walk every TTL bucket chain and assert it is well-formed, returning the set
+/// of segment ids that appear in some chain (the "chained"/readable set).
+///
+/// Checks, per the module header: prev/next link symmetry, no segment in two
+/// chains or a cycle (each id inserted into `visited` at most once, bounded
+/// walk), every chained segment readable, and NONE stuck in `Relinking`.
+fn assert_chains_well_formed(
+    segments: &Segments,
+    ttl_buckets: &TtlBuckets,
+    total: u32,
+) -> HashSet<u32> {
+    let mut visited: HashSet<u32> = HashSet::new();
+    for bucket in ttl_buckets.buckets.iter() {
+        let mut cur = bucket.head();
+        let mut prev: Option<NonZeroU32> = None;
+        let mut steps = 0u32;
+        while let Some(id) = cur {
+            assert!(
+                visited.insert(id.get()),
+                "segment {id} appears in two chains or a cycle"
+            );
+            steps += 1;
+            assert!(
+                steps <= total + 1,
+                "chain walk exceeded total segments — cycle in the chain"
+            );
+
+            let header = segments.header(id);
+            let state = header.state();
+            assert!(
+                state.is_readable(),
+                "chained segment {id} is not readable: {state:?}"
+            );
+            assert_ne!(
+                state,
+                State::Relinking,
+                "segment {id} is stuck in Relinking after all evictions completed \
+                 (an in-fill copy destination was never sealed)"
+            );
+            assert_eq!(
+                header.prev_seg(),
+                prev,
+                "segment {id} prev link is asymmetric with the chain walk"
+            );
+
+            prev = cur;
+            cur = header.next_seg();
+        }
+    }
+    visited
+}
+
+/// Assert no segment leaked: every non-Free segment is in exactly one chain,
+/// every Free segment is in none, the Free-state count equals the free-queue
+/// depth, and free + chained == total.
+fn assert_no_leak(segments: &Segments, chained: &HashSet<u32>, total: u32) {
+    let mut free_state = 0usize;
+    for raw in 1..=total {
+        let id = NonZeroU32::new(raw).unwrap();
+        let state = segments.header(id).state();
+        if state == State::Free {
+            free_state += 1;
+            assert!(
+                !chained.contains(&raw),
+                "segment {raw} is Free but also appears in a chain"
+            );
+        } else {
+            assert!(
+                chained.contains(&raw),
+                "non-Free segment {raw} ({state:?}) is in no chain — leaked or \
+                 stuck in a transient state after all evictions completed"
+            );
+        }
+    }
+    assert_eq!(
+        free_state,
+        segments.free(),
+        "Free-state segment count must equal the free+spare queue depth"
+    );
+    assert_eq!(
+        free_state + chained.len(),
+        total as usize,
+        "no leak: free + chained segments must account for the whole pool"
+    );
+}
+
+/// Test 1 — Concurrent evictors under the MERGE policy.
+///
+/// Populates a near-full Merge cache with distinct-valued items (bumping the
+/// frequency of a hot set so they survive pruning), then runs T threads each
+/// calling `cache.segments.evict()` in a loop over the shared `&self`
+/// machinery. The per-call eviction Mutex + the `Sealed -> Draining` claim CAS
+/// serialize the dangerous per-segment mutations. Asserts no leak, no
+/// corruption, correct values for every resolvable key, and that survivors
+/// remain.
+#[test]
+fn concurrent_evictors_merge_policy() {
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const KEY_LEN: usize = 7;
+    const VAL_LEN: usize = 7;
+    const THREADS: usize = 4;
+    const ITERS: usize = 150;
+
+    let sample_val = cval(0);
+    assert_eq!(sample_val.len(), VAL_LEN);
+    assert_eq!(ckey(0).len(), KEY_LEN);
+
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(sample_val.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // 16 fillable segments + 1 held-back spare (Merge).
+    let free_segments = 16usize;
+    let total_segments = free_segments + 1;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(segment_size as usize * total_segments)
+        .hash_power(16)
+        .eviction(Policy::Merge {
+            max: 8,
+            merge: 4,
+            compact: 0,
+        })
+        .build()
+        .expect("failed to create cache");
+
+    assert_eq!(cache.segments.free_only(), free_segments);
+
+    let ttl = Duration::from_secs(3600);
+    let fill_count = ITEMS_PER_SEGMENT * free_segments;
+    for i in 0..fill_count {
+        cache
+            .insert(ckey(i).as_bytes(), cval(i).as_bytes(), None, ttl)
+            .expect("fill inserts must succeed without needing eviction");
+    }
+
+    // Bump the frequency of a hot set (first three segments' worth) so the
+    // merge copies them forward rather than pruning them — guarantees
+    // survivors exist after the concurrent eviction storm.
+    let hot = 3 * ITEMS_PER_SEGMENT;
+    for _ in 0..5 {
+        for i in 0..hot {
+            let _ = cache.get(ckey(i).as_bytes());
+        }
+    }
+
+    let total = total_segments as u32;
+    {
+        let segments = &cache.segments;
+        let ttl_buckets = &cache.ttl_buckets;
+        let hashtable = &cache.hashtable;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(move || {
+                    for _ in 0..ITERS {
+                        // Ignore per-call Err (NoEvictableSegments once the pool
+                        // is drained / a candidate was concurrently claimed) —
+                        // the invariant is safety, not that every call evicts.
+                        let _ = segments.evict(ttl_buckets, hashtable);
+                    }
+                });
+            }
+        });
+
+        // Structural invariants (immutable-borrow phase).
+        let chained = assert_chains_well_formed(segments, ttl_buckets, total);
+        assert_no_leak(segments, &chained, total);
+    }
+
+    // Correct values for every key that still resolves (the real safety
+    // property — a torn/aliased copy would surface a wrong value here).
+    let mut survivors = 0usize;
+    for i in 0..fill_count {
+        if let Some(item) = cache.get(ckey(i).as_bytes()) {
+            assert_value_eq(
+                item.value(),
+                cval(i).as_bytes(),
+                "resolvable key must return its own value after concurrent merge",
+            );
+            survivors += 1;
+        }
+    }
+    assert!(
+        survivors > 0,
+        "at least the hot set must survive concurrent merge eviction"
+    );
+
+    #[cfg(feature = "debug")]
+    cache
+        .check_integrity()
+        .expect("cache must pass integrity check after concurrent merge eviction");
+}
+
+/// Test 2 — Concurrent evictors under the S3-FIFO policy.
+///
+/// The FIRST S3-FIFO test in the suite (closes the coverage gap flagged in
+/// review). Fills the admission pool to capacity and bumps the frequency of a
+/// hot set so concurrent `evict()` exercises the admission -> main PROMOTION
+/// path (`s3fifo_evict_admission` -> `s3fifo_promote_from`), then the main-pool
+/// CLOCK sweep once admission drains. Asserts the same no-leak / no-corruption
+/// / correct-value / no-stuck-Relinking invariants over the shared `&self`
+/// machinery.
+#[test]
+fn concurrent_evictors_s3fifo_policy() {
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const KEY_LEN: usize = 7;
+    const VAL_LEN: usize = 7;
+    const THREADS: usize = 4;
+    const ITERS: usize = 120;
+
+    let sample_val = cval(0);
+    assert_eq!(sample_val.len(), VAL_LEN);
+    assert_eq!(ckey(0).len(), KEY_LEN);
+
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(sample_val.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // 24 segments, admission_ratio 0.25 -> admission_cap = 6 segments. S3-FIFO
+    // holds back no spare, so all 24 are fillable.
+    let total_segments = 24usize;
+    let admission_ratio = 0.25;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(segment_size as usize * total_segments)
+        .hash_power(16)
+        .eviction(Policy::S3Fifo { admission_ratio })
+        .build()
+        .expect("failed to create cache");
+
+    let ttl = Duration::from_secs(3600);
+
+    // Fill roughly the admission pool (6 segments) so several admission-pool
+    // segments exist as eviction candidates when the concurrent phase starts.
+    // Inserts land in the admission pool while it has room (ghost is empty);
+    // once it is full, further inserts self-evict — either way we end with
+    // admission candidates plus some promoted/main items.
+    let admission_fill = 6 * ITEMS_PER_SEGMENT;
+    for i in 0..admission_fill {
+        cache
+            .insert(ckey(i).as_bytes(), cval(i).as_bytes(), None, ttl)
+            .expect("admission-pool fill inserts must succeed");
+    }
+
+    // Bump the frequency of a hot set so, when their admission segment is
+    // evicted, they PROMOTE to the main pool (freq > 0) instead of being
+    // dropped to the ghost queue — this is what makes the promotion path fire.
+    let hot = 3 * ITEMS_PER_SEGMENT;
+    for _ in 0..5 {
+        for i in 0..hot {
+            let _ = cache.get(ckey(i).as_bytes());
+        }
+    }
+
+    let total = total_segments as u32;
+    {
+        let segments = &cache.segments;
+        let ttl_buckets = &cache.ttl_buckets;
+        let hashtable = &cache.hashtable;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(move || {
+                    for _ in 0..ITERS {
+                        let _ = segments.evict(ttl_buckets, hashtable);
+                    }
+                });
+            }
+        });
+
+        let chained = assert_chains_well_formed(segments, ttl_buckets, total);
+        assert_no_leak(segments, &chained, total);
+    }
+
+    // Every resolvable key returns its own value — a mis-promoted / torn copy
+    // would surface a wrong value.
+    for i in 0..admission_fill {
+        if let Some(item) = cache.get(ckey(i).as_bytes()) {
+            assert_value_eq(
+                item.value(),
+                cval(i).as_bytes(),
+                "resolvable key must return its own value after concurrent s3fifo eviction",
+            );
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    cache
+        .check_integrity()
+        .expect("cache must pass integrity check after concurrent s3fifo eviction");
+}
+
+/// Test 3 — Reservers vs evictor, DISJOINT regions (the accessor-soundness
+/// milestone).
+///
+/// N reserver threads call `TtlBucket::reserve(size, &segments)` (item 4),
+/// write their granted item's bytes, and read them back — while 1 evictor
+/// thread runs `evict()` draining OLD sealed candidates. Reservers write the
+/// `Live` tail; the evictor (Merge, oldest-first) drains the head region. With
+/// a large buffer of pre-populated sealed segments between the two, they
+/// operate on DIFFERENT segments — the disjoint case the `&self` accessor's
+/// soundness rests on. A reserver's readback happens while its item is in the
+/// `Live` tail, which the evictor never drains (`can_evict` requires `Sealed`),
+/// so an intact readback proves the evictor's `&mut [u8]` into the head region
+/// never aliased the reserver's `&mut [u8]` into the tail.
+///
+/// The same-segment writer-vs-drain race is DEFERRED to 7d; the large buffer +
+/// bounded work keeps this test in the disjoint regime.
+#[test]
+fn reservers_vs_evictor_disjoint() {
+    const ITEMS_PER_SEGMENT: usize = 8;
+    const KEY_LEN: usize = 7;
+    const VAL_LEN: usize = 7;
+    const RESERVERS: usize = 3;
+    const RESERVES_PER_THREAD: usize = 24; // ~9 segments of tail growth total
+    const EVICT_ITERS: usize = 80;
+
+    let sample_val = cval(0);
+    assert_eq!(sample_val.len(), VAL_LEN);
+    assert_eq!(ckey(0).len(), KEY_LEN);
+
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(sample_val.as_bytes()), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // Large pool: 30 pre-populated sealed segments give the evictor a deep
+    // head region to churn, well away from the tail the reservers grow. Total
+    // 60 segments leaves ample free headroom for reserver tail growth + merge
+    // spares, so reserve() never starves and the two regions stay disjoint.
+    let prefill_segments = 30usize;
+    let total_segments = 60usize;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(segment_size as usize * total_segments)
+        .hash_power(16)
+        .eviction(Policy::Merge {
+            max: 8,
+            merge: 4,
+            compact: 0,
+        })
+        .build()
+        .expect("failed to create cache");
+
+    let ttl = Duration::from_secs(3600);
+
+    // Pre-populate the old sealed segments (published in the hashtable) so the
+    // evictor has real merge candidates in the head region.
+    let prefill = ITEMS_PER_SEGMENT * prefill_segments;
+    for i in 0..prefill {
+        cache
+            .insert(ckey(i).as_bytes(), cval(i).as_bytes(), None, ttl)
+            .expect("prefill inserts must succeed");
+    }
+    // Bump frequency so the merge keeps copying survivors forward (keeps the
+    // head region busy and populated rather than instantly draining to Free).
+    for _ in 0..3 {
+        for i in 0..(4 * ITEMS_PER_SEGMENT) {
+            let _ = cache.get(ckey(i).as_bytes());
+        }
+    }
+
+    // Reserver payloads use a disjoint key space ("r" prefix) and distinct
+    // values, so a corrupted readback (bytes from an evicted head item, or a
+    // neighbouring reserver's item) is detectable.
+    let rkey = |t: usize, j: usize| format!("r{t:03}{j:03}");
+    let rval = |t: usize, j: usize| format!("R{t:03}{j:03}");
+    assert_eq!(rkey(0, 0).len(), KEY_LEN);
+
+    let total = total_segments as u32;
+    {
+        let segments = &cache.segments;
+        let ttl_buckets = &cache.ttl_buckets;
+        let hashtable = &cache.hashtable;
+
+        std::thread::scope(|scope| {
+            // Evictor: drains OLD sealed candidates (Merge is oldest-first).
+            scope.spawn(move || {
+                for _ in 0..EVICT_ITERS {
+                    let _ = segments.evict(ttl_buckets, hashtable);
+                }
+            });
+
+            // Reservers: write the Live tail at disjoint CAS-allocated offsets,
+            // then read their own bytes back immediately (still Live) to confirm
+            // the evictor's concurrent head-region writes did not alias them.
+            for t in 0..RESERVERS {
+                scope.spawn(move || {
+                    // `get_bucket` takes a coarse Duration (the internal clock
+                    // type); mirror insert's std->coarse conversion for 3600s.
+                    let coarse_ttl = clocksource::coarse::Duration::from_secs(3600);
+                    let bucket = ttl_buckets.get_bucket(coarse_ttl);
+                    for j in 0..RESERVES_PER_THREAD {
+                        let key = rkey(t, j);
+                        let val = rval(t, j);
+                        let size = keyvalue::item_size(key.len(), &Value::Bytes(val.as_bytes()), 0);
+                        // Retry a bounded number of times if the pool is
+                        // momentarily starved (should not happen given the
+                        // headroom, but keeps the test robust).
+                        let mut reserved = None;
+                        for _ in 0..1000 {
+                            match bucket.reserve(size, segments) {
+                                Ok(r) => {
+                                    reserved = Some(r);
+                                    break;
+                                }
+                                Err(_) => {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
+                        let mut reserved =
+                            reserved.expect("reserve must eventually succeed with ample headroom");
+                        reserved.define(key.as_bytes(), Value::Bytes(val.as_bytes()), &[]);
+
+                        // Readback: the granted item is in the Live tail (the
+                        // evictor never drains a Live segment), so its bytes
+                        // MUST be exactly what this reserver wrote.
+                        let item = reserved.item();
+                        assert_eq!(
+                            item.key(),
+                            key.as_bytes(),
+                            "reserved item key corrupted (concurrent evictor aliased the tail)"
+                        );
+                        assert_value_eq(
+                            item.value(),
+                            val.as_bytes(),
+                            "reserved item value corrupted (concurrent evictor aliased the tail)",
+                        );
+                        #[cfg(feature = "integrity")]
+                        item.check_magic();
+
+                        // Publish the reserved item into the hashtable (a `&self`
+                        // op, item-4/7b) so it is a REAL item, not an orphan —
+                        // an unpublished reserved item would break the merge's
+                        // clear() accounting if its segment were ever merged.
+                        let location =
+                            crate::pack_location(reserved.seg(), reserved.offset() as u64);
+                        let verifier = segments.verifier();
+                        let _ = hashtable.insert(item.key(), location, &verifier);
+                    }
+                });
+            }
+        });
+
+        // No leak / no corruption over the whole pool after the storm.
+        let chained = assert_chains_well_formed(segments, ttl_buckets, total);
+        assert_no_leak(segments, &chained, total);
+    }
+
+    // Every prefill key that still resolves returns its own value.
+    for i in 0..prefill {
+        if let Some(item) = cache.get(ckey(i).as_bytes()) {
+            assert_value_eq(
+                item.value(),
+                cval(i).as_bytes(),
+                "resolvable prefill key must return its own value after concurrent reserve+evict",
+            );
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    cache
+        .check_integrity()
+        .expect("cache must pass integrity check after concurrent reserve+evict");
 }

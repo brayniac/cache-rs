@@ -18,12 +18,16 @@ use core::num::NonZeroU32;
 /// - **Live**: Active tail segment accepting writes and reads
 /// - **Sealed**: No more writes accepted, but data readable and chain
 ///   stable; the only evictable state
-/// - **Relinking**: DECLARED, UNUSED — the copy-to-spare merge rework
-///   (item 5b) and the s3fifo evict/admission paths reach a reader-safe
-///   chain-relink by copying survivors into a fresh Sealed segment instead
-///   of updating pointers on a live one in place, making an in-place
-///   relinking state unnecessary under today's serialized eviction. Kept
-///   reserved for a future concurrent-eviction design.
+/// - **Relinking**: The copy-DESTINATION state during a concurrent
+///   merge/s3fifo fill (item 7c). A freshly reserved spare (merge) or target
+///   (s3fifo) is linked at the bucket head as `Relinking`, filled with
+///   survivors relinked in via `cas_location`, then transitioned to `Sealed`
+///   once the fill completes. `Relinking` is readable (so the relinked
+///   survivors stay reachable to readers) but NOT evictable (only `Sealed`
+///   is), so a concurrent evictor can neither select the destination
+///   (`can_evict` is false) nor win its `Sealed->Draining` claim while its
+///   owning evictor is still writing into it — closing the destination
+///   writable-while-drainable hole.
 /// - **Draining**: Being processed (eviction/expiration/clear). Exclusive:
 ///   exactly one thread holds a segment in Draining. New reads rejected.
 /// - **Locked**: DECLARED, UNUSED — for the same reason as `Relinking`,
@@ -51,9 +55,9 @@ use core::num::NonZeroU32;
 ///        |                   | sealed by the appender, in the     |
 ///        |                   | same CAS that sets `next`          |
 ///        |                   v                                    |
-///        | (s3fifo        Sealed  (readable, evictable)           |
-///        |  head-insert:      | begin drain (SeqCst)              |
-///        |  Linking ->        v                                   |
+///        | (copy dest:    Sealed  (readable, evictable)           |
+///        |  Linking ->        | begin drain (SeqCst)              |
+///        |  Relinking ->      v                                   |
 ///        |  Sealed)       Draining ---- ref_count == 0 -----------+
 ///        |                 |     ^  \                        (-> Free)
 ///        +--- revert ------+     |   \ ref_count > 0

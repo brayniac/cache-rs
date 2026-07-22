@@ -198,7 +198,7 @@ fn seal_on_append() {
     for id in 1..used as u32 {
         let seg = cache
             .segments
-            .get_mut(NonZeroU32::new(id).unwrap())
+            .segment(NonZeroU32::new(id).unwrap())
             .unwrap();
         assert_eq!(
             seg.state(),
@@ -210,7 +210,7 @@ fn seal_on_append() {
 
     let tail = cache
         .segments
-        .get_mut(NonZeroU32::new(used as u32).unwrap())
+        .segment(NonZeroU32::new(used as u32).unwrap())
         .unwrap();
     assert_eq!(tail.state(), State::Live);
     assert!(!tail.can_evict(), "the write tail must never be evictable");
@@ -250,7 +250,7 @@ fn cas_fails_when_own_reservation_evicts_checked_item() {
             let used = segments - cache.segments.free();
             let tail = cache
                 .segments
-                .get_mut(NonZeroU32::new(used as u32).unwrap())
+                .segment(NonZeroU32::new(used as u32).unwrap())
                 .unwrap();
             segment_size as usize - tail.write_offset() as usize
         };
@@ -412,7 +412,7 @@ fn try_into_numeric_arms() {
         let (seg, _) = unpack_location(loc);
         cache
             .segments
-            .get_mut(NonZeroU32::new(seg).unwrap())
+            .segment(NonZeroU32::new(seg).unwrap())
             .unwrap()
             .ttl()
     };
@@ -430,7 +430,7 @@ fn try_into_numeric_arms() {
         let (seg, _) = unpack_location(loc);
         cache
             .segments
-            .get_mut(NonZeroU32::new(seg).unwrap())
+            .segment(NonZeroU32::new(seg).unwrap())
             .unwrap()
             .ttl()
     };
@@ -1156,16 +1156,16 @@ fn merge_evict_copies_survivors_into_spare() {
     // policy's random start still finds it (evict scans every bucket).
     cache
         .segments
-        .evict(&mut cache.ttl_buckets, &cache.hashtable)
+        .evict(&cache.ttl_buckets, &cache.hashtable)
         .expect("merge eviction must succeed on a full 5-segment chain");
 
     // (a) The bucket head is now the spare segment, Sealed and holding the
     // copied survivors.
     let seg_ttl = cache.segments.header(spare_id).ttl();
-    let head = cache.ttl_buckets.get_mut_bucket(seg_ttl).head();
+    let head = cache.ttl_buckets.get_bucket(seg_ttl).head();
     assert_eq!(head, Some(spare_id), "merge must head-insert the spare");
     {
-        let spare = cache.segments.get_mut(spare_id).unwrap();
+        let spare = cache.segments.segment(spare_id).unwrap();
         assert_eq!(spare.state(), State::Sealed);
         assert!(spare.live_items() > 0, "spare must hold copied survivors");
     }
@@ -1183,7 +1183,7 @@ fn merge_evict_copies_survivors_into_spare() {
         .filter(|&id| {
             cache
                 .segments
-                .get_mut(NonZeroU32::new(id).unwrap())
+                .segment(NonZeroU32::new(id).unwrap())
                 .unwrap()
                 .state()
                 == State::Free
@@ -1198,7 +1198,7 @@ fn merge_evict_copies_survivors_into_spare() {
         .filter(|&id| {
             cache
                 .segments
-                .get_mut(NonZeroU32::new(id).unwrap())
+                .segment(NonZeroU32::new(id).unwrap())
                 .unwrap()
                 .state()
                 .is_readable()
@@ -1310,17 +1310,17 @@ fn merge_compact_combines_under_full_segments_into_spare() {
     let seg_c = NonZeroU32::new(4).unwrap(); // third: Live write tail
 
     {
-        let a = cache.segments.get_mut(seg_a).unwrap();
+        let a = cache.segments.segment(seg_a).unwrap();
         assert_eq!(a.state(), State::Sealed);
         assert_eq!(a.live_items(), ITEMS_PER_SEGMENT as i32);
     }
     {
-        let b = cache.segments.get_mut(seg_b).unwrap();
+        let b = cache.segments.segment(seg_b).unwrap();
         assert_eq!(b.state(), State::Sealed);
         assert_eq!(b.live_items(), ITEMS_PER_SEGMENT as i32);
     }
     {
-        let c = cache.segments.get_mut(seg_c).unwrap();
+        let c = cache.segments.segment(seg_c).unwrap();
         assert_eq!(c.state(), State::Live);
         assert_eq!(c.live_items(), ITEMS_PER_SEGMENT as i32);
     }
@@ -1333,7 +1333,7 @@ fn merge_compact_combines_under_full_segments_into_spare() {
     for k in &keys[12..22] {
         assert!(cache.delete(k.as_bytes()), "delete must find the key");
     }
-    assert_eq!(cache.segments.get_mut(seg_b).unwrap().live_items(), 2);
+    assert_eq!(cache.segments.segment(seg_b).unwrap().live_items(), 2);
 
     // Now bring seg_a down from 12 -> 2 items. Somewhere in this loop
     // seg_a's ratio drops to <= compact_ratio (0.2) while seg_b (its chain
@@ -1350,14 +1350,14 @@ fn merge_compact_combines_under_full_segments_into_spare() {
     // both under-full candidates' survivors (2 from seg_a + 2 from
     // seg_b = 4), with none pruned.
     let seg_ttl = cache.segments.header(spare_id).ttl();
-    let head = cache.ttl_buckets.get_mut_bucket(seg_ttl).head();
+    let head = cache.ttl_buckets.get_bucket(seg_ttl).head();
     assert_eq!(
         head,
         Some(spare_id),
         "merge_compact must head-insert the spare"
     );
     {
-        let spare = cache.segments.get_mut(spare_id).unwrap();
+        let spare = cache.segments.segment(spare_id).unwrap();
         assert_eq!(spare.state(), State::Sealed);
         assert_eq!(
             spare.live_items(),
@@ -1368,10 +1368,10 @@ fn merge_compact_combines_under_full_segments_into_spare() {
 
     // (b) Both under-full source segments were drained (Free), and the
     // untouched Live tail was left alone.
-    assert_eq!(cache.segments.get_mut(seg_a).unwrap().state(), State::Free);
-    assert_eq!(cache.segments.get_mut(seg_b).unwrap().state(), State::Free);
+    assert_eq!(cache.segments.segment(seg_a).unwrap().state(), State::Free);
+    assert_eq!(cache.segments.segment(seg_b).unwrap().state(), State::Free);
     {
-        let c = cache.segments.get_mut(seg_c).unwrap();
+        let c = cache.segments.segment(seg_c).unwrap();
         assert_eq!(c.state(), State::Live);
         assert_eq!(c.live_items(), ITEMS_PER_SEGMENT as i32);
     }
@@ -1383,7 +1383,7 @@ fn merge_compact_combines_under_full_segments_into_spare() {
         .filter(|&id| {
             cache
                 .segments
-                .get_mut(NonZeroU32::new(id).unwrap())
+                .segment(NonZeroU32::new(id).unwrap())
                 .unwrap()
                 .state()
                 .is_readable()

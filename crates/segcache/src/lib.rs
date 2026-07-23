@@ -61,7 +61,7 @@ pub use keyvalue::Value;
 pub(crate) use crate::rand::*;
 pub(crate) use cas::CasToken;
 pub(crate) use hashtable::{
-    pack_location, unpack_location, Hashtable, MultiChoiceHashtable, SegmentsVerifier,
+    pack_location, unpack_location, Hashtable, MultiChoiceHashtable, SegmentsVerifier, SlotRef,
 };
 pub(crate) use item::*;
 pub(crate) use keyvalue::{RawItem, ITEM_HDR_SIZE};

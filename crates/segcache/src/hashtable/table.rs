@@ -17,6 +17,23 @@ use core::hash::{BuildHasher, Hasher};
 /// Maximum number of bucket choices supported.
 pub const MAX_CHOICES: u8 = 8;
 
+/// A located hashtable slot: the bucket and slot index where `lookup_slot`
+/// found a matching entry, plus the tag extracted from the key's hash so a
+/// follow-up `cas_location_at` doesn't need to re-hash the key or re-probe
+/// the candidate buckets.
+///
+/// A `SlotRef` is a *hint*, not a claim on the slot: `cas_location_at`
+/// still validates that the slot currently encodes the expected
+/// `old_location` before swapping it, exactly like `cas_location`'s probe
+/// would. See `cas_location_at` for why a stale `SlotRef` can never cause
+/// a CAS against the wrong entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotRef {
+    bucket_index: usize,
+    slot_index: usize,
+    tag: u16,
+}
+
 /// Lock-free hashtable for caches.
 ///
 /// Each entry stores:
@@ -431,6 +448,46 @@ impl MultiChoiceHashtable {
         None
     }
 
+    /// Search a bucket for an item WITHOUT updating frequency, also
+    /// returning the slot index of the match so the caller can go
+    /// straight back to it later (feeds `lookup_slot` / `cas_location_at`).
+    #[inline]
+    fn search_bucket_no_freq_slot(
+        &self,
+        bucket_index: usize,
+        tag: u16,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+    ) -> Option<(Location, usize)> {
+        let bucket = self.bucket(bucket_index);
+        let tag_shifted = (tag as u64) << 52;
+
+        let mut mask = Self::find_tag_matches_simd(bucket, tag_shifted);
+
+        while mask != 0 {
+            let slot_index = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+
+            let packed = bucket.items[slot_index].load(Ordering::Acquire);
+
+            if packed == 0 || Hashbucket::is_ghost(packed) {
+                continue;
+            }
+            if (packed & 0xFFF0_0000_0000_0000) != tag_shifted {
+                continue;
+            }
+
+            let location = Hashbucket::location(packed);
+            verifier.prefetch(location);
+
+            if verifier.verify(key, location, false) {
+                return Some((location, slot_index));
+            }
+        }
+
+        None
+    }
+
     /// Search a bucket for existence (no frequency update).
     fn search_bucket_exists(
         &self,
@@ -801,6 +858,130 @@ impl MultiChoiceHashtable {
         }
 
         false
+    }
+
+    /// Look up a key without updating frequency, also returning a
+    /// `SlotRef` pinpointing where the match was found. A follow-up
+    /// `cas_location_at(slot, ...)` can then swap that exact slot without
+    /// re-hashing the key or re-probing its candidate buckets — the
+    /// second-probe cost `cas_location` pays when called right after a
+    /// `lookup_no_freq_update` for the same key.
+    ///
+    /// Same miss/hit semantics as `lookup_no_freq_update`: only live
+    /// (non-ghost) entries are returned.
+    pub(crate) fn lookup_slot(
+        &self,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+    ) -> Option<(Location, SlotRef)> {
+        let hash = self.hash_key(key);
+        let tag = Self::tag_from_hash(hash);
+        let buckets = self.bucket_indices(hash);
+        let num_choices = self.num_choices as usize;
+
+        for &bucket_index in &buckets[..num_choices] {
+            self.prefetch_bucket(bucket_index);
+        }
+
+        for &bucket_index in &buckets[..num_choices] {
+            if let Some((location, slot_index)) =
+                self.search_bucket_no_freq_slot(bucket_index, tag, key, verifier)
+            {
+                return Some((
+                    location,
+                    SlotRef {
+                        bucket_index,
+                        slot_index,
+                        tag,
+                    },
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// CAS an item's location directly at a slot located by `lookup_slot`,
+    /// skipping the bucket re-probe `cas_location` performs internally.
+    ///
+    /// Same return contract as `cas_location`: `true` if the swap
+    /// happened, `false` if `old_location` is no longer present at this
+    /// slot — the entry moved, was overwritten, or was removed since the
+    /// lookup that produced `slot`. Callers handle `false` exactly as a
+    /// `cas_location` miss today: re-`lookup_slot` and retry.
+    ///
+    /// Retries the CAS in place across a spurious failure caused by a
+    /// concurrent frequency-counter bump changing the packed value's freq
+    /// bits underneath us (the same race `cas_location`'s callers already
+    /// retry through today, e.g. `replace_at`'s `get_item_frequency`
+    /// re-check) — it only gives up once the slot's packed value no
+    /// longer encodes `old_location`. This does not weaken the contract:
+    /// it can only turn a `false` that today's outer retry loop would
+    /// have converted into a re-attempt into an immediate re-attempt.
+    ///
+    /// # Correctness: why a stale `SlotRef` can't CAS the wrong entry
+    ///
+    /// The compare operand of the CAS is the *exact* packed value
+    /// (`tag`+`freq`+`old_location`) read from the slot just before it,
+    /// not merely "some entry at this slot index". If the entry `slot`
+    /// pointed at has since moved, been overwritten, or been removed, the
+    /// slot's current packed value fails the check below for one of these
+    /// reasons:
+    /// - the slot is now empty (`0`) or a ghost — rejected outright;
+    /// - the slot holds a different key's entry that happens to have
+    ///   landed there (bucket/slot indices are reused once vacated) — its
+    ///   `location` is necessarily different from `old_location`, because
+    ///   `old_location` names a segment slot that stays claimed (a
+    ///   `WriterPin`/remover pin brackets the unlink and the segment
+    ///   decrement) until this exact CAS or its `cas_location` sibling
+    ///   resolves, so no other live entry can carry that same location
+    ///   value in the meantime;
+    /// - the same key was updated in place by a racing writer to a new
+    ///   location — tag matches but `location` does not.
+    ///
+    /// In every case the `compare_exchange` below fails closed and we
+    /// return `false` without touching the slot; we never overwrite an
+    /// entry other than the one `old_location` uniquely identifies.
+    pub(crate) fn cas_location_at(
+        &self,
+        slot: SlotRef,
+        old_location: Location,
+        new_location: Location,
+        preserve_freq: bool,
+    ) -> bool {
+        let bucket = self.bucket(slot.bucket_index);
+        let slot_index = slot.slot_index;
+
+        loop {
+            let packed = bucket.items[slot_index].load(Ordering::Acquire);
+
+            if packed == 0 || Hashbucket::is_ghost(packed) {
+                return false;
+            }
+            if Hashbucket::tag(packed) != slot.tag || Hashbucket::location(packed) != old_location {
+                return false;
+            }
+
+            let freq = if preserve_freq {
+                Hashbucket::freq(packed)
+            } else {
+                1
+            };
+            let new_packed = Hashbucket::pack(slot.tag, freq, new_location);
+
+            match bucket.items[slot_index].compare_exchange(
+                packed,
+                new_packed,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                // Lost the CAS — re-read and retry while old_location is
+                // still there (mirrors the freq-bump retry `cas_location`
+                // relies on its callers for; see doc comment above).
+                Err(_) => continue,
+            }
+        }
     }
 }
 

@@ -189,9 +189,16 @@ impl Segcache {
         // its segment can be pinned (`try_pin_remover`) across the unlink AND
         // the `remove_at` decrement — closing the window where a concurrent
         // eviction drain of that segment could interleave with the decrement.
+        //
+        // `lookup_slot` (item 7f perf follow-up) returns the slot the old
+        // entry was found in alongside its location, so the publish below
+        // uses `cas_location_at` to CAS that exact slot directly instead of
+        // `cas_location` re-probing the key's candidate buckets from
+        // scratch — the hashtable does one hash per op regardless, so this
+        // only elides the redundant second bucket scan/verify.
         loop {
-            match self.hashtable.lookup_no_freq_update(key, &verifier) {
-                Some((old_location, _freq)) => {
+            match self.hashtable.lookup_slot(key, &verifier) {
+                Some((old_location, slot)) => {
                     if old_location == new_location {
                         // Already published (a prior loop iteration's
                         // fresh-key upsert below raced another insert of this
@@ -201,9 +208,9 @@ impl Segcache {
 
                     let (old_seg_raw, old_offset) = unpack_location(old_location);
                     let Some(old_seg_id) = NonZeroU32::new(old_seg_raw) else {
-                        // Not expected — `lookup_no_freq_update` only returns
-                        // real (non-ghost) entries — but stay defensive and
-                        // fall through to the same rollback used below.
+                        // Not expected — `lookup_slot` only returns real
+                        // (non-ghost) entries — but stay defensive and fall
+                        // through to the same rollback used below.
                         break;
                     };
 
@@ -217,7 +224,7 @@ impl Segcache {
 
                     if self
                         .hashtable
-                        .cas_location(key, old_location, new_location, true)
+                        .cas_location_at(slot, old_location, new_location, true)
                     {
                         #[cfg(feature = "metrics")]
                         ITEM_REPLACE.increment();
@@ -419,10 +426,19 @@ impl Segcache {
     /// removed from its segment; if the entry no longer maps to
     /// `old_location`, the reservation is rolled back and `Exists` is
     /// returned.
+    ///
+    /// `old_slot` is the `SlotRef` the caller's `lookup_slot` found
+    /// `old_location` at; it lets the publish below CAS that slot
+    /// directly via `cas_location_at` instead of re-probing the key's
+    /// candidate buckets (item 7f perf follow-up). Reused unchanged across
+    /// retries in the loop below: `old_location` only ever lives in one
+    /// slot at a time, so as long as `get_item_frequency` still finds
+    /// `old_location` under `key`, it is still at `old_slot`.
     fn replace_at(
         &self,
         key: &[u8],
         old_location: Location,
+        old_slot: SlotRef,
         reserved: ReservedItem,
     ) -> Result<(), SegcacheError> {
         let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
@@ -469,7 +485,7 @@ impl Segcache {
             // segment between define and publish (item 7d, H2).
             if self
                 .hashtable
-                .cas_location(key, old_location, new_location, true)
+                .cas_location_at(old_slot, old_location, new_location, true)
             {
                 #[cfg(feature = "metrics")]
                 ITEM_REPLACE.increment();
@@ -579,9 +595,9 @@ impl Segcache {
     ) -> Result<(), SegcacheError> {
         // Look up the current item to check its CAS token
         let verifier = self.verifier();
-        let (location, _freq) = self
+        let (location, slot) = self
             .hashtable
-            .lookup_no_freq_update(key, &verifier)
+            .lookup_slot(key, &verifier)
             .ok_or(SegcacheError::NotFound)?;
 
         let (seg_id, offset) = unpack_location(location);
@@ -617,7 +633,7 @@ impl Segcache {
         // `reserved` (and its WriterPin) is handed to `replace_at` by value and
         // stays alive there until publish — never dropped/destructured here
         // before the hashtable exchange (item 7d, H2).
-        self.replace_at(key, location, reserved)
+        self.replace_at(key, location, slot, reserved)
     }
 
     /// Remove the item with the given key, returns a bool indicating if it was
@@ -828,7 +844,7 @@ impl Segcache {
         ttl: std::time::Duration,
     ) -> Result<(), SegcacheError> {
         let verifier = self.verifier();
-        let Some((location, _freq)) = self.hashtable.lookup_no_freq_update(key, &verifier) else {
+        let Some((location, slot)) = self.hashtable.lookup_slot(key, &verifier) else {
             // Missing: create with the caller's ttl. NOTE for the
             // concurrent future: this publishes via plain insert, which
             // would overwrite a concurrently created value; revisit with
@@ -861,7 +877,7 @@ impl Segcache {
 
         let reserved =
             self.reserve_and_define(key, Value::U64(parsed), &opt_buf[..olen], seg_ttl)?;
-        self.replace_at(key, location, reserved)
+        self.replace_at(key, location, slot, reserved)
     }
 
     /// Test-only access to the segment collection, for asserting on segment

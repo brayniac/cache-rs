@@ -16,8 +16,8 @@
 //! │          METADATA           │ GEN  │PL│PD│ ACTIVE WRITERS │
 //! │          AtomicU64          │ 16b  │8b│8b│  AtomicU32/32b │
 //! ├─────────────────────────────┴──────┴──┴──┴────────────────┤
-//! │                        PADDING                            │
-//! │                        128 bit                            │
+//! │        ACTIVE REMOVERS      │          PADDING            │
+//! │        AtomicU32/32b        │            96 bit           │
 //! └───────────────────────────────────────────────────────────┘
 //!
 //! METADATA = [8 unused][8 state][24 prev][24 next] (see segments::state)
@@ -76,7 +76,8 @@ impl SegmentPool {
 /// 42       1    pool          (AtomicU8, SegmentPool)
 /// 43       1    (implicit alignment pad before active_writers)
 /// 44       4    active_writers (AtomicU32, in-flight reserve/write pins)
-/// 48      13    _pad          (+3 implicit trailing bytes to align(64) → 64)
+/// 48       4    active_removers (AtomicU32, in-flight replace/delete pins)
+/// 52       9    _pad          (+3 implicit trailing bytes to align(64) → 64)
 /// ```
 #[repr(C, align(64))]
 pub(crate) struct SegmentHeader {
@@ -92,7 +93,8 @@ pub(crate) struct SegmentHeader {
     generation: AtomicU16,
     pool: AtomicU8,
     active_writers: AtomicU32,
-    _pad: [u8; 13],
+    active_removers: AtomicU32,
+    _pad: [u8; 9],
 }
 
 // Loom atomics are larger than std atomics, so skip size check under loom.
@@ -123,7 +125,8 @@ impl SegmentHeader {
             generation: AtomicU16::new(0),
             pool: AtomicU8::new(SegmentPool::Main as u8),
             active_writers: AtomicU32::new(0),
-            _pad: [0; 13],
+            active_removers: AtomicU32::new(0),
+            _pad: [0; 9],
         }
     }
 
@@ -433,6 +436,51 @@ impl SegmentHeader {
     #[inline]
     pub fn active_writers(&self) -> u32 {
         self.active_writers.load(Ordering::SeqCst)
+    }
+
+    // -- Remover pinning (item 7f) --
+
+    /// A replace/delete may remove one of this segment's items iff it holds
+    /// live, removable items: `Sealed` (interior) or `Live` (tail). Not
+    /// Draining/AwaitingRelease/Relinking/Free.
+    #[inline]
+    fn state_is_removable(state: State) -> bool {
+        matches!(state, State::Sealed | State::Live)
+    }
+
+    /// Two-phase pin for a replace/delete that will unlink+decrement one of this
+    /// segment's items — the exact mirror of `try_pin_writer`, but gated on the
+    /// removable states. Bump `active_removers`, then re-check: if a drain
+    /// claimed the segment (`-> Draining`) in between, back out and fail so the
+    /// caller retries rather than decrementing a segment being reclaimed. The
+    /// SeqCst fetch_add + recheck is the remover half of the Dekker pair with a
+    /// drain's claim CAS + `active_removers` load. loom cannot verify this
+    /// distinction (see `try_acquire_reader`/`try_pin_writer`).
+    #[inline]
+    pub fn try_pin_remover(&self) -> bool {
+        if !Self::state_is_removable(self.metadata(Ordering::Acquire).state) {
+            return false;
+        }
+        self.active_removers.fetch_add(1, Ordering::SeqCst);
+        if !Self::state_is_removable(self.metadata(Ordering::SeqCst).state) {
+            self.active_removers.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// Release a remover pin taken with `try_pin_remover`. SeqCst mirrors
+    /// `release_writer`.
+    #[inline]
+    pub fn release_remover(&self) {
+        let prev = self.active_removers.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(prev > 0, "release_remover without matching pin");
+    }
+
+    /// Reservers-mid-remove count, ordered after a preceding SeqCst claim CAS.
+    #[inline]
+    pub fn active_removers(&self) -> u32 {
+        self.active_removers.load(Ordering::SeqCst)
     }
 
     // -- Identity --
@@ -958,6 +1006,80 @@ mod loom_tests {
         });
     }
 
+    // Removers race a drain claim: the remover's fetch_add+recheck SeqCst
+    // pair mirrors try_acquire_reader (and try_pin_writer above); the
+    // claimer's CAS+active_removers() load mirrors the drain CAS +
+    // ref_count_seqcst()/active_writers() load in the models above. Header
+    // starts Sealed — the common interior-item-removal case a replace/
+    // delete pins (see `state_is_removable`). Same limitation applies (see
+    // module NOTE): the message-passing property this pair exists for — a
+    // claimer that has committed the drain is never raced by a remover
+    // still mid-pin — is SC-dependent and NOT asserted here; the claimer's
+    // single post-CAS observation of `active_removers()` is recorded, not
+    // asserted on. Like the writer model (and unlike the reader model's
+    // revert-on-race), production's remover-vs-drain claim does not revert
+    // on the claimer's side; the remover's own recheck inside
+    // `try_pin_remover` is what backs out, so a single discarded
+    // observation on the claimer side is the faithful message-passing
+    // shape here. (`committed` accordingly means only "the claim CAS won",
+    // not "drain confirmed safe" — harmless since it is never asserted
+    // on.) What IS asserted is the SC-independent invariant: every
+    // `try_pin_remover` call, whether it succeeds or backs out, is exactly
+    // balanced by a `release_remover` in every interleaving loom explores
+    // — no leaked or underflowed pin count. The SeqCst mutual exclusion
+    // itself is pinned by the stress tests exercising concurrent
+    // replace/delete against an evictor draining the same segment, not by
+    // loom.
+    #[test]
+    fn loom_removers_vs_cas_gated_drain() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            header.set_state(State::Sealed);
+            let committed = Arc::new(LoomAtomicU32::new(0));
+
+            let removers: Vec<_> = (0..2)
+                .map(|_| {
+                    let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
+                    thread::spawn(move || {
+                        if h.try_pin_remover() {
+                            // SC-dependent property recorded, not asserted
+                            // (see comment above and module NOTE).
+                            let _ = c.load(Ordering::SeqCst);
+                            h.release_remover();
+                        }
+                    })
+                })
+                .collect();
+
+            let claimer = {
+                let h = Arc::clone(&header);
+                let c = Arc::clone(&committed);
+                thread::spawn(move || {
+                    if h.cas_metadata(State::Sealed, State::Draining, None, None, Ordering::SeqCst)
+                    {
+                        // Single post-CAS observation, mirroring the reader
+                        // model's one recheck rather than a spin-wait: not
+                        // asserted on (SC-dependent), just exercised.
+                        let _ = h.active_removers();
+                        c.store(1, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            for r in removers {
+                r.join().unwrap();
+            }
+            claimer.join().unwrap();
+
+            // SC-independent: no interleaving leaves a pin dangling or
+            // double-releases one.
+            assert_eq!(header.active_removers(), 0);
+        });
+    }
+
     // Two writers CAS-reserve space from the same segment: both fit, so
     // the final state is fully determined regardless of interleaving —
     // the grants are exactly {base, base+24} and the offset lands at
@@ -1118,5 +1240,42 @@ mod tests {
         });
         assert!(!h.try_pin_writer());
         assert_eq!(h.active_writers(), 0);
+    }
+
+    #[test]
+    fn remover_pin_two_phase() {
+        use crate::segments::state::{Metadata, State};
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        // Free is not removable.
+        assert!(!h.try_pin_remover());
+        assert_eq!(h.active_removers(), 0);
+        // Sealed IS removable (interior items can be replaced/deleted).
+        h.store_metadata_for_test(Metadata {
+            next: None,
+            prev: None,
+            state: State::Sealed,
+        });
+        assert!(h.try_pin_remover());
+        assert_eq!(h.active_removers(), 1);
+        // Live is removable too (tail items).
+        h.store_metadata_for_test(Metadata {
+            next: None,
+            prev: None,
+            state: State::Live,
+        });
+        assert!(h.try_pin_remover());
+        assert_eq!(h.active_removers(), 2);
+        h.release_remover();
+        h.release_remover();
+        assert_eq!(h.active_removers(), 0);
+        // Draining is NOT removable — a remover must bail so it can't decrement a
+        // segment a drain is reclaiming.
+        h.store_metadata_for_test(Metadata {
+            next: None,
+            prev: None,
+            state: State::Draining,
+        });
+        assert!(!h.try_pin_remover());
+        assert_eq!(h.active_removers(), 0);
     }
 }

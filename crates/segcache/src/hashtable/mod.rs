@@ -13,7 +13,7 @@ pub(crate) mod table;
 pub(crate) mod traits;
 
 pub use location::Location;
-pub(crate) use table::MultiChoiceHashtable;
+pub(crate) use table::{MultiChoiceHashtable, SlotRef};
 pub(crate) use traits::{Hashtable, KeyVerifier};
 
 use core::num::NonZeroU32;

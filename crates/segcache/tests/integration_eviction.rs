@@ -24,7 +24,7 @@ fn small_cache(segments: usize, policy: Policy) -> Segcache {
 
 #[test]
 fn random_evicts_short_ttl_segment_when_full() {
-    let mut cache = small_cache(2, Policy::Random);
+    let cache = small_cache(2, Policy::Random);
     let ttl = Duration::from_secs(10); // < former SEG_MATURE_TIME (20s)
 
     // Fill both segments (mirroring integration_basic sizes).
@@ -103,7 +103,7 @@ fn fifo_evicts_oldest_segment_first() {
     // 3 segments: seg1 (old items) → seg2 (new items) → seg3 (tail/current write target).
     // Eviction must choose between seg1 and seg2; seg3 is never eligible because
     // it has no next_seg.  Correct FIFO picks seg1 (oldest).
-    let mut cache = small_cache(3, Policy::Fifo);
+    let cache = small_cache(3, Policy::Fifo);
     let ttl = Duration::ZERO;
 
     // Fill segment 1 with "old" items.
@@ -200,4 +200,52 @@ fn fifo_evicts_oldest_segment_first() {
         cache.get(b"new_e").is_some(),
         "FIFO must not evict the newer segment: new_e should be present"
     );
+}
+
+// Regression: insert() into a FULL Merge pool must complete (not livelock).
+//
+// Bug: Segment::prune()'s adaptive cutoff could collapse to 0 (t == -1 when
+// no bytes retained yet at the first checkpoint), permanently disabling the
+// cutoff>=0.0001 drop-gate so a merge candidate was retained whole. With the
+// Merge spare (spare_capacity 1) that fed only the spare, never the general
+// free queue, and reserve_and_define's retry loop spun forever on an evict()
+// that returned Ok without freeing a usable segment. This drove insert() into
+// an infinite loop on a full Merge cache. Fixed by flooring the prune cutoff
+// multiplier and bounding the retry loop to eviction that actually raises the
+// free queue.
+#[test]
+fn merge_full_pool_insert_makes_progress_no_livelock() {
+    let cache = small_cache(
+        8,
+        Policy::Merge {
+            max: 8,
+            merge: 4,
+            compact: 0,
+        },
+    );
+    let ttl = Duration::from_secs(3600);
+
+    // Fill well past capacity with distinct keys. Each insert must return
+    // promptly (Ok after eviction, or a bounded NoFreeSegments) — never hang.
+    let mut ok = 0usize;
+    for i in 0..3000usize {
+        let k = format!("k{i:06}");
+        let v = format!("v{i:06}");
+        if cache.insert(k.as_bytes(), v.as_bytes(), None, ttl).is_ok() {
+            ok += 1;
+        }
+    }
+
+    // The vast majority of inserts must succeed — eviction reclaims space, so
+    // the cache keeps accepting writes rather than wedging.
+    assert!(
+        ok >= 2900,
+        "expected nearly all inserts to succeed after eviction, got {ok}/3000"
+    );
+
+    // And the cache is still usable: the most recent key resolves.
+    cache
+        .insert(b"final", b"value", None, ttl)
+        .expect("insert into a churned Merge cache must succeed");
+    assert_eq!(cache.get(b"final").unwrap().value(), b"value");
 }

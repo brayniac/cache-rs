@@ -48,7 +48,7 @@ fn pinned_segment_survives_eviction_churn() {
     let heap_size = segments * segment_size as usize;
     let ttl = Duration::ZERO;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .eviction(Policy::Fifo)
@@ -93,7 +93,7 @@ fn pinned_segment_survives_clear() {
     let heap_size = segments * segment_size as usize;
     let ttl = Duration::ZERO;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -134,7 +134,7 @@ fn held_item_observes_inplace_increments() {
     let heap_size = segments * segment_size as usize;
     let ttl = Duration::ZERO;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -174,7 +174,7 @@ fn seal_on_append() {
     let heap_size = segments * segment_size as usize;
     let ttl = Duration::ZERO;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -227,7 +227,7 @@ fn cas_fails_when_own_reservation_evicts_checked_item() {
     let heap_size = segments * segment_size as usize;
     let ttl = Duration::ZERO;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .eviction(Policy::Fifo)
@@ -291,7 +291,7 @@ fn cas_fails_when_own_reservation_evicts_checked_item() {
 #[test]
 fn incr_bumps_cas_token() {
     let ttl = Duration::ZERO;
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(4096)
         .heap_size(4096 * 64)
         .build()
@@ -358,7 +358,7 @@ fn numeric_update_preserves_expiry() {
 // the segment has not been reclaimed by expire() yet.
 #[test]
 fn numeric_update_expired_counter_not_found() {
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(4096)
         .heap_size(4096 * 64)
         .build()
@@ -381,7 +381,7 @@ fn numeric_update_expired_counter_not_found() {
 fn try_into_numeric_arms() {
     let ttl = Duration::ZERO;
     let other_ttl = Duration::from_secs(60);
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(4096)
         .heap_size(4096 * 64)
         .build()
@@ -624,7 +624,7 @@ fn get() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -648,7 +648,7 @@ fn cas() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -683,7 +683,7 @@ fn cas_stale_token_rejected_after_segment_recycle() {
     let segments = 1;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -733,7 +733,7 @@ fn overwrite() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -780,7 +780,7 @@ fn delete() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -810,7 +810,7 @@ fn collisions_2() {
     let segments = 2;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .hash_power(7)
@@ -841,7 +841,7 @@ fn collisions() {
     // With the N-choice hashtable, hash_power(7) gives 2^7 = 128 slots
     // across 16 buckets with 2-choice hashing. Insert items until the
     // hashtable is full.
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .hash_power(7)
@@ -881,7 +881,7 @@ fn full_cache_long() {
     let value_size = 512;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .hash_power(16)
@@ -920,7 +920,7 @@ fn full_cache_long_2() {
     let value_size = 1;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .hash_power(16)
@@ -956,7 +956,7 @@ fn expiration() {
     let segment_size = 2 * 1024;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .hash_power(16)
@@ -1048,7 +1048,7 @@ fn evict_expires_before_merging() {
     let free_segments = 5usize;
     let total_segments = free_segments + 1; // + spare
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(segment_size as usize * total_segments)
         .hash_power(16)
@@ -1159,7 +1159,7 @@ fn merge_evict_copies_survivors_into_spare() {
     let free_segments = 5usize;
     let total_segments = free_segments + 1;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(segment_size as usize * total_segments)
         .hash_power(16)
@@ -1327,7 +1327,7 @@ fn merge_compact_combines_under_full_segments_into_spare() {
     let free_segments = 3usize;
     let total_segments = free_segments + 1;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(segment_size as usize * total_segments)
         .hash_power(16)
@@ -1490,7 +1490,7 @@ fn clear() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -1521,7 +1521,7 @@ fn wrapping_add() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -1561,7 +1561,7 @@ fn saturating_sub() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()
@@ -1604,7 +1604,7 @@ fn saturating_sub() {
 // the corrupted length caused a panic on the asserts, which correctly detected
 // the bad state.
 fn fuzz_1() {
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(1024)
         .heap_size(8 * 1024)
         .hash_power(7)
@@ -1648,7 +1648,7 @@ fn fuzz_1() {
 // behavior as fuzz_1 test, but also exposed that we had a tracking issue for
 // dead bytes when recycling a segment when live items dropped to zero.
 fn fuzz_2() {
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(1024)
         .heap_size(8 * 1024)
         .hash_power(7)
@@ -1864,7 +1864,7 @@ fn concurrent_readers_see_correct_values() {
     let segment_size = 4096;
     let segments = 64;
     let heap_size = segments * segment_size as usize;
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .eviction(Policy::Fifo)
@@ -1953,7 +1953,7 @@ fn concurrent_readers_see_correct_values() {
 // test in `eviction_concurrency_tests.rs`, which has a real racing thread.
 #[test]
 fn writer_pins_released_after_write_ops() {
-    let mut cache = Segcache::builder().build().expect("failed to create cache");
+    let cache = Segcache::builder().build().expect("failed to create cache");
 
     cache
         .insert(b"k1", b"v1", None, Duration::from_secs(60))

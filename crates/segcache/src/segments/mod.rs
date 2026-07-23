@@ -4,6 +4,7 @@ mod builder;
 mod error;
 mod guard;
 mod header;
+mod remover_pin;
 mod segment;
 #[allow(clippy::module_inception)]
 mod segments;
@@ -17,6 +18,7 @@ pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;
 pub(crate) use guard::SegmentGuard;
 pub(crate) use header::{SegmentHeader, SegmentPool};
+pub(crate) use remover_pin::RemoverPin;
 pub(crate) use segment::Segment;
 pub(crate) use segments::{AllocOutcome, ClearOutcome, Segments};
 pub(crate) use state::State;

@@ -82,7 +82,7 @@ fn set_benchmark(c: &mut Criterion) {
             let (keys, values) = key_values(*key_size, 1_000_000, *value_size, 10_000);
 
             // launch the server
-            let mut cache = Segcache::builder()
+            let cache = Segcache::builder()
                 .hash_power(16)
                 .heap_size(64 * MB)
                 .segment_size(MB as i32)
@@ -118,7 +118,7 @@ fn incr_benchmark(c: &mut Criterion) {
     // a single hot counter: the worst case for the republish design
     // (every increment writes a new item; sustained churn exercises
     // steady-state eviction, which is part of the honest cost)
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .hash_power(16)
         .heap_size(64 * MB)
         .segment_size(MB as i32)
@@ -143,7 +143,7 @@ fn cas_benchmark(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     // the realistic gets -> cas round trip on a single key
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .hash_power(16)
         .heap_size(64 * MB)
         .segment_size(MB as i32)

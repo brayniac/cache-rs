@@ -1,31 +1,18 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
+//! Random number generator initialization.
 
-//! Random number generator initialization
+use ::rand::SeedableRng;
 
-pub use inner::*;
+pub type Random = rand_xoshiro::Xoshiro256PlusPlus;
 
-#[cfg(test)]
-mod inner {
-    use ::rand::SeedableRng;
-
-    pub type Random = rand_xoshiro::Xoshiro256PlusPlus;
-
-    // A very fast PRNG which is appropriate for testing
-    pub fn rng() -> Random {
-        rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(0)
+/// Creates a freshly-seeded [`Random`]. Test builds seed from a fixed
+/// value for reproducibility; other builds seed from system entropy.
+pub fn rng() -> Random {
+    #[cfg(test)]
+    {
+        Random::seed_from_u64(0)
     }
-}
-
-#[cfg(not(test))]
-mod inner {
-    use ::rand::SeedableRng;
-
-    pub type Random = rand_xoshiro::Xoshiro256PlusPlus;
-
-    // A fast PRNG appropriate for cache eviction sampling.
-    pub fn rng() -> Random {
-        rand_xoshiro::Xoshiro256PlusPlus::from_rng(&mut ::rand::rng())
+    #[cfg(not(test))]
+    {
+        Random::from_rng(&mut ::rand::rng())
     }
 }

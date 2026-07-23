@@ -29,14 +29,16 @@ impl Item {
         self.raw.expire()
     }
 
-    /// Perform a wrapping addition on the value.
+    /// Add `rhs` to the stored value, wrapping on overflow. Returns
+    /// [`CuckooCacheError::NotNumeric`] if the stored value is not numeric.
     pub fn wrapping_add(&mut self, rhs: u64) -> Result<(), CuckooCacheError> {
         self.raw
             .wrapping_add(rhs)
             .map_err(|_| CuckooCacheError::NotNumeric)
     }
 
-    /// Perform a saturating subtraction on the value.
+    /// Subtract `rhs` from the stored value, saturating at zero. Returns
+    /// [`CuckooCacheError::NotNumeric`] if the stored value is not numeric.
     pub fn saturating_sub(&mut self, rhs: u64) -> Result<(), CuckooCacheError> {
         self.raw
             .saturating_sub(rhs)

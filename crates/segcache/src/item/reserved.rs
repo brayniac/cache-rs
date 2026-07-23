@@ -1,5 +1,5 @@
-//! A reserved item is an item which has been allocated but not yet linked
-//! in the hashtable.
+//! A write reservation: segment space claimed for an item that is not yet
+//! defined or published to the hashtable.
 
 use crate::segments::WriterPin;
 use crate::RawItem;
@@ -19,7 +19,7 @@ pub(crate) struct ReservedItem {
 }
 
 impl ReservedItem {
-    /// Create a `ReservedItem` from its parts, taking ownership of the writer pin.
+    /// Assemble a `ReservedItem` from its components, taking over the writer pin.
     pub fn new(item: RawItem, seg: NonZeroU32, offset: usize, pin: WriterPin) -> Self {
         Self {
             item,
@@ -29,22 +29,23 @@ impl ReservedItem {
         }
     }
 
-    /// Store the key, value, and optional data into the item
+    /// Populate the reserved slot's underlying item with key, value, and
+    /// optional bytes.
     pub fn define(&mut self, key: &[u8], value: Value, optional: &[u8]) {
         self.item.define(key, value, optional)
     }
 
-    /// Get the `RawItem` that backs the `ReservedItem`
+    /// Expose the underlying `RawItem` for this reservation.
     pub fn item(&self) -> RawItem {
         self.item
     }
 
-    /// Get the segment offset
+    /// Byte offset of this reservation within its segment.
     pub fn offset(&self) -> usize {
         self.offset
     }
 
-    /// Get the segment id
+    /// Identifier of the segment holding this reservation.
     pub fn seg(&self) -> NonZeroU32 {
         self.seg
     }

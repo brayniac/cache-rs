@@ -17,7 +17,8 @@ pub use value::{OwnedValue, Value};
 #[cfg(any(feature = "integrity", feature = "debug"))]
 pub use item::ITEM_INTEGRITY_SIZE;
 
-/// A simple error indicating the item value is not a numeric type.
+/// Error returned when a numeric operation is attempted on a non-numeric
+/// value.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct NotNumericError;
 

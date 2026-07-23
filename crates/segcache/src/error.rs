@@ -1,28 +1,24 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! Top-level errors that will be returned to a caller of this library.
+//! Error types surfaced from this crate's public API.
 
 use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Eq, Copy, Clone)]
-/// Possible errors returned by the top-level API
+/// Errors that a public API call can produce.
 pub enum SegcacheError {
-    #[error("hashtable insert exception")]
+    #[error("hash table insertion failed")]
     HashTableInsertEx,
-    #[error("eviction exception")]
+    #[error("could not evict a segment to free space")]
     EvictionEx,
-    #[error("item oversized ({size:?} bytes)")]
+    #[error("item too large ({size:?} bytes)")]
     ItemOversized { size: usize },
-    #[error("no free segments")]
+    #[error("out of free segments")]
     NoFreeSegments,
-    #[error("item exists")]
+    #[error("item already present")]
     Exists,
-    #[error("item not found")]
+    #[error("no item found for the key")]
     NotFound,
-    #[error("data corruption detected")]
+    #[error("integrity check failed")]
     DataCorrupted,
-    #[error("item is not numeric")]
+    #[error("existing value is not numeric")]
     NotNumeric,
 }

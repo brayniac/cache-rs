@@ -359,18 +359,19 @@ impl CuckooCache {
     // Public API
     // -----------------------------------------------------------------------
 
-    /// Look up an item by key.
+    /// Retrieve the item stored under `key`. Returns `None` if the item is not
+    /// present or has expired.
     ///
     /// ```
     /// use cuckoo_cache::CuckooCache;
     /// use std::time::Duration;
     ///
     /// let mut cache = CuckooCache::builder().build();
-    /// assert!(cache.get(b"coffee").is_none());
+    /// assert!(cache.get(b"session-42").is_none());
     ///
-    /// cache.insert(b"coffee", b"strong", Duration::ZERO).unwrap();
-    /// let item = cache.get(b"coffee").unwrap();
-    /// assert_eq!(item.value(), b"strong");
+    /// cache.insert(b"session-42", b"active", Duration::ZERO).unwrap();
+    /// let item = cache.get(b"session-42").unwrap();
+    /// assert_eq!(item.value(), b"active");
     /// ```
     pub fn get(&mut self, key: &[u8]) -> Option<Item> {
         #[cfg(feature = "metrics")]
@@ -404,21 +405,22 @@ impl CuckooCache {
         None
     }
 
-    /// Insert an item into the cache.
+    /// Store `value` under `key`. If the key is already present, the value
+    /// is replaced.
     ///
     /// ```
     /// use cuckoo_cache::CuckooCache;
     /// use std::time::Duration;
     ///
     /// let mut cache = CuckooCache::builder().build();
-    /// cache.insert(b"drink", b"coffee", Duration::ZERO).unwrap();
+    /// cache.insert(b"status", b"pending", Duration::ZERO).unwrap();
     ///
-    /// let item = cache.get(b"drink").unwrap();
-    /// assert_eq!(item.value(), b"coffee");
+    /// let item = cache.get(b"status").unwrap();
+    /// assert_eq!(item.value(), b"pending");
     ///
-    /// cache.insert(b"drink", b"whisky", Duration::ZERO).unwrap();
-    /// let item = cache.get(b"drink").unwrap();
-    /// assert_eq!(item.value(), b"whisky");
+    /// cache.insert(b"status", b"complete", Duration::ZERO).unwrap();
+    /// let item = cache.get(b"status").unwrap();
+    /// assert_eq!(item.value(), b"complete");
     /// ```
     pub fn insert<'a, T: Into<Value<'a>>>(
         &mut self,
@@ -467,18 +469,20 @@ impl CuckooCache {
         Ok(())
     }
 
-    /// Remove the item with the given key.
+    /// Delete the entry for `key`. Returns `true` only if a live (unexpired)
+    /// item was removed; a missing key — or one whose item has already
+    /// expired — returns `false`.
     ///
     /// ```
     /// use cuckoo_cache::CuckooCache;
     /// use std::time::Duration;
     ///
     /// let mut cache = CuckooCache::builder().build();
-    /// assert!(!cache.delete(b"coffee"));
+    /// assert!(!cache.delete(b"token-7"));
     ///
-    /// cache.insert(b"coffee", b"strong", Duration::ZERO).unwrap();
-    /// assert!(cache.delete(b"coffee"));
-    /// assert!(cache.get(b"coffee").is_none());
+    /// cache.insert(b"token-7", b"issued", Duration::ZERO).unwrap();
+    /// assert!(cache.delete(b"token-7"));
+    /// assert!(cache.get(b"token-7").is_none());
     /// ```
     pub fn delete(&mut self, key: &[u8]) -> bool {
         #[cfg(feature = "metrics")]
@@ -510,7 +514,9 @@ impl CuckooCache {
         self.data.fill(0);
     }
 
-    /// Perform a wrapping addition on a numeric value.
+    /// Add `rhs` to the numeric value stored under `key`, wrapping on
+    /// overflow. Fails if the key has no item, or if the stored item isn't
+    /// numeric.
     pub fn wrapping_add(&mut self, key: &[u8], rhs: u64) -> Result<Item, CuckooCacheError> {
         let positions = self.positions(key);
 
@@ -531,7 +537,9 @@ impl CuckooCache {
         Err(CuckooCacheError::NotFound)
     }
 
-    /// Perform a saturating subtraction on a numeric value.
+    /// Subtract `rhs` from the numeric value stored under `key`, saturating
+    /// at zero. Fails if the key has no item, or if the stored item isn't
+    /// numeric.
     pub fn saturating_sub(&mut self, key: &[u8], rhs: u64) -> Result<Item, CuckooCacheError> {
         let positions = self.positions(key);
 
@@ -552,7 +560,7 @@ impl CuckooCache {
         Err(CuckooCacheError::NotFound)
     }
 
-    /// Get a count of live (non-expired) items.
+    /// Count how many slots currently hold a live, unexpired item.
     ///
     /// ```
     /// use cuckoo_cache::CuckooCache;

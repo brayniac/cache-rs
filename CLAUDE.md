@@ -20,7 +20,7 @@ cargo bench -p segcache            # Run benchmarks (criterion, 30s measurement)
 
 ## Workspace Structure
 
-Four crates with clear dependency flow: **segcache** and **cuckoo-cache** are cache engines that depend on **keyvalue** (shared item types) and optionally **datatier** (storage backends).
+Three crates with clear dependency flow: **segcache** and **cuckoo-cache** are cache engines that depend on **keyvalue** (shared item types). segcache allocates its segment heap directly via an anonymous `memmap2` mapping.
 
 ### keyvalue — Packed Item Types
 
@@ -28,13 +28,6 @@ Defines `Value`/`OwnedValue` enums (bytes or u64) and two item layouts:
 
 - **RawItem**: Used by segcache. 5-byte header (9 with `magic` feature). Variable-size keys/values up to 16MB. Stored as `*mut u8` pointer into segment memory.
 - **TinyItem**: Used by cuckoo-cache. 6-byte fixed header. Keys and values limited to 255 bytes each. Expiration embedded in header (`0` = empty slot, `u32::MAX` = no expiry).
-
-### datatier — Storage Pool Abstraction
-
-`Datapool` trait with three implementations:
-- `Memory`: Anonymous mmap with page prefaulting (standard use case)
-- `MmapFile`: File-backed mmap with blake3 checksum header (persistent memory/DAX)
-- `FileBackedMemory`: DRAM via anon mmap + periodic page flush to file (NVMe durability)
 
 ### segcache — Segment-Structured Cache
 

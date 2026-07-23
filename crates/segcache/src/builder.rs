@@ -1,19 +1,16 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! A builder for configuring a new [`Segcache`] instance.
+//! Builder for configuring a [`Segcache`] before it is built.
 
 use crate::*;
 
-/// A builder that is used to construct a new [`Segcache`] instance.
+/// Accumulates cache parameters (hash table sizing, heap layout, eviction
+/// policy) prior to calling [`Builder::build`].
 pub struct Builder {
     hash_power: u8,
     overflow_factor: f64,
     segments_builder: SegmentsBuilder,
 }
 
-// Defines the default parameters
+// Values used when a field is never explicitly set via the builder methods.
 impl Default for Builder {
     fn default() -> Self {
         Self {
@@ -25,20 +22,19 @@ impl Default for Builder {
 }
 
 impl Builder {
-    /// Specify the hash power, which limits the size of the hashtable to 2^N
-    /// entries. 1/8th of these are used for metadata storage, meaning that the
-    /// total number of items which can be held in the cache is limited to
-    /// `7 * 2^(N - 3)` items. The hash table will have a total size of
-    /// `2^(N + 3)` bytes.
+    /// Sets `N` so the hash table is sized to hold `2^N` entry slots (8
+    /// slots per bucket, so the bucket count is `2^(N - 3)`). Every slot is
+    /// usable for an item — there's no reserved metadata slot — and each
+    /// bucket occupies one 64-byte cache line, so the table as a whole takes
+    /// up `2^(N + 3)` bytes. `N` must be at least 7.
     ///
     /// ```
     /// use segcache::Segcache;
     ///
-    /// // create a cache with a small hashtable that has room for ~114k items
-    /// // without using any overflow buckets.
+    /// // a modest hash table: 2^17 slots, roughly 131k entries of headroom
     /// let cache = Segcache::builder().hash_power(17).build();
     ///
-    /// // create a cache with a larger hashtable with room for ~1.8M items
+    /// // a much larger table: 2^21 slots, roughly 2.1M entries of headroom
     /// let cache = Segcache::builder().hash_power(21).build();
     /// ```
     pub fn hash_power(mut self, hash_power: u8) -> Self {
@@ -47,23 +43,21 @@ impl Builder {
         self
     }
 
-    /// Specify an overflow factor which is used to scale the hashtable and
-    /// provide additional capacity for chaining item buckets. A factor of 1.0
-    /// will result in a hash table that is 100% larger.
+    /// Records a hash-table growth factor on the builder. This setting is
+    /// retained for API compatibility with earlier chaining-bucket
+    /// hashtable implementations; the current lock-free, N-choice hashtable
+    /// derives its size solely from [`Builder::hash_power`], so this value
+    /// is stored but not currently consulted by [`Builder::build`].
     ///
     /// ```
     /// use segcache::Segcache;
     ///
-    /// // create a cache with a hashtable with room for ~228k items, which is
-    /// // about the same as using a hash power of 18, but is more tolerant of
-    /// // hash collisions.
+    /// // the value is accepted but has no effect on the resulting table
     /// let cache = Segcache::builder()
     ///     .hash_power(17)
     ///     .overflow_factor(1.0)
     ///     .build();
     ///
-    /// // smaller overflow factors may be specified, meaning only some buckets
-    /// // can ever be chained
     /// let cache = Segcache::builder()
     ///     .hash_power(17)
     ///     .overflow_factor(0.2)
@@ -74,64 +68,69 @@ impl Builder {
         self
     }
 
-    /// Specify the total number of bytes to be used for heap storage of items.
-    /// This includes, key, value, and per-item overheads.
+    /// Sets the overall byte budget for the segment heap that backs stored
+    /// items. Keys, values, and the per-item header all come out of this
+    /// budget, and it is carved up into fixed-size segments (see
+    /// [`Builder::segment_size`]) at build time.
     ///
     /// ```
     /// use segcache::Segcache;
     ///
     /// const MB: usize = 1024 * 1024;
     ///
-    /// // create a cache with a 64MB heap
-    /// let cache = Segcache::builder().heap_size(64 * MB).build();
+    /// // a cache backed by a 32MB heap
+    /// let cache = Segcache::builder().heap_size(32 * MB).build();
     ///
-    /// // create a cache with a 256MB heap
-    /// let cache = Segcache::builder().heap_size(256 * MB).build();
+    /// // a cache backed by a 512MB heap
+    /// let cache = Segcache::builder().heap_size(512 * MB).build();
     /// ```
     pub fn heap_size(mut self, bytes: usize) -> Self {
         self.segments_builder = self.segments_builder.heap_size(bytes);
         self
     }
 
-    /// Specify the segment size for item storage. The largest item which can be
-    /// held is `size - 5` bytes for builds without the `debug` or `magic` build
-    /// features enabled. Smaller segment sizes reduce the number of items which
-    /// would be evicted/expired at one time, at the cost of additional memory
-    /// and book-keeping overheads compared to using larger segments for the
-    /// same total size.
+    /// Sets the size in bytes of each segment the heap is divided into.
+    /// Each item consumes its packed header plus key and value bytes, so
+    /// with the default (non-`debug`, non-`magic`) header layout an item
+    /// can be at most `size - 5` bytes. Choosing smaller segments caps how
+    /// much data is reclaimed by a single eviction or TTL expiry, at the
+    /// cost of more segments (and therefore more header/bookkeeping
+    /// overhead) for a fixed heap size; larger segments invert that
+    /// trade-off.
     ///
     /// ```
     /// use segcache::Segcache;
     ///
     /// const MB: i32 = 1024 * 1024;
     ///
-    /// // create a cache using 1MB segments
-    /// let cache = Segcache::builder().segment_size(1 * MB).build();
+    /// // segments sized at 2MB each
+    /// let cache = Segcache::builder().segment_size(2 * MB).build();
     ///
-    /// // create a cache using 4MB segments
-    /// let cache = Segcache::builder().segment_size(4 * MB).build();
+    /// // segments sized at 8MB each
+    /// let cache = Segcache::builder().segment_size(8 * MB).build();
     /// ```
     pub fn segment_size(mut self, size: i32) -> Self {
         self.segments_builder = self.segments_builder.segment_size(size);
         self
     }
 
-    /// Specify the eviction policy to be used. See the `Policy` documentation
-    /// for more details about each strategy.
+    /// Selects which [`Policy`] the cache uses to pick a segment for
+    /// reclamation once the heap is full. Each variant of `Policy` documents
+    /// its own selection strategy in detail.
     ///
     /// ```
     /// use segcache::{Policy, Segcache};
     ///
-    /// // create a cache using random segment eviction
+    /// // uniformly random segment eviction
     /// let cache = Segcache::builder().eviction(Policy::Random).build();
     ///
-    /// // create a cache using a merge based eviction policy
-    /// let policy = Policy::Merge { max: 8, merge: 4, compact: 2};
+    /// // frequency-aware merge eviction over chains of segments
+    /// let policy = Policy::Merge { max: 6, merge: 3, compact: 4 };
     /// let cache = Segcache::builder().eviction(policy).build();
     ///
-    /// // create an S3-Segcache with 10% admission pool
+    /// // S3-FIFO style eviction with a 20% admission pool
     /// let cache = Segcache::builder()
-    ///     .eviction(Policy::S3Fifo { admission_ratio: 0.10 })
+    ///     .eviction(Policy::S3Fifo { admission_ratio: 0.20 })
     ///     .build();
     /// ```
     pub fn eviction(mut self, policy: Policy) -> Self {
@@ -139,7 +138,11 @@ impl Builder {
         self
     }
 
-    /// Consumes the builder and returns a fully-allocated `Segcache` instance.
+    /// Allocates the hash table and segment heap according to the
+    /// accumulated settings and assembles them into a ready-to-use
+    /// `Segcache`. Building can fail — for example if `heap_size` isn't a
+    /// multiple of `segment_size` — in which case an `Err` is returned
+    /// instead of a cache.
     ///
     /// ```
     /// use segcache::{Policy, Segcache};
@@ -147,9 +150,9 @@ impl Builder {
     /// const MB: usize = 1024 * 1024;
     ///
     /// let cache = Segcache::builder()
-    ///     .heap_size(64 * MB)
-    ///     .segment_size(1 * MB as i32)
-    ///     .hash_power(16)
+    ///     .heap_size(32 * MB)
+    ///     .segment_size(2 * MB as i32)
+    ///     .hash_power(15)
     ///     .eviction(Policy::Random).build();
     /// ```
     pub fn build(self) -> Result<Segcache, std::io::Error> {

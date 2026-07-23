@@ -4,32 +4,38 @@
 //! key bytes, and value bytes.
 //!
 //! ```text
-//! ┌──────┬───────┬──────────────────────────────┐
-//! │ KLEN │ FLAGS │             VLEN             │
-//! │  u8  │  u8   │             u32              │
-//! │ 8bit │ 8bit  │            32 bit            │
-//! └──────┴───────┴──────────────────────────────┘
+//! Base layout — 6 bytes, `integrity` feature off:
+//!   offset : field : width : notes
+//!        0 : klen   :   1   : key length (u8)
+//!        1 : flags  :   1   : bit-packed, see below
+//!        2 : vlen   :   4   : value length (u32)
 //!
-//! FLAGS: [is_numeric:1][is_deleted:1][olen:6]
+//! Integrity layout — 12 bytes, `integrity` feature on:
+//!   offset : field  : width : notes
+//!        0 : magic  :   2   : sentinel bytes 0x4B, 0x56 ("KV")
+//!        2 : klen   :   1   : key length (u8)
+//!        3 : flags  :   1   : bit-packed, see below
+//!        4 : vlen   :   4   : value length (u32)
+//!        8 : crc32  :   4   : checksum, see coverage note below
 //!
-//! With `integrity` feature, magic and CRC32 fields are added:
+//! flags byte, bit 7 down to bit 0:
+//!   [ numeric:1 | deleted:1 | olen:6 ]
+//!   - numeric (bit 7): value is a packed integer rather than raw bytes
+//!   - deleted (bit 6): tombstone marker
+//!   - olen (bits 5-0): length of the optional data segment, 0-63
 //!
-//! ┌───────┬───────┬──────┬───────┬──────────────┬──────────────┐
-//! │MAGIC_0│MAGIC_1│ KLEN │ FLAGS │     VLEN     │    CRC32     │
-//! │  u8   │  u8   │  u8  │  u8   │     u32      │     u32      │
-//! │ 0xCA  │ 0xFE  │ 8bit │ 8bit  │    32 bit    │    32 bit    │
-//! └───────┴───────┴──────┴───────┴──────────────┴──────────────┘
-//!
-//! The CRC32 covers the full item: magic + klen + flags + vlen + optional
-//! + key + value. Computed with the CRC32 field zeroed during calculation.
+//! crc32 coverage: computed over the entire item — magic, klen, flags,
+//! vlen, optional data, key, and value — with the crc32 field itself
+//! held at zero while the checksum is calculated.
 //! ```
 
-/// The size of the item header in bytes.
+/// Byte width of `ItemHeader`, derived from its (possibly
+/// integrity-extended) field layout.
 pub const ITEM_HDR_SIZE: usize = std::mem::size_of::<ItemHeader>();
 
-/// Magic sentinel bytes for integrity checking.
+/// Magic sentinel bytes for integrity checking: the ASCII bytes "KV".
 #[cfg(feature = "integrity")]
-pub const ITEM_MAGIC: [u8; 2] = [0xCA, 0xFE];
+pub const ITEM_MAGIC: [u8; 2] = [0x4B, 0x56];
 
 /// Size of the integrity fields (magic + CRC32) when the feature is enabled.
 #[cfg(feature = "integrity")]
@@ -44,7 +50,7 @@ const NUMERIC_MASK: u8 = 0b1000_0000;
 const DELETE_MASK: u8 = 0b0100_0000;
 const OLEN_MASK: u8 = 0b0011_1111;
 
-/// Packed item header stored at the start of each item in segment memory.
+/// Packed item header stored at the start of each item.
 ///
 /// Base layout: `[klen:1][flags:1][vlen:4]` = 6 bytes.
 /// With `integrity`: `[magic:2][klen:1][flags:1][vlen:4][crc32:4]` = 12 bytes.
@@ -80,10 +86,12 @@ impl ItemHeader {
         }
     }
 
-    /// Check that the magic bytes match the expected value.
+    /// Assert that this header's magic bytes still match the sentinel
+    /// value written by `init`.
     ///
     /// # Panics
-    /// Panics if the magic bytes are incorrect, indicating data corruption.
+    /// A mismatch means the header has been corrupted, so this asserts rather
+    /// than returning a `Result`.
     pub fn check_magic(&self) {
         #[cfg(feature = "integrity")]
         {

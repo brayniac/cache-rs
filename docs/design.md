@@ -17,12 +17,12 @@ The central idea is **separation of storage from eviction**. The storage layer �
                 │  └───────────────┬────────────────┘  │
                 └──────────────────┼───────────────────┘
                                    │
-              ┌────────────────────┼────────────────┐
-              ▼                    ▼                ▼
-        ┌───────────┐       ┌───────────┐    ┌───────────┐
-        │ keyvalue  │       │ datatier  │    │ metriken  │
-        │ (items)   │       │ (mmap)    │    │ (metrics) │
-        └───────────┘       └───────────┘    └───────────┘
+                 ┌─────────────────┴─────────────────┐
+                 ▼                                   ▼
+           ┌───────────┐                       ┌───────────┐
+           │ keyvalue  │                       │ metriken  │
+           │ (items)   │                       │ (metrics) │
+           └───────────┘                       └───────────┘
 ```
 
 This means adding a new eviction algorithm — like S3-FIFO — requires only the decision logic (~250 lines), not a new storage engine. The new policy automatically inherits:

@@ -1,27 +1,25 @@
-//! A single TTL bucket containing a segment chain.
+//! One TTL bucket: the anchor for a chain of segments in a shared TTL range.
 //!
 //! Items with similar TTLs are stored in segments linked together in a
 //! doubly-linked chain. The head segment is always the oldest, enabling
 //! O(1) expiration by checking only the head.
 //!
 //! ```text
-//! ┌──────────────┬──────────────┬─────────────┬──────────────┐
-//! │   HEAD SEG   │   TAIL SEG   │     TTL     │     NSEG     │
-//! │              │              │             │              │
-//! │    32 bit    │    32 bit    │    32 bit   │    32 bit    │
-//! ├──────────────┼──────────────┴─────────────┴──────────────┤
-//! │  NEXT MERGE  │                  PADDING                  │
-//! │              │                                           │
-//! │    32 bit    │                  96 bit                   │
-//! ├──────────────┴───────────────────────────────────────────┤
-//! │                         PADDING                          │
-//! │                                                          │
-//! │                         128 bit                          │
-//! ├──────────────────────────────────────────────────────────┤
-//! │                         PADDING                          │
-//! │                                                          │
-//! │                         128 bit                          │
-//! └──────────────────────────────────────────────────────────┘
+//! offset : field          : width : notes
+//!      0 : head           :   4   : AtomicU32, oldest segment (0 = none)
+//!      4 : tail           :   4   : AtomicU32, writable segment (0 = none)
+//!      8 : ttl            :   4   : i32, this bucket's TTL
+//!     12 : nseg           :   4   : AtomicU32, total segments ever linked
+//!     16 : next_to_merge  :   4   : AtomicU32, merge-resume hint (0 = none)
+//!     20 : chain_lock     :   8   : Box<Mutex<()>>, pointer-sized; the
+//!                                   mutex body lives off to the side so
+//!                                   this field stays cache-line-local
+//!     28 : _pad           :  36   : reserved, rounds the struct out to
+//!                                   64 bytes
+//!
+//! total: 64 bytes = 1 cache line. Offsets above follow field declaration
+//! order for documentation purposes; `TtlBucket` has no `#[repr(C)]`, so
+//! the compiler is free to reorder fields in the actual layout.
 //! ```
 
 use crate::segments::AllocOutcome;
@@ -441,9 +439,9 @@ impl TtlBucket {
     /// Expands the bucket with a new segment if the current tail is
     /// full. Concurrent-safe among writers: space grants are a bounded
     /// CAS on the tail's write offset, and expansion is a lock-free
-    /// seal election (see `try_expand`). Returns a `ReservedItem`
-    /// pointing to the allocated space, or an error if the item is
-    /// oversized or no segments are free.
+    /// seal election (see `try_expand`). On success it yields a
+    /// `ReservedItem` for the granted region; it fails if the item
+    /// exceeds the size limit or the pool has no free segments.
     pub(crate) fn reserve(
         &self,
         size: usize,

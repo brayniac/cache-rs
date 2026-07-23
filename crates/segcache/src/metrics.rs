@@ -1,8 +1,4 @@
-// Copyright 2022 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-// All metrics for the Seg crate
+// Metric definitions for this crate.
 
 use metriken::*;
 

@@ -2,7 +2,7 @@
 
 use crate::{CuckooCache, Policy};
 
-/// A builder used to configure and construct a [`CuckooCache`].
+/// Builder for a [`CuckooCache`].
 pub struct Builder {
     pub(crate) item_size: usize,
     pub(crate) nitem: usize,

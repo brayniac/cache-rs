@@ -11,9 +11,10 @@ use core::hash::{BuildHasher, Hasher};
 use core::num::NonZeroU32;
 use memmap2::MmapOptions;
 
-/// `Segments` contain all items within the cache. This struct is a collection
-/// of individual `Segment`s which are represented by a `SegmentHeader` and a
-/// subslice of bytes from a contiguous anonymous mmap allocation.
+/// Owns the full set of segments backing the cache: the header array plus
+/// the mmap region the headers index into. Every `Segment` handed out
+/// elsewhere is a transient view built from one header paired with its
+/// corresponding byte range here, not a separately stored object.
 pub(crate) struct Segments {
     /// Segment metadata headers (one per segment, cache-line aligned).
     ///
@@ -24,9 +25,9 @@ pub(crate) struct Segments {
     headers: Box<[SegmentHeader]>,
     /// Anonymous mmap-backed heap for segment data.
     data: memmap2::MmapMut,
-    /// Segment size in bytes.
+    /// Byte length of a single segment's data region.
     segment_size: i32,
-    /// Total number of segments.
+    /// Number of segments the mmap region is divided into.
     cap: u32,
     /// Lock-free free segment queue. Boxed for a stable address: guards
     /// hold a raw pointer to it so the AwaitingRelease handoff can return
@@ -210,7 +211,8 @@ impl Segments {
         self.policy
     }
 
-    /// Return the size of each segment in bytes.
+    /// Byte length of a single segment's data region, as configured at
+    /// construction.
     #[inline]
     pub fn segment_size(&self) -> i32 {
         self.segment_size
@@ -294,9 +296,10 @@ impl Segments {
 
     // ── Item access ──────────────────────────────────────────────────
 
-    /// Retrieve a `RawItem` from a specific segment id at the given offset.
-    /// This can take `&self` because we only need a shared reference to the
-    /// header and we construct the `RawItem` directly from a data pointer.
+    /// Compute the `RawItem` view at `offset` within the given segment,
+    /// without any bounds or liveness check on that offset. Takes `&self`
+    /// because it only reads the segment's data pointer to derive the
+    /// address; it never touches the header's mutable state.
     pub(crate) fn get_item_at(&self, seg_id: Option<NonZeroU32>, offset: usize) -> Option<RawItem> {
         let seg_id = seg_id.map(|v| v.get())?;
         trace!("getting item from: seg: {seg_id} offset: {offset}");
@@ -408,7 +411,7 @@ impl Segments {
 
     // ── Segment views ────────────────────────────────────────────────
 
-    /// Returns a `Segment` view for the segment with the specified id.
+    /// Builds the `Segment` view corresponding to the given segment id.
     ///
     /// # Why `&self` is sound (exclusivity by segment state-ownership)
     ///
@@ -517,10 +520,13 @@ impl Segments {
 
     // ── Chain helpers ────────────────────────────────────────────────
 
-    /// Unlink a segment from its chain by patching the prev/next pointers of
-    /// its neighbours.
+    /// Remove `id` from its TTL-bucket chain, stitching its neighbours'
+    /// prev/next pointers together so the chain stays contiguous with `id`
+    /// excised.
     ///
-    /// *NOTE*: this must not be used on segments in the free queue.
+    /// *NOTE*: callers must ensure `id` is currently chained (readable
+    /// segments only) — this has no meaning for a segment sitting on the
+    /// free queue, which is not part of any chain.
     fn unlink(&self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
 
@@ -635,9 +641,10 @@ impl Segments {
         }
     }
 
-    /// Reserve a segment from the free queue. Returns the id of a
-    /// segment in the Reserved state (statistics reset, generation
-    /// bumped), which must then be linked into a segment chain.
+    /// Pop a segment off the free queue and claim it for the caller. The
+    /// returned id has already been transitioned to the Reserved state,
+    /// with its write statistics reset and its generation counter bumped;
+    /// linking it into a segment chain is left to the caller.
     pub(crate) fn reserve_free(&self) -> Option<NonZeroU32> {
         loop {
             match self.free_queue.steal() {
@@ -928,9 +935,13 @@ impl Segments {
         }
     }
 
-    /// Perform eviction based on the configured eviction policy. A success
-    /// indicates that a segment was put onto the free queue and `reserve_free()`
-    /// should return some segment id.
+    /// Run a single eviction attempt using whichever policy this cache was
+    /// configured with. When this returns `Ok`, a segment has landed on the
+    /// free queue, so a following call to `reserve_free()` ought to find
+    /// one waiting.
+    ///
+    /// The merge/compaction policies this dispatches to follow the eviction
+    /// design described in Segcache (Yang et al., USENIX NSDI 2021).
     pub fn evict(
         &self,
         ttl_buckets: &TtlBuckets,
@@ -958,8 +969,9 @@ impl Segments {
                 let offset = ttl_buckets.get_bucket_index(ttl);
                 let buckets = ttl_buckets.buckets.len();
 
-                // Since merging starts in the middle of a segment chain, we
-                // may need to loop back around to the first TTL bucket.
+                // A merge candidate can begin partway through a chain rather
+                // than at its head, so this loop wraps back around to
+                // bucket 0 instead of stopping once it reaches the last one.
                 for i in 0..=buckets {
                     let bucket_id = (offset + i) % buckets;
                     let ttl_bucket = &ttl_buckets.buckets[bucket_id];
@@ -1065,8 +1077,13 @@ impl Segments {
         }
     }
 
-    /// Returns the least valuable segment based on the configured eviction
-    /// policy.
+    /// Picks the next eviction candidate under whichever `Policy` this
+    /// instance was built with, dispatching to the random scan, the
+    /// weighted-random FIFO-bucket pick, or the ranked-index lookup used by
+    /// the sophisticated policies.
+    ///
+    /// Idea: the ranked-index branch follows the merge/compaction eviction
+    /// design from Segcache (Yang et al., USENIX NSDI 2021).
     pub(crate) fn least_valuable_seg(&self, ttl_buckets: &TtlBuckets) -> Option<NonZeroU32> {
         match self.policy {
             Policy::None => None,
@@ -1078,7 +1095,9 @@ impl Segments {
                 for i in 0..self.cap {
                     let idx = (start + i) % self.cap;
                     if self.headers[idx as usize].can_evict() {
-                        // SAFETY: we are always adding 1 to the index.
+                        // SAFETY: `idx + 1` is nonzero because `idx` is an
+                        // unsigned index (>= 0), so the `+ 1` can never
+                        // produce 0.
                         return Some(unsafe { NonZeroU32::new_unchecked(idx + 1) });
                     }
                 }
@@ -1127,9 +1146,13 @@ impl Segments {
 
     // ── Remove ───────────────────────────────────────────────────────
 
-    /// Remove a single item from a segment based on the segment id and offset.
+    /// Erases the item living at `offset` in segment `seg_id`, updating
+    /// occupancy accounting for that segment.
     /// May trigger merge compaction if the merge eviction policy is active and
     /// the segment occupancy drops below the compact ratio.
+    ///
+    /// Idea: the compaction trigger below follows the merge/compaction
+    /// eviction design from Segcache (Yang et al., USENIX NSDI 2021).
     ///
     /// `pin` is a remover pin (item 7f) taken by the caller on `seg_id`
     /// BEFORE unlinking the item from the hashtable, so it brackets the
@@ -1177,8 +1200,8 @@ impl Segments {
             }
         }
 
-        // For merge eviction, check if the segment is below the compact ratio
-        // low watermark. If so, perform a no-evict merge (compaction only).
+        // Under the Merge policy, once a segment falls beneath the compaction
+        // occupancy floor, compact it forward in place without evicting items.
         if let Policy::Merge { .. } = self.policy {
             let target_ratio = self.evict.lock().unwrap().compact_ratio();
 
@@ -1283,6 +1306,9 @@ impl Segments {
     /// it (reader-safe — bytes are never relocated in place) and the candidate
     /// is then drained via `clear_segment`. Returns the next segment id to
     /// merge from (if any).
+    ///
+    /// Idea: this frequency-pruning merge follows the eviction design from
+    /// Segcache (Yang et al., USENIX NSDI 2021).
     fn merge_evict(
         &self,
         start: NonZeroU32,
@@ -1496,6 +1522,9 @@ impl Segments {
     /// low watermark — not an evict-under-pressure path — so unlike
     /// `merge_evict` it does not fall back to dropping a segment when no
     /// spare is available; it simply skips (`Ok(None)`).
+    ///
+    /// Idea: this compaction pass follows the merge-based compaction design
+    /// from Segcache (Yang et al., USENIX NSDI 2021).
     fn merge_compact(
         &self,
         start: NonZeroU32,

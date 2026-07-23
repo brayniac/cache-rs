@@ -1,7 +1,3 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rand::Rng;
 use rand::SeedableRng;
@@ -11,7 +7,7 @@ use std::time::Duration;
 
 pub const MB: usize = 1024 * 1024;
 
-// A very fast PRNG which is appropriate for testing
+// Deterministic, low-overhead PRNG used only for benchmarking.
 pub fn rng() -> impl Rng {
     rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(0)
 }

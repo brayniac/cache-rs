@@ -1,8 +1,4 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! Random number generator initialization
+//! Test-only PRNG construction.
 
 pub use inner::*;
 
@@ -12,7 +8,7 @@ mod inner {
 
     pub type Random = rand_xoshiro::Xoshiro256PlusPlus;
 
-    // A very fast PRNG which is appropriate for testing
+    // Deterministic, low-overhead PRNG used only in tests.
     pub fn rng() -> Random {
         rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(0)
     }

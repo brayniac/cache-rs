@@ -7,8 +7,8 @@ use thiserror::Error;
 pub enum CuckooCacheError {
     #[error("item oversized ({size} bytes, max {max} bytes)")]
     ItemOversized { size: usize, max: usize },
-    #[error("item not found")]
+    #[error("no item found for the key")]
     NotFound,
-    #[error("item is not numeric")]
+    #[error("existing value is not numeric")]
     NotNumeric,
 }

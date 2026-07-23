@@ -1,7 +1,3 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Core datastructure.
 
 use crate::Value;
@@ -11,10 +7,12 @@ use std::cmp::min;
 
 const RESERVE_RETRIES: usize = 3;
 
-/// A pre-allocated key-value store with eager expiration. It uses a
-/// segment-structured design that stores data in fixed-size segments, grouping
-/// objects with nearby expiration time into the same segment, and lifting most
-/// per-object metadata into the shared segment header.
+/// A fixed-capacity key-value cache that reclaims expired data proactively
+/// rather than on next access. Item bytes live in append-only, fixed-size
+/// segments; items sharing a similar expiration horizon are collected into
+/// the same segment so that an entire segment can be reclaimed in one step
+/// once its TTL bucket has fully expired, and per-item bookkeeping that
+/// would otherwise cost bytes per item is instead tracked once per segment.
 pub struct Segcache {
     pub(crate) hashtable: MultiChoiceHashtable,
     pub(crate) segments: Segments,
@@ -36,20 +34,19 @@ const _: () = {
 };
 
 impl Segcache {
-    /// Returns a new `Builder` which is used to configure and construct a
-    /// `Segcache` instance.
+    /// Returns a new [`Builder`] for configuring a `Segcache`.
     ///
     /// ```
     /// use segcache::{Policy, Segcache};
     ///
-    /// const MB: usize = 1024 * 1024;
+    /// const KB: usize = 1024;
     ///
-    /// // create a heap using 1MB segments
+    /// // build a small cache made up of 256KB segments
     /// let cache = Segcache::builder()
-    ///     .heap_size(64 * MB)
-    ///     .segment_size(1 * MB as i32)
-    ///     .hash_power(16)
-    ///     .eviction(Policy::Random).build().expect("failed to create cache");
+    ///     .heap_size(32 * 1024 * KB)
+    ///     .segment_size(256 * KB as i32)
+    ///     .hash_power(14)
+    ///     .eviction(Policy::Fifo).build().expect("failed to create cache");
     /// ```
     pub fn builder() -> Builder {
         Builder::default()
@@ -61,9 +58,9 @@ impl Segcache {
         self.segments.verifier()
     }
 
-    /// Gets a count of items in the `Segcache` instance. This is an expensive
-    /// operation and is only enabled for tests and builds with the `debug`
-    /// feature enabled.
+    /// Count how many items are currently live across all segments. This
+    /// walks every segment, so it's costly — only compiled in for tests and
+    /// the `debug` feature.
     ///
     /// ```
     /// use segcache::{Policy, Segcache};
@@ -77,18 +74,18 @@ impl Segcache {
         self.segments.items()
     }
 
-    /// Get the item in the `Segcache` with the provided key
+    /// Look up an item by key, returning it if present.
     ///
     /// ```
     /// use segcache::{Policy, Segcache};
     /// use std::time::Duration;
     ///
     /// let cache = Segcache::builder().build().expect("failed to create cache");
-    /// assert!(cache.get(b"coffee").is_none());
+    /// assert!(cache.get(b"session").is_none());
     ///
-    /// cache.insert(b"coffee", b"strong", None, Duration::ZERO);
-    /// let item = cache.get(b"coffee").expect("didn't get item back");
-    /// assert_eq!(item.value(), b"strong");
+    /// cache.insert(b"session", b"active", None, Duration::ZERO);
+    /// let item = cache.get(b"session").expect("didn't get item back");
+    /// assert_eq!(item.value(), b"active");
     /// ```
     pub fn get(&self, key: &[u8]) -> Option<Item> {
         let verifier = self.verifier();
@@ -139,14 +136,15 @@ impl Segcache {
         }
     }
 
-    /// Get the item in the `Segcache` with the provided key without
-    /// increasing the item frequency - useful for combined operations that
-    /// check for presence - eg replace is a get + set
+    /// Look up an item by key without touching its access-frequency
+    /// counter. Useful when a caller only needs to test presence as one
+    /// step of a larger operation (such as a replace, which first checks
+    /// for an existing item before writing a new one).
     /// ```
     /// use segcache::{Policy, Segcache};
     ///
     /// let cache = Segcache::builder().build().expect("failed to create cache");
-    /// assert!(cache.get_no_freq_incr(b"coffee").is_none());
+    /// assert!(cache.get_no_freq_incr(b"session").is_none());
     /// ```
     pub fn get_no_freq_incr(&self, key: &[u8]) -> Option<Item> {
         let verifier = self.verifier();
@@ -177,22 +175,24 @@ impl Segcache {
         }
     }
 
-    /// Insert a new item into the cache. May return an error indicating that
-    /// the insert was not successful.
+    /// Store a value under a key, overwriting any existing item there.
+    /// Returns an error if the write could not be completed (for example,
+    /// the item is too large or the hash table has no room for a new
+    /// entry).
     /// ```
     /// use segcache::{Policy, Segcache};
     /// use std::time::Duration;
     ///
     /// let cache = Segcache::builder().build().expect("failed to create cache");
-    /// assert!(cache.get(b"drink").is_none());
+    /// assert!(cache.get(b"status").is_none());
     ///
-    /// cache.insert(b"drink", b"coffee", None, Duration::ZERO);
-    /// let item = cache.get(b"drink").expect("didn't get item back");
-    /// assert_eq!(item.value(), b"coffee");
+    /// cache.insert(b"status", b"pending", None, Duration::ZERO);
+    /// let item = cache.get(b"status").expect("didn't get item back");
+    /// assert_eq!(item.value(), b"pending");
     ///
-    /// cache.insert(b"drink", b"whisky", None, Duration::ZERO);
-    /// let item = cache.get(b"drink").expect("didn't get item back");
-    /// assert_eq!(item.value(), b"whisky");
+    /// cache.insert(b"status", b"done", None, Duration::ZERO);
+    /// let item = cache.get(b"status").expect("didn't get item back");
+    /// assert_eq!(item.value(), b"done");
     /// ```
     pub fn insert<'a, T: Into<Value<'a>>>(
         &self,
@@ -203,7 +203,7 @@ impl Segcache {
     ) -> Result<(), SegcacheError> {
         let value: Value = value.into();
 
-        // default optional data is empty
+        // treat a missing optional field as an empty byte slice
         let optional = optional.unwrap_or(&[]);
 
         let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
@@ -446,8 +446,8 @@ impl Segcache {
                 }
             }
             if retries == 0 {
-                // segment acquire failed, increment the stats and return with
-                // an error
+                // out of retries: record the failure in the metrics and
+                // report that no segment could be reserved
 
                 #[cfg(feature = "metrics")]
                 {
@@ -597,8 +597,11 @@ impl Segcache {
         Ok(expires_at - now)
     }
 
-    /// Performs a CAS operation, inserting the item only if the CAS value
-    /// matches the current value for that item.
+    /// Conditionally overwrite an item: the write only takes effect if
+    /// `cas` matches the token currently associated with the key. Callers
+    /// obtain that token from a prior `get`/`cas` call and pass it back to
+    /// detect whether the item was changed by someone else in the
+    /// meantime.
     ///
     /// ```
     /// use segcache::{Policy, Segcache, SegcacheError};
@@ -606,25 +609,25 @@ impl Segcache {
     ///
     /// let cache = Segcache::builder().build().expect("failed to create cache");
     ///
-    /// // If the item is not in the cache, CAS will fail as 'NotFound'
+    /// // there's no item to compare against yet, so this fails as NotFound
     /// assert_eq!(
-    ///     cache.cas(b"drink", b"coffee", None, Duration::ZERO, 0),
+    ///     cache.cas(b"status", b"pending", None, Duration::ZERO, 0),
     ///     Err(SegcacheError::NotFound)
     /// );
     ///
-    /// // If a stale CAS value is provided, CAS will fail as 'Exists'
-    /// cache.insert(b"drink", b"coffee", None, Duration::ZERO);
+    /// // once an item exists, a token that doesn't match it fails as Exists
+    /// cache.insert(b"status", b"pending", None, Duration::ZERO);
     /// assert_eq!(
-    ///     cache.cas(b"drink", b"coffee", None, Duration::ZERO, 0),
+    ///     cache.cas(b"status", b"pending", None, Duration::ZERO, 0),
     ///     Err(SegcacheError::Exists)
     /// );
     ///
-    /// // Getting the CAS value and then performing the operation ensures
-    /// // success in absence of a race with another client
-    /// let current = cache.get(b"drink").expect("not found");
-    /// assert!(cache.cas(b"drink", b"whisky", None, Duration::ZERO, current.cas()).is_ok());
-    /// let item = cache.get(b"drink").expect("not found");
-    /// assert_eq!(item.value(), b"whisky"); // item is updated
+    /// // reading the item's current token first and passing it straight
+    /// // back lets the write go through, as long as nothing raced it
+    /// let current = cache.get(b"status").expect("not found");
+    /// assert!(cache.cas(b"status", b"done", None, Duration::ZERO, current.cas()).is_ok());
+    /// let item = cache.get(b"status").expect("not found");
+    /// assert_eq!(item.value(), b"done"); // the write took effect
     /// ```
     pub fn cas<'a, T: Into<Value<'a>>>(
         &self,
@@ -677,24 +680,25 @@ impl Segcache {
         self.replace_at(key, location, slot, reserved)
     }
 
-    /// Remove the item with the given key, returns a bool indicating if it was
-    /// removed.
+    /// Delete the item stored under `key`, if any. The return value
+    /// indicates whether an item was actually removed.
     /// ```
     /// use segcache::{Policy, Segcache, SegcacheError};
     /// use std::time::Duration;
     ///
     /// let cache = Segcache::builder().build().expect("failed to create cache");
     ///
-    /// // If the item is not in the cache, delete will return false
-    /// assert_eq!(cache.delete(b"coffee"), false);
+    /// // deleting a key with no item is a no-op and reports false
+    /// assert_eq!(cache.delete(b"session"), false);
     ///
-    /// // And will return true on success
-    /// cache.insert(b"coffee", b"strong", None, Duration::ZERO);
-    /// assert!(cache.get(b"coffee").is_some());
-    /// assert_eq!(cache.delete(b"coffee"), true);
-    /// assert!(cache.get(b"coffee").is_none());
+    /// // deleting a key that does have an item removes it and reports true
+    /// cache.insert(b"session", b"active", None, Duration::ZERO);
+    /// assert!(cache.get(b"session").is_some());
+    /// assert_eq!(cache.delete(b"session"), true);
+    /// assert!(cache.get(b"session").is_none());
     /// ```
-    // TODO(bmartin): a result would be better here
+    // TODO(bmartin): callers can't distinguish "nothing to delete" from a
+    // genuine failure; returning a Result would make that distinction possible
     pub fn delete(&self, key: &[u8]) -> bool {
         // Look up the item to get its location
         let verifier = self.verifier();
@@ -743,26 +747,26 @@ impl Segcache {
         true
     }
 
-    /// Loops through the TTL Buckets to handle eager expiration, returns the
-    /// number of segments expired
+    /// Sweep the TTL buckets and reclaim any segment whose bucket has
+    /// fully elapsed.
     /// ```
     /// use segcache::{Policy, Segcache, SegcacheError};
     /// use std::time::Duration;
     ///
     /// let cache = Segcache::builder().build().expect("failed to create cache");
     ///
-    /// // Insert an item with a short ttl
-    /// cache.insert(b"coffee", b"strong", None, Duration::from_secs(5));
+    /// // insert an item that expires quickly
+    /// cache.insert(b"session", b"active", None, Duration::from_secs(5));
     ///
-    /// // The item is still in the cache
-    /// assert!(cache.get(b"coffee").is_some());
+    /// // it's readable right after being inserted
+    /// assert!(cache.get(b"session").is_some());
     ///
-    /// // Delay and then trigger expiration
+    /// // once enough time has passed, expire() reclaims its segment
     /// std::thread::sleep(Duration::from_secs(6));
     /// cache.expire();
     ///
-    /// // And the expired item is not in the cache
-    /// assert!(cache.get(b"coffee").is_none());
+    /// // and the item is no longer reachable
+    /// assert!(cache.get(b"session").is_none());
     /// ```
     /// Returns the number of segments actually freed. Segments pinned by
     /// outstanding [`Item`]s are drained from the hashtable but not freed
@@ -780,8 +784,9 @@ impl Segcache {
         self.ttl_buckets.clear(&self.hashtable, &self.segments)
     }
 
-    /// Checks the integrity of all segments
-    /// *NOTE*: this operation is relatively expensive
+    /// Validate the internal consistency of every segment. Returns
+    /// `Err(SegcacheError::DataCorrupted)` if any segment fails its check.
+    /// Note: this scans the whole heap, so it's relatively expensive.
     #[cfg(feature = "debug")]
     pub fn check_integrity(&self) -> Result<(), SegcacheError> {
         if self.segments.check_integrity(&self.hashtable) {
@@ -791,9 +796,9 @@ impl Segcache {
         }
     }
 
-    /// Perform a wrapping addition on the value stored at the supplied key.
-    /// Returns an error if the key is invalid, the item is not found, or the
-    /// stored value is not a numeric type.
+    /// Add `rhs` to the numeric value stored at `key`, wrapping around on
+    /// overflow. Fails if the key has no item, or if the stored item
+    /// isn't a numeric value.
     ///
     /// The update happens IN PLACE under the item's seqlock: no item or
     /// segment churn, the expiration deadline is untouched (memcached's
@@ -809,9 +814,9 @@ impl Segcache {
         self.numeric_update(key, |raw| raw.fetch_wrapping_add(rhs))
     }
 
-    /// Perform a saturating subtraction on the value stored at the supplied
-    /// key. Returns an error if the key is invalid, the item is not found, or
-    /// the stored value is not a numeric type.
+    /// Subtract `rhs` from the numeric value stored at `key`, clamping to
+    /// zero instead of underflowing. Fails if the key has no item, or if
+    /// the stored item isn't a numeric value.
     ///
     /// See [`Self::wrapping_add`] for the update and CAS-token semantics.
     /// Returns the new value.

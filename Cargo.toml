@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/cuckoo",
-    "crates/datatier",
     "crates/keyvalue",
     "crates/segcache",
 ]
@@ -14,12 +13,10 @@ repository = "https://github.com/pelikan-io/cache-rs"
 
 [workspace.dependencies]
 ahash = "0.8.12"
-blake3 = "1.8.3"
 clocksource = "0.8.3"
 crossbeam-deque = "0.8.6"
 criterion = "0.8.2"
-datatier = { path = "crates/datatier", version = "0.1.1" }
-keyvalue = { path = "crates/keyvalue", version = "0.3.0" }
+keyvalue = { path = "crates/keyvalue", version = "0.4.0" }
 log = "0.4.29"
 memmap2 = "0.9.10"
 metriken = "0.7.0"

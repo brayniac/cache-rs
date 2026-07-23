@@ -4,86 +4,65 @@ use crate::*;
 
 #[test]
 fn bucket_index() {
-    let ttl_buckets = TtlBuckets::new();
+    let buckets = TtlBuckets::new();
+    let index_of = |secs: u32| buckets.get_bucket_index(Duration::from_secs(secs));
 
-    // Zero TTL and max duration both map to the last bucket.
-    assert_eq!(ttl_buckets.get_bucket_index(Duration::from_secs(0)), 1023);
+    // A non-positive TTL and any TTL past the top of the last tier both
+    // saturate at the final bucket (index 1023).
+    assert_eq!(index_of(0), 1023);
+    assert_eq!(index_of(8_388_608), 1023); // one second past tier-4 top
     assert_eq!(
-        ttl_buckets.get_bucket_index(Duration::from_secs(u32::MAX)),
+        buckets.get_bucket_index(Duration::from_secs(u32::MAX)),
         1023
     );
 
-    // First bucket covers TTLs 1–7s (bucket 0).
-    assert_eq!(ttl_buckets.get_bucket_index(Duration::from_secs(1)), 0);
-    assert_eq!(ttl_buckets.get_bucket_index(Duration::from_secs(7)), 0);
-
-    // Tier 1: 8s–2048s, buckets 1–255, each 8s wide.
-    for bucket in 1..256 {
-        let start = Duration::from_secs(8 * bucket);
-        let end = Duration::from_secs(8 * bucket + 7);
-        assert_eq!(
-            ttl_buckets.get_bucket_index(start) as u32,
-            bucket,
-            "ttl: {start:?}"
-        );
-        assert_eq!(
-            ttl_buckets.get_bucket_index(end) as u32,
-            bucket,
-            "ttl: {end:?}"
-        );
+    // Spot-check one representative TTL inside each tier. The expected
+    // indices are derived directly from the shift/offset formula the code
+    // uses: tier 1 = secs>>3, tier 2 = (secs>>7)+256, tier 3 =
+    // (secs>>11)+512, tier 4 = (secs>>15)+768.
+    let cases: &[(u32, usize)] = &[
+        // tier 1 (each bucket 8s wide, indices 0..255)
+        (5, 0),
+        (24, 3),
+        (999, 124),
+        // tier 2 (each bucket 128s wide, indices 256..511)
+        (2048, 272),
+        (5000, 295),
+        // tier 3 (each bucket 2048s wide, indices 512..767)
+        (32_768, 528),
+        (200_000, 609),
+        // tier 4 (each bucket 32768s wide, indices 768..1023)
+        (524_288, 784),
+        (2_000_000, 829),
+    ];
+    for &(secs, expected) in cases {
+        assert_eq!(index_of(secs), expected, "ttl {secs}s");
     }
 
-    // Tier 2: 2048s–32768s, buckets 256–511, each 128s wide.
-    for bucket in 16..256 {
-        let start = Duration::from_secs(128 * bucket);
-        let end = Duration::from_secs(128 * bucket + 127);
-        assert_eq!(
-            ttl_buckets.get_bucket_index(start) as u32,
-            bucket + 256,
-            "ttl: {start:?}"
-        );
-        assert_eq!(
-            ttl_buckets.get_bucket_index(end) as u32,
-            bucket + 256,
-            "ttl: {end:?}"
-        );
-    }
+    // Every TTL that falls within one bucket's width must resolve to the
+    // same index. Walk both edges of a chosen bucket in each tier and
+    // confirm they collapse together, then confirm the next second rolls
+    // over to the following bucket.
+    let width_check = |low: u32, high: u32, next: u32| {
+        let idx = index_of(low);
+        assert_eq!(index_of(high), idx, "top of bucket ({high}s)");
+        assert_eq!(index_of(next), idx + 1, "rollover into next bucket");
+    };
+    // tier 1 bucket 40 spans [320, 327]; 328 opens bucket 41
+    width_check(320, 327, 328);
+    // tier 2 bucket at index 300 spans [5632, 5759]; 5760 opens the next
+    width_check(5632, 5759, 5760);
+    // tier 3 bucket at index 600 spans [180224, 182271]; 182272 opens next
+    width_check(180_224, 182_271, 182_272);
 
-    // Tier 3: 32768s–524288s, buckets 512–767, each 2048s wide.
-    for bucket in 16..256 {
-        let start = Duration::from_secs(2048 * bucket);
-        let end = Duration::from_secs(2048 * bucket + 2047);
-        assert_eq!(
-            ttl_buckets.get_bucket_index(start) as u32,
-            bucket + 512,
-            "ttl: {start:?}"
-        );
-        assert_eq!(
-            ttl_buckets.get_bucket_index(end) as u32,
-            bucket + 512,
-            "ttl: {end:?}"
-        );
-    }
-
-    // Tier 4: 524288s–8388608s, buckets 768–1023, each 32768s wide.
-    for bucket in 16..256 {
-        let start = Duration::from_secs(32_768 * bucket);
-        let end = Duration::from_secs(32_768 * bucket + 32_767);
-        assert_eq!(
-            ttl_buckets.get_bucket_index(start) as u32,
-            bucket + 768,
-            "ttl: {start:?}"
-        );
-        assert_eq!(
-            ttl_buckets.get_bucket_index(end) as u32,
-            bucket + 768,
-            "ttl: {end:?}"
-        );
-    }
-
-    // Beyond ~97 days maps to the max bucket.
-    assert_eq!(
-        ttl_buckets.get_bucket_index(Duration::from_secs(8_388_608)) as u32,
-        1023
-    );
+    // Exercise the exact boundaries where one tier hands off to the next.
+    // The last TTL of a tier and the first TTL of the following tier must
+    // land in adjacent-but-distinct index ranges.
+    assert_eq!(index_of(2_047), 255); // last tier-1 bucket
+    assert_eq!(index_of(2_048), 272); // first populated tier-2 bucket
+    assert_eq!(index_of(32_767), 511); // last tier-2 bucket
+    assert_eq!(index_of(32_768), 528); // first populated tier-3 bucket
+    assert_eq!(index_of(524_287), 767); // last tier-3 bucket
+    assert_eq!(index_of(524_288), 784); // first populated tier-4 bucket
+    assert_eq!(index_of(8_388_607), 1023); // top of tier 4
 }

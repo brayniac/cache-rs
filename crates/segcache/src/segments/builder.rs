@@ -24,26 +24,27 @@ impl Default for SegmentsBuilder {
 }
 
 impl SegmentsBuilder {
-    /// Set the segment size in bytes.
+    /// Configure the byte size of each segment.
     pub fn segment_size(mut self, bytes: i32) -> Self {
         self.segment_size = bytes;
         self
     }
 
-    /// Set the total heap size in bytes. The number of segments is
-    /// `heap_size / segment_size`.
+    /// Configure the overall heap byte budget; the segment count follows
+    /// as `heap_size / segment_size`.
     pub fn heap_size(mut self, bytes: usize) -> Self {
         self.heap_size = bytes;
         self
     }
 
-    /// Set the eviction [`Policy`].
+    /// Configure which eviction [`Policy`] the cache uses.
     pub fn eviction_policy(mut self, policy: Policy) -> Self {
         self.evict_policy = policy;
         self
     }
 
-    /// Validate configuration and build the [`Segments`].
+    /// Check the accumulated configuration and, if sound, construct the
+    /// [`Segments`].
     ///
     /// Returns an error if:
     /// - `segment_size` is not larger than the per-item header overhead

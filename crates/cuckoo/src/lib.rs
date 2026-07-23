@@ -14,9 +14,9 @@
 //! * fixed per-item memory overhead
 //! * bounded insertion latency via displacement limits
 //!
-//! Non-goals:
-//! * not designed for concurrent access
-//! * not suited for items larger than the configured slot size
+//! Out of scope:
+//! * shared or concurrent access across threads
+//! * values exceeding the fixed per-slot capacity
 
 #[macro_use]
 extern crate log;

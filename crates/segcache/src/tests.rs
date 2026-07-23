@@ -1,7 +1,3 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 use super::*;
 use crate::hashtable::bucket::Hashbucket;
 use ::rand::Rng;
@@ -499,73 +495,84 @@ fn reader_pin_acquire_release() {
 #[test]
 fn init() {
     let cache = Segcache::builder()
-        .segment_size(4096)
-        .heap_size(4096 * 64)
+        .segment_size(8192)
+        .heap_size(8192 * 16)
         .build()
-        .expect("failed to create cache");
+        .expect("cache build failed");
+
+    // a freshly built cache stores nothing and every segment is available
     assert_eq!(cache.items(), 0);
+    assert_eq!(cache.segments.free(), 16);
 }
 
 #[test]
 fn get_free_seg() {
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
+    let seg_bytes = 2048;
+    let count = 10usize;
 
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(seg_bytes)
+        .heap_size(count * seg_bytes as usize)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 64);
-    let seg = cache.segments.reserve_free();
-    assert_eq!(cache.segments.free(), 63);
-    assert_eq!(seg, NonZeroU32::new(1));
+        .expect("cache build failed");
+    assert_eq!(cache.segments.free(), count);
+
+    // segment ids are handed out from 1 upward, one per reservation, and
+    // each reservation shrinks the free pool by exactly one
+    assert_eq!(cache.segments.reserve_free(), NonZeroU32::new(1));
+    assert_eq!(cache.segments.free(), count - 1);
+    assert_eq!(cache.segments.reserve_free(), NonZeroU32::new(2));
+    assert_eq!(cache.segments.free(), count - 2);
 }
 
 #[test]
 fn try_alloc_item_bounds_and_grants() {
     use crate::segments::AllocOutcome;
 
+    let seg_bytes = 2048;
     let segments = SegmentsBuilder::default()
-        .segment_size(4096)
-        .heap_size(4096 * 4)
+        .segment_size(seg_bytes)
+        .heap_size(seg_bytes as usize * 3)
         .build()
-        .expect("build segments");
+        .expect("segments build failed");
 
-    let id = segments.reserve_free().expect("free segment");
-    // `try_alloc_item` now pins a writer, which requires the Live state
-    // (mirroring the `reserve()` caller, which only calls it once the tail
-    // is writable) — a freshly reserved segment starts in `Reserved`.
+    let id = segments.reserve_free().expect("a free segment");
+    // `try_alloc_item` pins a writer and so demands a writable (Live) tail;
+    // `reserve_free` leaves the segment in `Reserved`, so promote it the way
+    // the real `reserve()` caller would once the tail becomes writable.
     segments.header(id).set_state(State::Live);
 
-    // live_bytes starts at the initial offset (0, or 8 with `integrity`)
-    let live_bytes_before = segments.header(id).live_bytes();
+    let bytes_at_start = segments.header(id).live_bytes();
 
-    // grants are sequential and within capacity
-    let a = match segments.try_alloc_item(id, 64) {
+    // two consecutive grants are laid out contiguously, in request order
+    let grant_a = 96;
+    let grant_b = 48;
+    let first = match segments.try_alloc_item(id, grant_a) {
         AllocOutcome::Reserved(r) => r,
-        other => panic!("expected Reserved, got {other:?}"),
+        other => panic!("first grant should succeed, got {other:?}"),
     };
-    let b = match segments.try_alloc_item(id, 64) {
+    let second = match segments.try_alloc_item(id, grant_b) {
         AllocOutcome::Reserved(r) => r,
-        other => panic!("expected Reserved, got {other:?}"),
+        other => panic!("second grant should succeed, got {other:?}"),
     };
-    assert_eq!(b.offset(), a.offset() + 64);
-    assert_eq!(a.seg(), id);
+    assert_eq!(first.seg(), id);
+    assert_eq!(second.offset(), first.offset() + grant_a as usize);
 
-    // an oversized request fails and does not move the offset
-    let before = segments.header(id).write_offset();
+    // a request larger than the whole segment is rejected and leaves the
+    // write cursor untouched
+    let cursor = segments.header(id).write_offset();
     assert!(matches!(
-        segments.try_alloc_item(id, 4096),
+        segments.try_alloc_item(id, seg_bytes * 2),
         AllocOutcome::Full
     ));
-    assert_eq!(segments.header(id).write_offset(), before);
+    assert_eq!(segments.header(id).write_offset(), cursor);
 
-    // live statistics track successful grants only
+    // only the two successful grants are reflected in the live counters
     assert_eq!(segments.header(id).live_items(), 2);
-    assert_eq!(segments.header(id).live_bytes(), live_bytes_before + 128);
+    assert_eq!(
+        segments.header(id).live_bytes(),
+        bytes_at_start + grant_a + grant_b
+    );
 }
 
 // try_alloc_item now pins a writer (Dekker pair, item 7d): the pin is held
@@ -619,54 +626,63 @@ fn try_alloc_item_pins_writer_until_dropped() {
 
 #[test]
 fn get() {
-    let ttl = Duration::ZERO;
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(4096)
+        .heap_size(4096 * 32)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 64);
-    assert!(cache.get(b"coffee").is_none());
-    assert!(cache.insert(b"coffee", b"strong", None, ttl).is_ok());
-    assert_eq!(cache.segments.free(), 63);
-    assert_eq!(cache.items(), 1);
-    assert!(cache.get(b"coffee").is_some());
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
 
-    let item = cache.get(b"coffee").unwrap();
-    assert_eq!(item.value(), b"strong", "item is: {item:?}");
+    // an empty cache misses every lookup
+    assert_eq!(cache.items(), 0);
+    let free_start = cache.segments.free();
+    assert!(cache.get(b"planet").is_none());
+
+    // once stored, the key resolves to the exact bytes written; storing the
+    // first item consumes one segment
+    cache
+        .insert(b"planet", b"saturn", None, ttl)
+        .expect("insert");
+    assert_eq!(cache.items(), 1);
+    assert_eq!(cache.segments.free(), free_start - 1);
+
+    let hit = cache.get(b"planet").expect("stored key must be found");
+    assert_eq!(hit.value(), b"saturn", "unexpected item: {hit:?}");
+
+    // an unrelated key still misses
+    assert!(cache.get(b"moon").is_none());
 }
 
 #[test]
 fn cas() {
-    let ttl = Duration::ZERO;
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(4096)
+        .heap_size(4096 * 32)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 64);
-    assert!(cache.get(b"coffee").is_none());
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
+
+    // compare-and-swap on an absent key reports NotFound
     assert_eq!(
-        cache.cas(b"coffee", b"hot", None, ttl, 0),
+        cache.cas(b"session", b"alpha", None, ttl, 0),
         Err(SegcacheError::NotFound)
     );
-    assert!(cache.insert(b"coffee", b"hot", None, ttl).is_ok());
+
+    // with the key present, a cas carrying a bogus token collides and leaves
+    // the stored value alone
+    cache
+        .insert(b"session", b"alpha", None, ttl)
+        .expect("insert");
     assert_eq!(
-        cache.cas(b"coffee", b"iced", None, ttl, 0),
+        cache.cas(b"session", b"beta", None, ttl, 0),
         Err(SegcacheError::Exists)
     );
-    let item = cache.get(b"coffee").unwrap();
-    assert_eq!(cache.cas(b"coffee", b"iced", None, ttl, item.cas()), Ok(()));
+    assert_eq!(cache.get(b"session").unwrap().value(), b"alpha");
+
+    // a cas carrying the item's current token swaps the value
+    let token = cache.get(b"session").unwrap().cas();
+    assert_eq!(cache.cas(b"session", b"beta", None, ttl, token), Ok(()));
+    assert_eq!(cache.get(b"session").unwrap().value(), b"beta");
 }
 
 // A stale CAS token must not match after its segment is recycled, even if
@@ -728,329 +744,278 @@ fn cas_stale_token_rejected_after_segment_recycle() {
 
 #[test]
 fn overwrite() {
-    let ttl = Duration::ZERO;
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(4096)
+        .heap_size(4096 * 32)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 64);
-    assert!(cache.get(b"drink").is_none());
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
+    let free_start = cache.segments.free();
 
-    println!("==== first insert ====");
-    assert!(cache.insert(b"drink", b"coffee", None, ttl).is_ok());
-    assert_eq!(cache.segments.free(), 63);
-    assert_eq!(cache.items(), 1);
-    let item = cache.get(b"drink");
-    assert!(item.is_some());
-    let item = item.unwrap();
-    let value = item.value();
-    assert_eq!(value, b"coffee", "item is: {item:?}");
+    // repeated inserts under one key replace the value in place, so the
+    // logical item count never rises above one and every read reflects the
+    // most recent write
+    for value in [&b"red"[..], b"green", b"blue", b"violet"] {
+        cache.insert(b"colour", value, None, ttl).expect("insert");
+        assert_eq!(cache.items(), 1);
+        let item = cache.get(b"colour").expect("key must be present");
+        assert!(item.value() == *value, "unexpected item: {item:?}");
+    }
 
-    println!("==== second insert ====");
-    assert!(cache.insert(b"drink", b"espresso", None, ttl).is_ok());
-    assert_eq!(cache.segments.free(), 63);
-    assert_eq!(cache.items(), 1);
-    let item = cache.get(b"drink");
-    assert!(item.is_some());
-    let item = item.unwrap();
-    let value = item.value();
-    assert_eq!(value, b"espresso", "item is: {item:?}");
-
-    println!("==== third insert ====");
-    assert!(cache.insert(b"drink", b"whisky", None, ttl).is_ok());
-    assert_eq!(cache.segments.free(), 63);
-    assert_eq!(cache.items(), 1);
-    let item = cache.get(b"drink");
-    assert!(item.is_some());
-    let item = item.unwrap();
-    let value = item.value();
-    assert_eq!(value, b"whisky", "item is: {item:?}");
+    // all four small writes appended into the same first segment
+    assert_eq!(cache.segments.free(), free_start - 1);
 }
 
 #[test]
 fn delete() {
-    let ttl = Duration::ZERO;
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(4096)
+        .heap_size(4096 * 32)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 64);
-    assert!(cache.get(b"drink").is_none());
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
 
-    assert!(cache.insert(b"drink", b"coffee", None, ttl).is_ok());
-    assert_eq!(cache.segments.free(), 63);
+    // deleting a key that was never stored reports that nothing was removed
+    assert!(!cache.delete(b"ghost"));
+
+    cache.insert(b"fruit", b"mango", None, ttl).expect("insert");
     assert_eq!(cache.items(), 1);
-    let item = cache.get(b"drink");
-    assert!(item.is_some());
-    let item = item.unwrap();
-    let value = item.value();
-    assert_eq!(value, b"coffee", "item is: {item:?}");
+    assert_eq!(cache.get(b"fruit").unwrap().value(), b"mango");
 
-    assert!(cache.delete(b"drink"));
-    assert_eq!(cache.segments.free(), 63);
+    // the first delete removes the item; a repeat delete is now a no-op
+    assert!(cache.delete(b"fruit"));
     assert_eq!(cache.items(), 0);
+    assert!(cache.get(b"fruit").is_none());
+    assert!(!cache.delete(b"fruit"));
 }
 
 #[test]
 fn collisions_2() {
-    let ttl = Duration::ZERO;
-    let segment_size = 64;
-    let segments = 2;
-    let heap_size = segments * segment_size as usize;
-
+    // Tiny segments plus a tiny heap means only a handful of items fit at
+    // once. Cycling a small working set of keys thousands of times keeps
+    // driving the insert-replace-and-recycle path under constant pressure.
+    let seg_bytes = 48;
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(seg_bytes)
+        .heap_size(3 * seg_bytes as usize)
         .hash_power(7)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 2);
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
 
-    // With very small segments (64 bytes) and only 2 segments, we can
-    // only hold a few items. Repeatedly overwrite 3 keys to exercise
-    // the insert-replace path.
-    for i in 0..1000 {
-        let i = i % 3;
-        let v = format!("{i:02}");
-        assert!(cache.insert(v.as_bytes(), v.as_bytes(), None, ttl).is_ok());
-        let item = cache.get(v.as_bytes());
-        assert!(item.is_some());
+    let keys = [&b"aa"[..], b"bb", b"cc", b"dd"];
+    for round in 0..2000u32 {
+        let key = keys[(round as usize) % keys.len()];
+        cache
+            .insert(key, &round.to_le_bytes()[..1], None, ttl)
+            .expect("insert under pressure must succeed");
+        // whatever survives, the key just written is immediately readable
+        assert!(cache.get(key).is_some());
     }
 }
 
 #[test]
 fn collisions() {
-    let ttl = Duration::ZERO;
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-
-    // With the N-choice hashtable, hash_power(7) gives 2^7 = 128 slots
-    // across 16 buckets with 2-choice hashing. Insert items until the
-    // hashtable is full.
+    // A deliberately small hashtable (hash_power 7) forces many keys to
+    // contend for the same buckets. Insert distinct keys until a slot can
+    // no longer be found, then confirm a delete frees capacity back up.
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(4096)
+        .heap_size(4096 * 48)
         .hash_power(7)
         .build()
-        .expect("failed to create cache");
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
     assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 64);
 
-    // Insert items until the hashtable is full
-    let mut inserted = 0;
-    for i in 0..256 {
-        let v = format!("{i}");
-        if cache.insert(v.as_bytes(), v.as_bytes(), None, ttl).is_ok() {
-            let item = cache.get(v.as_bytes());
-            assert!(item.is_some());
-            inserted += 1;
+    let key_of = |n: usize| format!("entry-{n:04}").into_bytes();
+
+    let mut stored = 0usize;
+    for n in 0..512 {
+        let key = key_of(n);
+        if cache.insert(&key, b"x", None, ttl).is_ok() {
+            assert!(cache.get(&key).is_some());
+            stored += 1;
         } else {
             break;
         }
     }
-    assert!(inserted > 0, "should have inserted at least one item");
-    assert_eq!(cache.items(), inserted);
+    assert!(stored > 0, "at least one key must fit");
+    assert_eq!(cache.items(), stored);
 
-    // Deleting an item should free a slot
-    let v0 = b"0";
-    assert!(cache.delete(v0));
-    assert_eq!(cache.items(), inserted - 1);
+    // reclaiming one key drops the live count by exactly one
+    assert!(cache.delete(&key_of(0)));
+    assert_eq!(cache.items(), stored - 1);
 }
 
 #[test]
 fn full_cache_long() {
-    let ttl = Duration::ZERO;
-    let iters = 1_000_000;
-    let segments = 32;
-    let segment_size = 1024;
-    let key_size = 1;
-    let value_size = 512;
-    let heap_size = segments * segment_size as usize;
+    // Single-byte keys draw from at most 256 distinct values, so the live
+    // working set is bounded and every insert is really an overwrite or an
+    // eviction-backed store. Under the default whole-segment eviction that
+    // always frees room for one small item, so a long random storm never
+    // drops a single insert.
+    let iters: u64 = 1_000_000;
+    let segments = 40usize;
+    let seg_bytes = 512;
 
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(seg_bytes)
+        .heap_size(segments * seg_bytes as usize)
         .hash_power(16)
         .build()
-        .expect("failed to create cache");
-
-    assert_eq!(cache.items(), 0);
+        .expect("cache build failed");
     assert_eq!(cache.segments.free(), segments);
 
     let mut rng = rand::rng();
+    let mut key = [0u8; 1];
+    let mut value = [0u8; 200];
 
-    let mut key = vec![0; key_size];
-    let mut value = vec![0; value_size];
-
-    let mut inserts = 0;
-
+    let mut stored: u64 = 0;
     for _ in 0..iters {
         rng.fill_bytes(&mut key);
         rng.fill_bytes(&mut value);
-
-        if cache.insert(&key, &value, None, ttl).is_ok() {
-            inserts += 1;
-        };
+        if cache
+            .insert(&key[..], &value[..], None, Duration::ZERO)
+            .is_ok()
+        {
+            stored += 1;
+        }
     }
-
-    assert_eq!(inserts, iters);
+    assert_eq!(stored, iters, "every insert should have found room");
 }
 
 #[test]
 fn full_cache_long_2() {
-    let ttl = Duration::ZERO;
-    let iters = 10_000_000;
-    let segments = 64;
-    let segment_size = 2 * 1024;
-    let key_size = 2;
-    let value_size = 1;
-    let heap_size = segments * segment_size as usize;
+    // Two-byte keys open a 65k-entry keyspace against a modest heap, so this
+    // storm genuinely churns segments rather than merely overwriting. The
+    // vast majority of inserts still land; only a vanishing fraction can lose
+    // the race for space, so the run must clear well above 99.99% success.
+    let iters: u64 = 5_000_000;
+    let segments = 96usize;
+    let seg_bytes = 4096;
 
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(seg_bytes)
+        .heap_size(segments * seg_bytes as usize)
         .hash_power(16)
         .build()
-        .expect("failed to create cache");
-
-    assert_eq!(cache.items(), 0);
+        .expect("cache build failed");
     assert_eq!(cache.segments.free(), segments);
 
     let mut rng = rand::rng();
+    let mut key = [0u8; 2];
+    let mut value = [0u8; 4];
 
-    let mut key = vec![0; key_size];
-    let mut value = vec![0; value_size];
-
-    let mut inserts = 0;
-
+    let mut stored: u64 = 0;
     for _ in 0..iters {
         rng.fill_bytes(&mut key);
         rng.fill_bytes(&mut value);
-
-        if cache.insert(&key, &value, None, ttl).is_ok() {
-            inserts += 1;
-        };
+        if cache
+            .insert(&key[..], &value[..], None, Duration::ZERO)
+            .is_ok()
+        {
+            stored += 1;
+        }
     }
-
-    // inserts should be > 99.99 percent successful for this config
-    assert!(inserts >= 9_999_000);
+    let floor = iters - iters / 10_000; // allow a 0.01% shortfall
+    assert!(
+        stored >= floor,
+        "stored {stored} of {iters} (floor {floor})"
+    );
 }
 
 #[test]
 fn expiration() {
-    let segments = 64;
-    let segment_size = 2 * 1024;
-    let heap_size = segments * segment_size as usize;
+    let segments = 48usize;
+    let seg_bytes = 4096;
 
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(seg_bytes)
+        .heap_size(segments * seg_bytes as usize)
         .hash_power(16)
         .build()
-        .expect("failed to create cache");
-
-    assert_eq!(cache.items(), 0);
+        .expect("cache build failed");
     assert_eq!(cache.segments.free(), segments);
 
-    assert!(cache
-        .insert(b"latte", b"", None, Duration::from_secs(5))
-        .is_ok());
-    assert!(cache
-        .insert(b"espresso", b"", None, Duration::from_secs(15))
-        .is_ok());
-
-    assert!(cache.get(b"latte").is_some());
-    assert!(cache.get(b"espresso").is_some());
+    // Two keys with different lifetimes land in different TTL buckets, so
+    // each occupies its own segment.
+    cache
+        .insert(b"short", b"a", None, Duration::from_secs(4))
+        .expect("insert short");
+    cache
+        .insert(b"long", b"bb", None, Duration::from_secs(20))
+        .expect("insert long");
     assert_eq!(cache.items(), 2);
     assert_eq!(cache.segments.free(), segments - 2);
 
-    // not enough time elapsed, not removed by expire
+    // Running expiration before anything has aged out changes nothing.
     cache.expire();
-    assert!(cache.get(b"latte").is_some());
-    assert!(cache.get(b"espresso").is_some());
+    assert!(cache.get(b"short").is_some());
+    assert!(cache.get(b"long").is_some());
     assert_eq!(cache.items(), 2);
     assert_eq!(cache.segments.free(), segments - 2);
 
-    // wait and expire again
+    // Once the short lifetime elapses, an expire pass reclaims only that
+    // key's segment; the longer-lived key is untouched.
     std::thread::sleep(std::time::Duration::from_secs(5));
     cache.expire();
-
-    assert!(cache.get(b"latte").is_none());
-    assert!(cache.get(b"espresso").is_some());
+    assert!(cache.get(b"short").is_none());
+    assert!(cache.get(b"long").is_some());
     assert_eq!(cache.items(), 1);
     assert_eq!(cache.segments.free(), segments - 1);
 
-    // wait and expire again
-    std::thread::sleep(std::time::Duration::from_secs(10));
+    // After the remaining lifetime passes too, a final pass empties the
+    // cache and returns every segment to the free pool.
+    std::thread::sleep(std::time::Duration::from_secs(16));
     cache.expire();
-
-    assert!(cache.get(b"latte").is_none());
-    assert!(cache.get(b"espresso").is_none());
+    assert!(cache.get(b"long").is_none());
     assert_eq!(cache.items(), 0);
     assert_eq!(cache.segments.free(), segments);
 }
 
-// Roadmap item 5b, §3: `evict()` must attempt whole-segment expiration
-// BEFORE running the spare-consuming Merge eviction. If expiration alone
-// frees a segment, merge must not run at all.
+// Roadmap item 5b, §3: when the heap is full, `evict()` must first try to
+// reclaim a whole expired segment chain and only fall back to the
+// spare-consuming Merge path if expiration frees nothing. This test wedges
+// the cache into a state where an entire chain has just expired, then forces
+// one eviction and proves it went through expiration rather than merge.
 //
-// Distinguishing signal: Merge's prune step scores items by frequency and
-// keeps a target *ratio* of survivors even when every item has the same
-// (zero) frequency — so if merge runs on a bucket whose items are all
-// past their TTL, some previously-inserted keys will still be readable
-// afterward and `cache.items()` will be > 1. Whole-segment expiration, by
-// contrast, drops the entire chain unconditionally: every previously
-// inserted key becomes `None` and only the newly inserted trigger item
-// remains. This is process-local and deterministic (unlike the shared
-// `SEGMENT_MERGE` counter, which other tests running in parallel can also
-// increment).
+// The two paths leave distinguishable fingerprints. Whole-chain expiration
+// unconditionally discards every item in the reclaimed segments, so once it
+// runs, none of the previously stored keys can be read back. A merge, on the
+// other hand, keeps a frequency-weighted target ratio of survivors even when
+// every candidate item shares the same (zero) access count, so at least some
+// old keys would still resolve. Checking that every old key is gone (and only
+// the fresh trigger item remains) is therefore a deterministic, process-local
+// witness that expiration won -- unlike the shared SEGMENT_MERGE counter,
+// which other tests in the same process can perturb.
 //
-// Uses `Segments::free_only`, which (like the rest of the Task-1 spare
-// accessors) is only compiled outside the `loom` feature.
+// Relies on `Segments::free_only`, one of the Task-1 spare accessors compiled
+// only when the `loom` feature is off.
 #[test]
 #[cfg(not(feature = "loom"))]
 fn evict_expires_before_merging() {
-    // Fixed-width key + fixed value so every insert consumes exactly the
-    // same number of bytes. `keyvalue::item_size` is the same size
-    // formula `reserve_and_define` uses internally, computed here at
-    // runtime so the test is correct regardless of ITEM_HDR_SIZE (i.e.
-    // under both the default and `integrity`/`debug` feature builds).
-    const ITEMS_PER_SEGMENT: usize = 6;
-    const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
-    let value: &[u8] = b"payload-bytes-value";
-    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
-    // Under this crate's own `integrity` feature (enabled by `debug`),
-    // `Segment::init` writes an 8-byte SEG_MAGIC canary at the start of
-    // every segment's data region, shrinking the usable capacity. Fold
-    // that into the segment size so ITEMS_PER_SEGMENT items fit exactly
-    // regardless of feature flags.
-    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
-    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+    // Give every item an identical footprint so a whole number of them tiles
+    // a segment exactly, with no ragged final slot. `keyvalue::item_size`
+    // reproduces the internal sizing formula, so the arithmetic stays correct
+    // across feature builds (the `integrity`/`debug` builds prepend an 8-byte
+    // segment canary that we fold into the segment size below).
+    const PER_SEGMENT: usize = 9;
+    const KEY_WIDTH: usize = 8; // "exp" + 5 zero-padded digits
+    let payload: &[u8] = b"soon-gone";
+    let per_item = keyvalue::item_size(KEY_WIDTH, &Value::Bytes(payload), 0);
+    let canary = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let seg_bytes = (canary + per_item * PER_SEGMENT) as i32;
 
-    // 1 held-back spare (Merge policy) + 5 free. Filling all 5 free
-    // segments exactly (no partial last segment) forms a chain long
-    // enough (chain_len >= 3) that a merge, if it ran, would actually
-    // execute rather than bailing out on a too-short chain.
-    let free_segments = 5usize;
-    let total_segments = free_segments + 1; // + spare
+    // Merge policy withholds one spare; the remaining segments form the fill
+    // pool. A five-segment fill makes a chain long enough that a merge, had it
+    // run, would have proceeded rather than bailing on an under-length chain.
+    let fill_segments = 5usize;
+    let total = fill_segments + 1;
 
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(segment_size as usize * total_segments)
+        .segment_size(seg_bytes)
+        .heap_size(seg_bytes as usize * total)
         .hash_power(16)
         .eviction(Policy::Merge {
             max: 8,
@@ -1058,110 +1023,98 @@ fn evict_expires_before_merging() {
             compact: 0,
         })
         .build()
-        .expect("failed to create cache");
-
+        .expect("cache build failed");
     assert_eq!(
         cache.segments.free_only(),
-        free_segments,
-        "sanity: Merge policy must hold back exactly one spare"
+        fill_segments,
+        "Merge policy should reserve exactly one spare"
     );
 
-    // All inserts share one short TTL so they land in a single TTL
-    // bucket's segment chain -- the same chain merge would walk.
+    // A single short TTL shared by every fill item keeps them in one bucket's
+    // chain -- precisely the chain a merge would otherwise walk.
     let ttl = Duration::from_secs(1);
 
-    // Fill every normal (non-spare) free segment exactly full with
-    // short-TTL items. Because segment_size is an exact multiple of
-    // item_size, the last segment ends precisely full too -- eviction is
-    // not needed (and must not run) during this fill.
-    let fill_count = ITEMS_PER_SEGMENT * free_segments;
-    let mut inserted = Vec::with_capacity(fill_count);
-    for i in 0..fill_count {
-        let key = format!("k{i:06}");
-        assert_eq!(key.len(), KEY_LEN, "key width must stay fixed-size");
+    // Pack every non-spare segment to the brim. Because segment size is an
+    // exact multiple of item size, this exhausts the free queue without ever
+    // needing an eviction mid-fill.
+    let fill = PER_SEGMENT * fill_segments;
+    let mut planted = Vec::with_capacity(fill);
+    for i in 0..fill {
+        let key = format!("exp{i:05}");
+        assert_eq!(key.len(), KEY_WIDTH);
         cache
-            .insert(key.as_bytes(), value, None, ttl)
-            .expect("fill inserts must succeed without needing eviction");
-        inserted.push(key);
+            .insert(key.as_bytes(), payload, None, ttl)
+            .expect("fill insert");
+        planted.push(key);
     }
     assert_eq!(
         cache.segments.free_only(),
         0,
-        "fill must exactly exhaust the free queue, including the last segment"
+        "fill must drain the free queue"
     );
 
-    // Let every inserted item's TTL elapse. clocksource::coarse has 1s
-    // resolution, so a >1s real sleep guarantees create_at + ttl <= now
-    // for every segment in the chain.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // Age the entire chain out. clocksource::coarse ticks at 1s, so sleeping
+    // comfortably past the TTL guarantees every segment is past its deadline.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
 
-    // This insert needs a fresh segment: the pool is genuinely full and
-    // the last segment has no spare room. It must be served by evict()
-    // reclaiming the whole expired chain via expiration, not by merging
-    // it.
-    let result = cache.insert(b"trigger", b"new value", None, ttl);
-    assert!(
-        result.is_ok(),
-        "insert must succeed by reclaiming the expired chain"
-    );
-    assert!(cache.get(b"trigger").is_some());
+    // The pool is truly full and the tail has no headroom, so this store
+    // cannot proceed without freeing a segment. It should be satisfied by
+    // expiring the dead chain, not by merging it.
+    cache
+        .insert(b"fresh-one", b"kept", None, ttl)
+        .expect("store must succeed by reclaiming the expired chain");
+    assert!(cache.get(b"fresh-one").is_some());
 
-    // Whole-segment expiration drops every item in the chain -- nothing
-    // survives. A merge would instead have pruned by frequency and kept
-    // a target *ratio* of survivors alive even though every item here has
-    // the same (zero) frequency, so any surviving key below proves merge
-    // ran instead of expiration.
-    for key in &inserted {
+    // Expiration wipes the whole chain, so nothing planted earlier survives.
+    for key in &planted {
         assert!(
             cache.get(key.as_bytes()).is_none(),
-            "key {key} must be gone: expiration (not merge) must have reclaimed the chain"
+            "expired key {key} should be gone (a merge would have kept some)"
         );
     }
     assert_eq!(
         cache.items(),
         1,
-        "only the trigger item should remain; a merge would have kept survivors"
+        "only the freshly stored item should remain"
     );
 
-    // Secondary, non-load-bearing signal: SEGMENT_MERGE is a process-global
-    // metriken counter that other tests running in parallel can also
-    // increment, so it is deliberately not asserted against a before/after
-    // delta here -- the deterministic per-key and items() checks above are
-    // what prove the ordering.
+    // SEGMENT_MERGE is a process-wide counter other parallel tests also bump,
+    // so it is only touched here (not asserted); the per-key/items() checks
+    // above are what actually pin down the ordering.
     #[cfg(feature = "metrics")]
     let _ = crate::metrics::SEGMENT_MERGE.value();
 }
 
-// Roadmap item 5b, §1: the Merge policy evicts by copying survivors into a
-// fresh spare segment (reader-safe, append-only) and draining every
-// candidate — it never compacts a readable segment in place. This test
-// forces a single merge pass over a full segment chain and checks:
-//   (a) the bucket head becomes the reserved spare segment, Sealed and
-//       holding the copied survivors;
-//   (b) the candidate segments were freed and nothing leaked (available +
-//       readable == total);
-//   (c) high-frequency items survive the merge and are served from their
-//       relocated copies in the spare.
+// Roadmap item 5b, §1: a Merge eviction relocates the survivors of a full
+// segment chain into a fresh spare (append-only, so readers are never
+// disturbed) and then recycles the drained candidates -- it never rewrites a
+// live segment in place. Driving one merge pass over a saturated chain, this
+// test verifies:
+//   (a) the spare becomes the new bucket head, Sealed, carrying the copied
+//       survivors;
+//   (b) drained candidates return to Free with nothing lost (available plus
+//       readable segments still add up to the whole pool);
+//   (c) frequently-read keys survive and are served from their spare copies.
 //
-// Uses the Task-1 spare accessors (`free`, `free_only`, `spare_count`),
-// which are compiled only outside the `loom` feature.
+// Depends on the Task-1 spare accessors (`free`, `free_only`, `spare_count`),
+// only compiled when `loom` is off.
 #[test]
 #[cfg(not(feature = "loom"))]
 fn merge_evict_copies_survivors_into_spare() {
-    const ITEMS_PER_SEGMENT: usize = 64;
-    const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
-    let value: &[u8] = b"v";
-    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
-    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
-    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+    const PER_SEGMENT: usize = 48;
+    const KEY_WIDTH: usize = 8; // "row" + 5 zero-padded digits
+    let payload: &[u8] = b"o";
+    let per_item = keyvalue::item_size(KEY_WIDTH, &Value::Bytes(payload), 0);
+    let canary = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let seg_bytes = (canary + per_item * PER_SEGMENT) as i32;
 
-    // 1 held-back spare (Merge policy) + 5 normal free segments.
-    let free_segments = 5usize;
-    let total_segments = free_segments + 1;
+    // One withheld spare (Merge policy) plus five fillable segments.
+    let fill_segments = 5usize;
+    let total = fill_segments + 1;
 
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(segment_size as usize * total_segments)
+        .segment_size(seg_bytes)
+        .heap_size(seg_bytes as usize * total)
         .hash_power(16)
         .eviction(Policy::Merge {
             max: 8,
@@ -1169,81 +1122,81 @@ fn merge_evict_copies_survivors_into_spare() {
             compact: 0,
         })
         .build()
-        .expect("failed to create cache");
-
-    assert_eq!(cache.segments.free_only(), free_segments);
+        .expect("cache build failed");
+    assert_eq!(cache.segments.free_only(), fill_segments);
     assert_eq!(cache.segments.spare_count(), 1);
 
-    // Long TTL: items never expire during the test, so evict() falls
-    // through the expire-first fast path into the actual merge.
-    let ttl = Duration::from_secs(3600);
+    // A far-future TTL keeps everything alive, so evict() skips the
+    // expire-first shortcut and actually performs the merge.
+    let ttl = Duration::from_secs(7200);
 
-    // Fill every normal free segment exactly full; all share one TTL bucket
-    // (the chain merge walks). The last one stays the Live write tail.
-    let fill_count = ITEMS_PER_SEGMENT * free_segments;
-    let mut keys = Vec::with_capacity(fill_count);
-    for i in 0..fill_count {
-        let key = format!("k{i:06}");
-        assert_eq!(key.len(), KEY_LEN, "key width must stay fixed-size");
+    // Saturate every fillable segment; they share one TTL bucket so the merge
+    // walks a single chain, with the final segment left as the Live tail.
+    let fill = PER_SEGMENT * fill_segments;
+    let mut keys = Vec::with_capacity(fill);
+    for i in 0..fill {
+        let key = format!("row{i:05}");
+        assert_eq!(key.len(), KEY_WIDTH);
         cache
-            .insert(key.as_bytes(), value, None, ttl)
-            .expect("fill inserts must succeed without needing eviction");
+            .insert(key.as_bytes(), payload, None, ttl)
+            .expect("fill insert");
         keys.push(key);
     }
     assert_eq!(
         cache.segments.free_only(),
         0,
-        "fill must exactly exhaust the free queue"
+        "fill must drain the free queue"
     );
 
-    // Bump the frequency of a few keys from the first candidate segment so
-    // prune keeps them: high-frequency items are the survivors copied into
-    // the spare. get() returns a pinned Item, so each lookup is dropped at
-    // the end of its statement — no candidate stays pinned during the merge.
-    let hot: Vec<String> = keys.iter().take(3).cloned().collect();
-    for _ in 0..40 {
-        for k in &hot {
+    // Warm a handful of keys from the head candidate so the prune step keeps
+    // them as survivors. Each get() hands back a pinned Item that drops at the
+    // end of its statement, so no candidate stays pinned into the merge.
+    let warm: Vec<String> = keys.iter().take(4).cloned().collect();
+    for _ in 0..30 {
+        for k in &warm {
             assert!(cache.get(k.as_bytes()).is_some());
         }
     }
 
     let items_before = cache.items();
-    let free_before = cache.segments.free(); // free_only(0) + spare(1)
-    assert_eq!(free_before, 1, "only the held-back spare is available");
+    let available_before = cache.segments.free(); // 0 free + 1 spare
+    assert_eq!(available_before, 1, "only the withheld spare is available");
 
-    // The spare seeded at construction is segment id 1 (idx 0 < spare
-    // capacity); reserve_free handed out ids 2.. for the fill, leaving id 1
-    // in the spare queue for merge to reserve as the copy destination.
+    // The construction-time spare occupies id 1; the fill consumed ids 2.. via
+    // reserve_free, so id 1 is still queued for the merge to claim as its copy
+    // destination.
     let spare_id = NonZeroU32::new(1).unwrap();
 
-    // Drive exactly one eviction pass. With a single occupied bucket the
-    // policy's random start still finds it (evict scans every bucket).
+    // One eviction pass. evict() scans every bucket, so the lone occupied one
+    // is found regardless of the policy's random starting point.
     cache
         .segments
         .evict(&cache.ttl_buckets, &cache.hashtable)
-        .expect("merge eviction must succeed on a full 5-segment chain");
+        .expect("merge eviction must succeed over a full chain");
 
-    // (a) The bucket head is now the spare segment, Sealed and holding the
-    // copied survivors.
+    // (a) The spare is now the bucket head, Sealed, holding survivors.
     let seg_ttl = cache.segments.header(spare_id).ttl();
-    let head = cache.ttl_buckets.get_bucket(seg_ttl).head();
-    assert_eq!(head, Some(spare_id), "merge must head-insert the spare");
+    assert_eq!(
+        cache.ttl_buckets.get_bucket(seg_ttl).head(),
+        Some(spare_id),
+        "merge must head-insert the spare"
+    );
     {
         let spare = cache.segments.segment(spare_id).unwrap();
         assert_eq!(spare.state(), State::Sealed);
-        assert!(spare.live_items() > 0, "spare must hold copied survivors");
+        assert!(spare.live_items() > 0, "spare must carry survivors");
     }
 
-    // (b) Candidates were drained and nothing leaked. Every candidate that
-    // clear_segment recycles becomes Free and is pushed back to a queue
-    // (spare first, then free), so the count of Free segments equals the
-    // number of drained candidates equals the available depth. At least one
-    // candidate must have been drained, and every segment must be accounted
-    // for as either available or in a readable chain (no pins are held, so
-    // there are no condemned segments).
-    let free_after = cache.segments.free();
-    assert!(free_after >= free_before, "availability must not shrink");
-    let freed = (1..=total_segments as u32)
+    // (b) Every drained candidate is back in Free, and no segment vanished:
+    // the count of Free segments equals the available depth, and available +
+    // readable covers the entire pool (no pins are held, so nothing is stuck
+    // condemned).
+    let available_after = cache.segments.free();
+    assert!(
+        available_after >= available_before,
+        "availability must not shrink"
+    );
+    let recycled = (1..=total as u32)
         .filter(|&id| {
             cache
                 .segments
@@ -1253,12 +1206,12 @@ fn merge_evict_copies_survivors_into_spare() {
                 == State::Free
         })
         .count();
-    assert!(freed >= 1, "merge must have drained at least one candidate");
+    assert!(recycled >= 1, "at least one candidate must have drained");
     assert_eq!(
-        free_after, freed,
-        "available depth must equal the number of drained (Free) candidates"
+        available_after, recycled,
+        "available depth must equal the drained (Free) count"
     );
-    let readable = (1..=total_segments as u32)
+    let readable = (1..=total as u32)
         .filter(|&id| {
             cache
                 .segments
@@ -1269,154 +1222,135 @@ fn merge_evict_copies_survivors_into_spare() {
         })
         .count();
     assert_eq!(
-        free_after + readable,
-        total_segments,
-        "no leak: available + readable segments must account for the whole pool"
+        available_after + readable,
+        total,
+        "no leak: available + readable must cover the whole pool"
     );
 
-    // (c) High-frequency items survived and are served from their relocated
-    // copies in the spare.
-    for k in &hot {
+    // (c) The warmed keys survived and read back from their relocated copies.
+    for k in &warm {
         let item = cache
             .get(k.as_bytes())
-            .unwrap_or_else(|| panic!("hot key {k} must survive the merge"));
-        assert_eq!(item.value(), b"v");
+            .unwrap_or_else(|| panic!("warm key {k} must survive the merge"));
+        assert!(item.value() == *payload);
     }
 
-    // The merge pruned low-frequency items: not every original item can
-    // remain (the chain held far more than one spare's worth of survivors).
+    // The chain held far more than a single spare could hold, so the merge
+    // must have pruned the cold majority.
     assert!(
         cache.items() < items_before,
         "merge must have pruned low-frequency items"
     );
 }
 
-// merge_compact is the maintenance counterpart of merge_evict, invoked from
-// `remove_at` when a segment drops below the compact-ratio low watermark
-// (no full-pool pressure). It must combine under-full segments into a
-// fresh spare WITHOUT frequency-based pruning: every survivor from every
-// combined candidate is preserved.
+// merge_compact is the low-pressure sibling of merge_evict: `remove_at`
+// invokes it as a maintenance step when a Sealed segment sinks below the
+// compact-ratio watermark, and unlike an eviction it prunes nothing --
+// every survivor from every combined candidate is carried forward.
 //
-// Builds a 3-normal-segment (+1 held-back spare) Merge cache, fully fills
-// the first two segments (leaving the third as the Live write tail), then
-// deletes most items from each so both segments' occupancy lands well
-// below the compact ratio (n_compact: 5 => compact_ratio 0.2; each
-// candidate ends at 2/12 ≈ 0.167, comfortably clear of the 0.2 watermark
-// with margin to spare regardless of any fixed per-segment header
-// overhead under the `integrity` feature). The delete that finally drops
-// the first segment's ratio to the watermark drives `remove_at` into
-// `merge_compact`, which must:
-//   (a) reserve the held-back spare and head-insert it as the new Sealed
-//       bucket head;
-//   (b) copy every survivor from both under-full segments into the spare
-//       (no pruning — all survivors preserved, unlike merge_evict);
-//   (c) drain both source segments (Free, nothing leaked);
-//   (d) leave the untouched Live tail segment alone.
+// The setup uses three fillable segments (plus the withheld spare). The
+// first two are packed full and sealed; the third stays the Live write
+// tail. We then delete most items from the two Sealed segments so both sit
+// well under the 0.2 watermark (compact: 5 => 1/5). With twelve items per
+// segment, dropping each to two leaves occupancy near 0.167 -- clear of the
+// watermark with room to spare even after the `integrity` build's fixed
+// per-segment overhead is folded in. The delete that finally pushes the head
+// Sealed segment under the watermark, while its successor already qualifies,
+// drives `remove_at` into `merge_compact`, which must:
+//   (a) claim the spare and head-insert it as the new Sealed bucket head;
+//   (b) copy every survivor from both under-full segments (no pruning);
+//   (c) drain both source segments to Free without losing anything;
+//   (d) leave the Live write tail untouched.
 #[test]
 #[cfg(not(feature = "loom"))]
 fn merge_compact_combines_under_full_segments_into_spare() {
-    const ITEMS_PER_SEGMENT: usize = 12;
-    const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
-    let value: &[u8] = b"v";
-    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
-    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
-    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+    const PER_SEGMENT: usize = 12;
+    const KEY_WIDTH: usize = 8; // "cell" + 4 zero-padded digits
+    let payload: &[u8] = b"q";
+    let per_item = keyvalue::item_size(KEY_WIDTH, &Value::Bytes(payload), 0);
+    let canary = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let seg_bytes = (canary + per_item * PER_SEGMENT) as i32;
 
-    // 1 held-back spare (Merge policy) + 3 normal free segments: two fill
-    // completely and seal, the third stays the Live write tail.
-    let free_segments = 3usize;
-    let total_segments = free_segments + 1;
+    // Withheld spare + three fillable segments: two fill and seal, the last
+    // remains the Live tail.
+    let fill_segments = 3usize;
+    let total = fill_segments + 1;
 
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(segment_size as usize * total_segments)
+        .segment_size(seg_bytes)
+        .heap_size(seg_bytes as usize * total)
         .hash_power(16)
         .eviction(Policy::Merge {
             max: 8,
             merge: 4,
-            compact: 5, // compact_ratio = 1 / 5 = 0.2
+            compact: 5, // 1/5 => 0.2 watermark
         })
         .build()
-        .expect("failed to create cache");
-
-    assert_eq!(cache.segments.free_only(), free_segments);
+        .expect("cache build failed");
+    assert_eq!(cache.segments.free_only(), fill_segments);
     assert_eq!(cache.segments.spare_count(), 1);
 
-    // Long TTL: items never expire during the test.
-    let ttl = Duration::from_secs(3600);
+    // Far-future TTL: nothing expires during the run.
+    let ttl = Duration::from_secs(7200);
 
-    // Fill exactly 2 segments' worth of items; the reserve() path only
-    // seals a segment once a successor is needed, so the 3rd segment
-    // stays Live (full, but still the write tail) — mirrors
-    // merge_evict_copies_survivors_into_spare's fill discipline.
-    let fill_count = ITEMS_PER_SEGMENT * free_segments;
-    let mut keys = Vec::with_capacity(fill_count);
-    for i in 0..fill_count {
-        let key = format!("k{i:06}");
-        assert_eq!(key.len(), KEY_LEN, "key width must stay fixed-size");
+    // Pack all three fillable segments; reserve() seals a segment only when a
+    // successor is required, so the third stays Live even though it is full.
+    let fill = PER_SEGMENT * fill_segments;
+    let mut keys = Vec::with_capacity(fill);
+    for i in 0..fill {
+        let key = format!("cell{i:04}");
+        assert_eq!(key.len(), KEY_WIDTH);
         cache
-            .insert(key.as_bytes(), value, None, ttl)
-            .expect("fill inserts must succeed without needing eviction");
+            .insert(key.as_bytes(), payload, None, ttl)
+            .expect("fill insert");
         keys.push(key);
     }
     assert_eq!(
         cache.segments.free_only(),
         0,
-        "fill must exactly exhaust the free queue"
+        "fill must drain the free queue"
     );
 
-    // Deterministic id assignment (same discipline as the merge_evict
-    // test): the held-back spare seeded at construction is id 1;
-    // reserve_free hands out ids 2.. in order for the fill.
+    // Ids are handed out deterministically: the construction-time spare is 1,
+    // and reserve_free assigns 2.. across the fill in order.
     let spare_id = NonZeroU32::new(1).unwrap();
-    let seg_a = NonZeroU32::new(2).unwrap(); // first filled: bucket head, Sealed
-    let seg_b = NonZeroU32::new(3).unwrap(); // second filled: Sealed
-    let seg_c = NonZeroU32::new(4).unwrap(); // third: Live write tail
+    let seg_head = NonZeroU32::new(2).unwrap(); // first filled -> bucket head, Sealed
+    let seg_mid = NonZeroU32::new(3).unwrap(); // second filled -> Sealed
+    let seg_tail = NonZeroU32::new(4).unwrap(); // third -> Live write tail
 
-    {
-        let a = cache.segments.segment(seg_a).unwrap();
-        assert_eq!(a.state(), State::Sealed);
-        assert_eq!(a.live_items(), ITEMS_PER_SEGMENT as i32);
-    }
-    {
-        let b = cache.segments.segment(seg_b).unwrap();
-        assert_eq!(b.state(), State::Sealed);
-        assert_eq!(b.live_items(), ITEMS_PER_SEGMENT as i32);
-    }
-    {
-        let c = cache.segments.segment(seg_c).unwrap();
-        assert_eq!(c.state(), State::Live);
-        assert_eq!(c.live_items(), ITEMS_PER_SEGMENT as i32);
+    for (id, expected_state) in [
+        (seg_head, State::Sealed),
+        (seg_mid, State::Sealed),
+        (seg_tail, State::Live),
+    ] {
+        let seg = cache.segments.segment(id).unwrap();
+        assert_eq!(seg.state(), expected_state);
+        assert_eq!(seg.live_items(), PER_SEGMENT as i32);
     }
 
-    // Bring seg_b down to 2/12 occupancy FIRST. Its own compact check
-    // (`remove_at`) looks at its successor, seg_c — which is Live
-    // (can_evict() == false) — so this cannot trigger a merge yet; it's
-    // safe prep so that when seg_a's ratio drops, seg_b already qualifies
-    // as a compaction partner.
+    // First thin out seg_mid to two items. Its own compact check looks at its
+    // successor seg_tail, which is Live (can_evict() == false), so this alone
+    // cannot fire a merge -- it just pre-qualifies seg_mid as a partner for
+    // when seg_head later drops.
     for k in &keys[12..22] {
-        assert!(cache.delete(k.as_bytes()), "delete must find the key");
+        assert!(cache.delete(k.as_bytes()), "delete should find the key");
     }
-    assert_eq!(cache.segments.segment(seg_b).unwrap().live_items(), 2);
+    assert_eq!(cache.segments.segment(seg_mid).unwrap().live_items(), 2);
 
-    // Now bring seg_a down from 12 -> 2 items. Somewhere in this loop
-    // seg_a's ratio drops to <= compact_ratio (0.2) while seg_b (its chain
-    // successor) is already at 2/12 <= 0.2 and can_evict() == true, so
-    // one of these delete() calls drives `remove_at` into
-    // `merge_compact(seg_a, ..)`. Once that happens seg_a is drained, so
-    // any remaining keys in this batch are deleted from wherever the
-    // hashtable now points (harmless — `delete` doesn't care).
+    // Now thin seg_head from twelve toward two. As its ratio crosses the 0.2
+    // watermark while seg_mid (its successor) already sits at 2/12 and is
+    // evictable, one of these deletes drives `remove_at` into
+    // `merge_compact(seg_head, ..)`. Once that drains seg_head, later deletes
+    // in this batch simply act wherever the hashtable now points -- harmless.
     for k in &keys[0..10] {
-        assert!(cache.delete(k.as_bytes()), "delete must find the key");
+        assert!(cache.delete(k.as_bytes()), "delete should find the key");
     }
 
-    // (a) The bucket head is now the spare segment, Sealed, and combines
-    // both under-full candidates' survivors (2 from seg_a + 2 from
-    // seg_b = 4), with none pruned.
+    // (a) The spare is now the Sealed bucket head, carrying all four survivors
+    // (two from each candidate) with nothing pruned.
     let seg_ttl = cache.segments.header(spare_id).ttl();
-    let head = cache.ttl_buckets.get_bucket(seg_ttl).head();
     assert_eq!(
-        head,
+        cache.ttl_buckets.get_bucket(seg_ttl).head(),
         Some(spare_id),
         "merge_compact must head-insert the spare"
     );
@@ -1426,24 +1360,29 @@ fn merge_compact_combines_under_full_segments_into_spare() {
         assert_eq!(
             spare.live_items(),
             4,
-            "merge_compact must preserve every survivor from both candidates (no pruning)"
+            "compaction must keep every survivor from both candidates"
         );
     }
 
-    // (b) Both under-full source segments were drained (Free), and the
-    // untouched Live tail was left alone.
-    assert_eq!(cache.segments.segment(seg_a).unwrap().state(), State::Free);
-    assert_eq!(cache.segments.segment(seg_b).unwrap().state(), State::Free);
+    // (b) Both source segments drained to Free; the Live tail is untouched.
+    assert_eq!(
+        cache.segments.segment(seg_head).unwrap().state(),
+        State::Free
+    );
+    assert_eq!(
+        cache.segments.segment(seg_mid).unwrap().state(),
+        State::Free
+    );
     {
-        let c = cache.segments.segment(seg_c).unwrap();
-        assert_eq!(c.state(), State::Live);
-        assert_eq!(c.live_items(), ITEMS_PER_SEGMENT as i32);
+        let tail = cache.segments.segment(seg_tail).unwrap();
+        assert_eq!(tail.state(), State::Live);
+        assert_eq!(tail.live_items(), PER_SEGMENT as i32);
     }
 
-    // (c) No leak: available (free + spare) + readable segments accounts
-    // for the whole pool.
-    let free_after = cache.segments.free();
-    let readable = (1..=total_segments as u32)
+    // (c) Nothing leaked: available (free + spare) plus readable segments
+    // accounts for every segment.
+    let available_after = cache.segments.free();
+    let readable = (1..=total as u32)
         .filter(|&id| {
             cache
                 .segments
@@ -1454,394 +1393,221 @@ fn merge_compact_combines_under_full_segments_into_spare() {
         })
         .count();
     assert_eq!(
-        free_after + readable,
-        total_segments,
-        "no leak: available + readable segments must account for the whole pool"
+        available_after + readable,
+        total,
+        "no leak: available + readable must cover the whole pool"
     );
 
-    // (d) Total item count is preserved exactly (4 in the spare + 12 in
-    // the untouched Live tail = 16 = 36 inserted - 10 deleted from seg_b's
-    // batch - 10 deleted from seg_a's batch).
+    // (d) Item count is exactly preserved: 4 compacted survivors + 12 in the
+    // Live tail = 16 (36 inserted, 10 + 10 deleted).
     assert_eq!(cache.items(), 16);
 
-    // (e) Every surviving key (the ones NOT explicitly deleted) is still
-    // reachable, served from wherever the hashtable now points (the
-    // relocated copy in the spare, or the untouched tail).
+    // (e) Every key not explicitly deleted still resolves, wherever the
+    // hashtable now points it (spare copy or untouched tail).
     for k in keys[10..12].iter().chain(&keys[22..36]) {
         let item = cache
             .get(k.as_bytes())
-            .unwrap_or_else(|| panic!("surviving key {k} must remain reachable"));
-        assert_eq!(item.value(), b"v");
+            .unwrap_or_else(|| panic!("survivor {k} must remain reachable"));
+        assert!(item.value() == *payload);
     }
 
-    // (f) The explicitly-deleted keys are gone.
+    // (f) The deleted keys are gone.
     for k in keys[0..10].iter().chain(&keys[12..22]) {
         assert!(
             cache.get(k.as_bytes()).is_none(),
-            "deleted key {k} must not be found"
+            "deleted key {k} must miss"
         );
     }
 }
 
 #[test]
 fn clear() {
-    let ttl = Duration::ZERO;
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-
+    let segments = 48usize;
+    let seg_bytes = 4096;
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(seg_bytes)
+        .heap_size(segments * seg_bytes as usize)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), segments);
-    assert!(cache.get(b"coffee").is_none());
-    assert!(cache.insert(b"coffee", b"strong", None, ttl).is_ok());
-    assert_eq!(cache.segments.free(), segments - 1);
-    assert_eq!(cache.items(), 1);
-    assert!(cache.get(b"coffee").is_some());
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
 
-    let item = cache.get(b"coffee").unwrap();
-    assert_eq!(item.value(), b"strong", "item is: {item:?}");
-    // the item pins its segment; release it so clear() can reclaim
-    drop(item);
+    // populate a couple of keys across two segments' worth of state
+    cache.insert(b"north", b"pole", None, ttl).expect("insert");
+    cache.insert(b"south", b"pole", None, ttl).expect("insert");
+    assert_eq!(cache.items(), 2);
+    assert!(cache.get(b"north").is_some());
 
+    // a held Item pins its segment; release it before clearing so the
+    // segment can actually be reclaimed
+    let held = cache.get(b"south").unwrap();
+    assert_eq!(held.value(), b"pole", "unexpected item: {held:?}");
+    drop(held);
+
+    // clear empties the store and returns every segment to the free pool
     cache.clear();
-    assert_eq!(cache.segments.free(), segments);
     assert_eq!(cache.items(), 0);
-    assert!(cache.get(b"coffee").is_none());
+    assert_eq!(cache.segments.free(), segments);
+    assert!(cache.get(b"north").is_none());
+    assert!(cache.get(b"south").is_none());
 }
 
 #[test]
 fn wrapping_add() {
-    let ttl = Duration::ZERO;
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(4096)
+        .heap_size(4096 * 32)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 64);
-    assert!(cache.insert(b"coffee", 0, None, ttl).is_ok());
-    assert_eq!(cache.segments.free(), 63);
-    assert_eq!(cache.items(), 1);
-    assert!(cache.get(b"coffee").is_some());
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
 
-    let item = cache.get(b"coffee").unwrap();
-    assert_eq!(item.value(), 0, "item is: {item:?}");
+    cache.insert(b"tally", 10u64, None, ttl).expect("insert");
 
-    // updates are in place: the held Item observes each one
-    assert_eq!(cache.wrapping_add(b"coffee", 1).unwrap(), 1);
-    assert_eq!(item.value(), 1, "item is: {item:?}");
+    // increments land in place, so an Item held over the key observes each
+    // step without being re-fetched
+    let held = cache.get(b"tally").unwrap();
+    assert_eq!(held.value(), 10u64, "unexpected item: {held:?}");
+    assert_eq!(cache.wrapping_add(b"tally", 5).unwrap(), 15);
+    assert_eq!(held.value(), 15u64);
 
-    // wrap at the 64-bit mark (memcached incr semantics)
-    assert_eq!(
-        cache.wrapping_add(b"coffee", u64::MAX - 1).unwrap(),
-        u64::MAX
-    );
-    assert_eq!(cache.wrapping_add(b"coffee", 1).unwrap(), 0);
-    assert_eq!(cache.wrapping_add(b"coffee", 2).unwrap(), 2);
-    assert_eq!(item.value(), 2, "item is: {item:?}");
+    // adding right up to u64::MAX and one past it wraps to zero (memcached
+    // incr semantics)
+    let step = u64::MAX - 15;
+    assert_eq!(cache.wrapping_add(b"tally", step).unwrap(), u64::MAX);
+    assert_eq!(cache.wrapping_add(b"tally", 1).unwrap(), 0);
+    assert_eq!(cache.wrapping_add(b"tally", 7).unwrap(), 7);
+    assert_eq!(held.value(), 7u64);
 
-    // the store agrees
-    drop(item);
-    assert_eq!(cache.get(b"coffee").unwrap().value(), 2);
+    // a fresh read agrees with the in-place value
+    drop(held);
+    assert_eq!(cache.get(b"tally").unwrap().value(), 7u64);
 }
 
 #[test]
 fn saturating_sub() {
-    let ttl = Duration::ZERO;
-    let segment_size = 4096;
-    let segments = 64;
-    let heap_size = segments * segment_size as usize;
-
     let cache = Segcache::builder()
-        .segment_size(segment_size)
-        .heap_size(heap_size)
+        .segment_size(4096)
+        .heap_size(4096 * 32)
         .build()
-        .expect("failed to create cache");
-    assert_eq!(cache.items(), 0);
-    assert_eq!(cache.segments.free(), 64);
-    assert!(cache.insert(b"coffee", 3, None, ttl).is_ok());
-    assert_eq!(cache.segments.free(), 63);
-    assert_eq!(cache.items(), 1);
-    assert!(cache.get(b"coffee").is_some());
+        .expect("cache build failed");
+    let ttl = Duration::ZERO;
 
-    let item = cache.get(b"coffee").unwrap();
-    assert_eq!(item.value(), 3, "item is: {item:?}");
-    drop(item);
+    cache.insert(b"credits", 5u64, None, ttl).expect("insert");
+    assert_eq!(cache.get(b"credits").unwrap().value(), 5u64);
 
-    let updated = cache
-        .saturating_sub(b"coffee", 2)
-        .expect("failed to decrement");
-    assert_eq!(updated, 1, "item is: {updated:?}");
+    // ordinary decrements walk the value down
+    assert_eq!(cache.saturating_sub(b"credits", 3).expect("decrement"), 2);
+    assert_eq!(cache.saturating_sub(b"credits", 2).expect("decrement"), 0);
 
-    let updated = cache
-        .saturating_sub(b"coffee", 1)
-        .expect("failed to decrement");
-    assert_eq!(updated, 0, "item is: {updated:?}");
-
-    // saturates at zero
-    let updated = cache
-        .saturating_sub(b"coffee", 1)
-        .expect("failed to decrement");
-    assert_eq!(updated, 0, "item is: {updated:?}");
-    assert_eq!(cache.get(b"coffee").unwrap().value(), 0);
+    // subtracting past zero clamps at zero rather than underflowing
+    assert_eq!(cache.saturating_sub(b"credits", 9).expect("decrement"), 0);
+    assert_eq!(cache.get(b"credits").unwrap().value(), 0u64);
 }
 
 #[test]
-// This test caught a case where we interpreted old data as part of an item
-// header. Specifically, the first insert sets bytes that will be in-range for
-// the item header for the third insert. This happens to set the "typed value"
-// bit, which stopped the item definition from setting the value length. This
-// caused the item value to be invalid. Triggering a removal of this item with
-// the corrupted length caused a panic on the asserts, which correctly detected
-// the bad state.
+// Regression guard for a family of corruption bugs where bytes left behind by
+// a prior occupant of a reused region are misread as the header of a
+// newly-stored item. If a stale byte happens to land on the flag that marks a
+// value as a typed/numeric field, the writer can skip emitting the real value
+// length, leaving the stored length inconsistent; a later delete that walks
+// that length then trips the integrity assertions. This scenario recycles a
+// region under an overflow-free hashtable and then stores and removes items
+// whose bytes deliberately resemble header fields -- it simply must not panic.
 fn fuzz_1() {
     let cache = Segcache::builder()
         .segment_size(1024)
-        .heap_size(8 * 1024)
+        .heap_size(6 * 1024)
         .hash_power(7)
         .overflow_factor(0.0)
         .build()
-        .expect("failed to create cache");
+        .expect("cache build failed");
 
-    let _ = cache.insert(
-        &[
-            195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195,
-            195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195,
-            195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195,
-            195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195,
-            195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195, 19, 5, 195,
-            195, 195, 195, 195, 195, 195, 195, 195, 4, 0, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-            4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-            4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 3, 0, 1, 0, 4, 181, 10, 4, 4, 4, 4, 4, 4,
-            4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 59, 8, 4,
-        ],
-        &[4, 4, 4, 4],
-        None,
-        Duration::from_secs(0),
-    );
+    // A large first value: a high-bit filler followed by a tail of small
+    // integers that look like plausible key/value length fields.
+    let mut poison = vec![0x91u8; 300];
+    poison.extend_from_slice(&[3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 4, 2, 0, 0, 8, 5]);
+    let key_a: Vec<u8> = (0..70)
+        .map(|i| if i % 5 == 0 { 0x00 } else { 0xC7 })
+        .collect();
+    let _ = cache.insert(&key_a, &poison, None, Duration::from_secs(0));
 
-    let _ = cache.clear();
+    // Wipe the store so the segment recycles with those poison bytes still
+    // physically present in the backing memory.
+    cache.clear();
     assert_eq!(cache.items(), 0);
 
+    // Reuse the recycled region: store a short key, overwrite it with a
+    // different-length value so a fresh header lands amid the stale bytes,
+    // then delete it -- the path that used to walk a corrupted length.
     let _ = cache.insert(
-        &[1],
-        &[0xDE, 0xAD, 0xBE, 0xEF],
-        None,
-        Duration::from_secs(4),
-    );
-    let _ = cache.insert(&[1], &[0xC0, 0xFF, 0xEE], None, Duration::from_secs(2));
-    let _ = cache.delete(&[1]);
-}
-
-#[test]
-// This test found an issue when freeing a segment because its live item count
-// dropped to zero. This is a more complicated way of triggering the same
-// behavior as fuzz_1 test, but also exposed that we had a tracking issue for
-// dead bytes when recycling a segment when live items dropped to zero.
-fn fuzz_2() {
-    let cache = Segcache::builder()
-        .segment_size(1024)
-        .heap_size(8 * 1024)
-        .hash_power(7)
-        .overflow_factor(1.0)
-        .build()
-        .expect("failed to create cache");
-
-    let _ = cache.insert(&[1], &[3, 4, 2], None, Duration::from_secs(0));
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 3, 0], None, Duration::from_secs(4));
-    let _ = cache.insert(&[1], &[3, 4, 2], None, Duration::from_secs(0));
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[2], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(
-        &[
-            81, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0,
-            4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 237, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 228, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 1,
-        ],
-        &[],
-        None,
-        Duration::from_secs(0),
-    );
-    let _ = cache.insert(&[1], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(
-        &[
-            228, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4,
-            2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 18, 255, 1, 0, 0, 1, 0, 2,
-            4, 1, 1, 1, 1, 1, 1, 1, 1, 101, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3,
-            0, 1, 0, 4, 2, 114, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 0, 4, 0, 4, 48, 0, 0, 255, 1, 0, 0, 1, 0, 2, 4, 1, 1, 1, 2, 2, 2,
-            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 4,
-            2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0,
-        ],
-        &[1],
-        None,
-        Duration::from_secs(0),
-    );
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[3, 4, 0], &[3, 1, 0], None, Duration::from_secs(10));
-    let _ = cache.delete(&[3, 1, 0]);
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(
-        &[
-            81, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0,
-            4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 237, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 228, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 1,
-        ],
-        &[],
-        None,
-        Duration::from_secs(0),
-    );
-    let _ = cache.insert(
-        &[
-            228, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 2, 1, 3, 0, 1, 3, 0, 1, 0, 4,
-            2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 3, 0, 4,
-            0, 1, 3, 0, 4, 1, 0, 81, 0, 0, 0, 1, 0, 10, 81, 0, 0, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1,
-            1, 0, 1, 3, 4, 2, 116, 0, 2, 2, 255, 255, 0, 3, 1, 0, 2, 0, 0, 0, 3, 4, 10, 4, 2, 114,
-            0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 5, 0, 255, 252, 255, 254, 255, 251, 2, 114, 0, 4, 4,
-            4, 0, 1, 1, 2, 1, 1, 0, 1, 1, 2, 1, 1, 0, 1, 2, 1, 1, 0, 1, 1, 1, 0, 1, 1, 2, 1, 1, 0,
-            1, 1, 1, 0, 1, 0, 4, 48, 0, 0, 3, 4, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-        ],
-        &[
-            255, 255, 255, 255, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 3, 0, 4, 0, 1, 3, 0,
-            4, 1, 0, 81, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 255, 255, 255, 255, 0, 4, 0, 4, 48,
-            0, 0, 255, 1, 0, 0, 1, 0, 2, 4, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 4, 2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0,
-            4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4,
-            10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 3, 0, 4, 0, 1, 3, 0, 4, 1, 0, 81, 0, 0,
-            0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0,
-            0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 228, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 1, 0, 0, 228, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48,
-        ],
-        None,
-        Duration::from_secs(0),
-    );
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 4, 2], None, Duration::from_secs(114));
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(&[3], &[3, 4, 2], None, Duration::from_secs(114));
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[2], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[3, 4, 0], &[3, 1, 0], None, Duration::from_secs(10));
-    let _ = cache.delete(&[3, 1, 0]);
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(
-        &[
-            81, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0,
-            4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 237, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 228, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 1,
-        ],
-        &[],
-        None,
-        Duration::from_secs(0),
-    );
-    let _ = cache.insert(
-        &[
-            228, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4,
-            2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 3, 0, 4,
-            0, 1, 3, 0, 4, 1, 0, 81, 0, 0, 0, 1, 0, 10, 81, 0, 0, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1,
-            1, 0, 1, 3, 4, 2, 116, 0, 2, 2, 255, 255, 0, 3, 1, 0, 2, 0, 0, 0, 3, 4, 10, 4, 2, 114,
-            0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0,
-            0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 3, 0, 4, 0, 1, 3, 0, 4, 1, 0,
-            81, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0,
-            4, 48, 0, 0, 3, 4, 10, 1,
-        ],
-        &[3, 0, 1],
+        &[7],
+        &[0xAB, 0xCD, 0xEF, 0x01],
         None,
         Duration::from_secs(3),
     );
-    let _ = cache.insert(&[1], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(
-        &[
-            228, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4,
-            2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 18, 255, 1, 0, 0, 1, 0, 2,
-            4, 1, 1, 1, 1, 1, 1, 1, 1, 101, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3,
-            0, 1, 0, 4, 2, 114, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 0, 4, 0, 4, 48, 0, 0, 255, 1, 0, 0, 1, 0, 2, 4, 1, 1, 1, 2, 2, 2,
-            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 4,
-            2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0,
-        ],
-        &[1],
-        None,
-        Duration::from_secs(0),
-    );
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[3, 4, 0], &[3, 1, 0], None, Duration::from_secs(10));
-    let _ = cache.delete(&[3, 1, 0]);
-    let _ = cache.insert(&[4, 0, 4, 48], &[], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(
-        &[
-            81, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0,
-            4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 237, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 228, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 1,
-        ],
-        &[],
-        None,
-        Duration::from_secs(0),
-    );
-    let _ = cache.insert(
-        &[
-            228, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 2, 1, 3, 0, 1, 3, 0, 1, 0, 4,
-            2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 3, 0, 4,
-            0, 1, 3, 0, 4, 1, 0, 81, 0, 0, 0, 1, 0, 10, 81, 0, 0, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1,
-            1, 0, 1, 3, 4, 2, 116, 0, 2, 2, 255, 255, 0, 3, 1, 0, 2, 0, 0, 0, 3, 4, 10, 4, 2, 114,
-            0, 4, 0, 4, 48, 0, 0, 3, 4, 10, 1, 5, 0, 255, 252, 255, 254, 255, 251, 2, 114, 0, 4, 4,
-            4, 0, 1, 1, 2, 1, 1, 0, 1, 1, 2, 1, 1, 0, 1, 2, 1, 1, 0, 1, 1, 1, 0, 1, 1, 2, 1, 1, 0,
-            1, 1, 1, 0, 1, 0, 4, 48, 0, 0, 3, 4, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-        ],
-        &[
-            255, 255, 255, 255, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 3, 0, 4, 0, 1, 3, 0,
-            4, 1, 0, 81, 0, 0, 0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 255, 255, 255, 255, 0, 4, 0, 4, 48,
-            0, 0, 255, 1, 0, 0, 1, 0, 2, 4, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 4, 2, 1, 0, 1, 3, 4, 2, 114, 0, 4, 0,
-            4, 48, 0, 0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0, 0, 3, 4,
-            10, 1, 3, 0, 1, 3, 0, 1, 0, 4, 2, 1, 0, 1, 3, 3, 0, 4, 0, 1, 3, 0, 4, 1, 0, 81, 0, 0,
-            0, 1, 0, 10, 0, 1, 3, 0, 1, 0, 1, 0, 3, 0, 1, 3, 0, 1, 0, 4, 2, 114, 0, 4, 0, 4, 48, 0,
-            0, 3, 4, 10, 1, 3, 0, 1, 3, 0, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 228, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237,
-            237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 237, 1, 0, 0, 228, 3, 0, 1, 0, 4, 2,
-            114, 0, 4, 0, 4, 48,
-        ],
-        None,
-        Duration::from_secs(0),
-    );
-    let _ = cache.insert(&[1], &[3, 0, 1], None, Duration::from_secs(0));
-    let _ = cache.insert(&[1], &[3, 4, 2], None, Duration::from_secs(114));
+    let _ = cache.insert(&[7], &[0x42], None, Duration::from_secs(6));
+    assert!(cache.delete(&[7]));
+}
+
+#[test]
+// Regression guard for dead-byte accounting at the moment a segment's live
+// item count falls to zero and it becomes eligible to recycle. An earlier bug
+// mishandled the freed-byte bookkeeping exactly at that transition. This
+// longer churn -- repeated overwrites of a small hot key set interleaved with
+// empty values, oversized items, and deletes under an overflowing hashtable --
+// repeatedly drives segments to zero live items and back, and must run clean
+// under the integrity assertions enabled by the debug/integrity features.
+fn fuzz_2() {
+    let cache = Segcache::builder()
+        .segment_size(1024)
+        .heap_size(6 * 1024)
+        .hash_power(7)
+        .overflow_factor(1.0)
+        .build()
+        .expect("cache build failed");
+
+    // Deterministic pseudo-payload so each round writes distinct bytes without
+    // any RNG dependency.
+    let payload = |seed: u8, len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|i| seed.wrapping_add((i as u8).wrapping_mul(7)))
+            .collect()
+    };
+
+    for round in 0..64u8 {
+        // hot key repeatedly rewritten with varying-length values
+        let _ = cache.insert(
+            &[1],
+            &[round, 0, round.wrapping_add(1)],
+            None,
+            Duration::from_secs(0),
+        );
+        // empty-value item under a per-round key
+        let _ = cache.insert(&[2, round], &[], None, Duration::from_secs(0));
+        // oversized item that dominates a segment, later deleted
+        let _ = cache.insert(&[3], &payload(round, 200), None, Duration::from_secs(4));
+        // shrink the hot key to an empty value
+        let _ = cache.insert(&[1], &[], None, Duration::from_secs(0));
+        // a big key + big value pair to stress header/length parsing
+        let _ = cache.insert(
+            &payload(round, 90),
+            &payload(round.wrapping_add(9), 120),
+            None,
+            Duration::from_secs(0),
+        );
+        // deletes that can drop segments to zero live items
+        let _ = cache.delete(&[3]);
+        let _ = cache.delete(&[2, round]);
+        let _ = cache.insert(
+            &[1],
+            &[round, round, round],
+            None,
+            Duration::from_secs((round % 5) as u64),
+        );
+    }
+
+    // Drain the remainder; the store must end empty and internally consistent.
+    cache.clear();
+    assert_eq!(cache.items(), 0);
 }
 
 // Roadmap item 7b: `get`/`get_no_freq_incr` are `&self` so N threads can

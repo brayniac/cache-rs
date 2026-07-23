@@ -1,4 +1,4 @@
-//! A raw byte-level representation of an item.
+//! Field accessors over an item stored as a packed byte buffer.
 //!
 //! The [`RawItem`] provides direct byte-level access to item data stored as
 //! a packed buffer of `[ItemHeader][optional][key][value]`.
@@ -17,11 +17,10 @@ use crate::NotNumericError;
 use crate::Value;
 use core::sync::atomic::{fence, AtomicU64, Ordering};
 
-/// The raw byte-level representation of an item.
+/// A cursor over an item's packed bytes, addressed through a raw pointer.
 ///
-/// This is a thin wrapper around a raw pointer to a packed item buffer.
-/// The caller is responsible for ensuring the pointer is valid and properly
-/// aligned.
+/// `RawItem` does not own or validate the bytes it points at; the caller
+/// must guarantee the pointer targets a properly aligned, live item buffer.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawItem {
@@ -29,7 +28,7 @@ pub struct RawItem {
 }
 
 impl RawItem {
-    /// Create a `RawItem` from a pointer.
+    /// Wrap a raw pointer as a `RawItem`.
     ///
     /// # Safety
     ///
@@ -43,23 +42,23 @@ impl RawItem {
         Self { data: ptr }
     }
 
-    /// Get an immutable reference to the item's header.
+    /// View the item's header without copying it.
     pub fn header(&self) -> &ItemHeader {
         unsafe { &*(self.data as *const ItemHeader) }
     }
 
-    /// Get a mutable pointer to the item's header.
+    /// Raw pointer to the item's header, for in-place field mutation.
     fn header_mut(&mut self) -> *mut ItemHeader {
         self.data as *mut ItemHeader
     }
 
-    /// Returns the key length.
+    /// Length of the stored key, in bytes.
     #[inline]
     pub fn klen(&self) -> u8 {
         self.header().klen()
     }
 
-    /// Borrow the key bytes.
+    /// Slice view over the stored key bytes.
     pub fn key(&self) -> &[u8] {
         unsafe {
             let ptr = self.data.add(self.key_offset());
@@ -68,7 +67,7 @@ impl RawItem {
         }
     }
 
-    /// Returns the value length as stored in the header.
+    /// Number of value bytes recorded in the header.
     #[inline]
     fn vlen(&self) -> u32 {
         self.header().vlen()
@@ -146,13 +145,13 @@ impl RawItem {
         }
     }
 
-    /// Returns the optional data length.
+    /// Length of the item's optional data segment, in bytes.
     #[inline]
     pub fn olen(&self) -> u8 {
         self.header().olen()
     }
 
-    /// Borrow the optional data, if any.
+    /// Slice view over the optional data, or `None` when there is none.
     pub fn optional(&self) -> Option<&[u8]> {
         let olen = self.olen() as usize;
         if olen > 0 {
@@ -165,7 +164,7 @@ impl RawItem {
         }
     }
 
-    /// Check the header magic bytes.
+    /// Assert the header's magic sentinel is intact.
     #[inline]
     pub fn check_magic(&self) {
         self.header().check_magic()
@@ -180,7 +179,8 @@ impl RawItem {
         unsafe { (*self.header_mut()).set_deleted(deleted) }
     }
 
-    /// Write key, value, and optional data into the item buffer.
+    /// Populate the item's header and copy in the key, value, and optional
+    /// bytes.
     pub fn define(&mut self, key: &[u8], value: Value, optional: &[u8]) {
         unsafe {
             (*self.header_mut()).init();

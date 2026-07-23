@@ -1,4 +1,4 @@
-//! Items are the base unit of data stored within the cache.
+//! The value handle a cache lookup returns: raw item bytes plus a segment pin.
 
 mod reserved;
 
@@ -32,25 +32,26 @@ impl Item {
         self.raw.check_magic()
     }
 
-    /// Borrow the item key
+    /// View of the key bytes for this item.
     pub fn key(&self) -> &[u8] {
         self.raw.key()
     }
 
-    /// Borrow the item value
+    /// View of the value for this item, as bytes or a decoded integer.
     pub fn value(&self) -> Value<'_> {
         self.raw.value()
     }
 
-    /// CAS value for the item, matching the memcache protocol's 64-bit
-    /// "cas unique". Combines the item's location with its segment's
-    /// generation counter; any update, relocation, or segment recycle
-    /// invalidates outstanding values.
+    /// Opaque CAS token for this item, filling the role of memcached's
+    /// 64-bit "cas unique". Derived from the item's location plus its
+    /// segment's generation counter, so any in-place update, relocation,
+    /// or segment reuse changes the value and invalidates tokens taken
+    /// before it.
     pub fn cas(&self) -> u64 {
         self.cas
     }
 
-    /// Borrow the optional data
+    /// View of the item's optional data, if present.
     pub fn optional(&self) -> Option<&[u8]> {
         self.raw.optional()
     }

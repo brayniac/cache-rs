@@ -4,26 +4,27 @@
 //! for all mutable fields, preparing for concurrent access.
 //!
 //! ```text
-//! ┌──────────────┬──────────────┬──────────────┬──────────────┐
-//! │      ID      │ WRITE OFFSET │  LIVE BYTES  │  LIVE ITEMS  │
-//! │     u32      │  AtomicI32   │  AtomicI32   │  AtomicI32   │
-//! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
-//! ├──────────────┼──────────────┼──────────────┼──────────────┤
-//! │  CREATE AT   │   MERGE AT   │     TTL      │  REF COUNT   │
-//! │ AtomicInstant│ AtomicInstant│  AtomicU32   │  AtomicU32   │
-//! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
-//! ├──────────────┴──────────────┼──────┬──┬──┬────────────────┤
-//! │          METADATA           │ GEN  │PL│PD│ ACTIVE WRITERS │
-//! │          AtomicU64          │ 16b  │8b│8b│  AtomicU32/32b │
-//! ├─────────────────────────────┴──────┴──┴──┴────────────────┤
-//! │        ACTIVE REMOVERS      │          PADDING            │
-//! │        AtomicU32/32b        │            96 bit           │
-//! └───────────────────────────────────────────────────────────┘
+//! | offset | field           | width | type / notes                                       |
+//! |-------:|-----------------|------:|-----------------------------------------------------|
+//! |      0 | id              |     4 | u32, immutable after init                            |
+//! |      4 | write_offset    |     4 | AtomicI32                                             |
+//! |      8 | live_bytes      |     4 | AtomicI32                                             |
+//! |     12 | live_items      |     4 | AtomicI32                                             |
+//! |     16 | create_at       |     4 | AtomicInstant                                         |
+//! |     20 | merge_at        |     4 | AtomicInstant                                         |
+//! |     24 | ttl             |     4 | AtomicU32, seconds                                    |
+//! |     28 | ref_count       |     4 | AtomicU32, active readers                             |
+//! |     32 | metadata        |     8 | AtomicU64 = [unused:8][state:8][prev:24][next:24]     |
+//! |     40 | generation      |     2 | AtomicU16, bumped on reserve                          |
+//! |     42 | pool            |     1 | AtomicU8, SegmentPool                                 |
+//! |     43 | —               |     1 | implicit alignment byte before active_writers         |
+//! |     44 | active_writers  |     4 | AtomicU32, in-flight reserve/write pins                |
+//! |     48 | active_removers |     4 | AtomicU32, in-flight replace/delete pins               |
+//! |     52 | —               |    12 | trailing padding out to align(64)                     |
 //!
-//! METADATA = [8 unused][8 state][24 prev][24 next] (see segments::state)
-//! GEN = generation (AtomicU16)   PL = SegmentPool (AtomicU8)
-//! PD = 8-bit alignment pad before ACTIVE WRITERS (AtomicU32)
-//! Total: 512 bits = 64 bytes = 1 cache line
+//! metadata word detail (see segments::state): 8 unused bits, then an
+//! 8-bit state, a 24-bit prev link, and a 24-bit next link.
+//! total: 64 bytes = 512 bits = 1 cache line
 //! ```
 //!
 //! The state, prev, and next fields share one atomic word so that a chain
@@ -660,7 +661,7 @@ impl SegmentHeader {
         }
     }
 
-    /// Check if the segment can actually be evicted: Sealed with no
+    /// Whether this segment is eligible for reclamation: `Sealed` with no
     /// readers pinning it. The write tail is Live, so it is
     /// automatically excluded (the seal happens when a successor is
     /// appended).

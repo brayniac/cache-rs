@@ -1,22 +1,19 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! This crate is a Rust implementation of the Segcache storage layer.
+//! `segcache` is an in-memory cache engine that stores items inside
+//! append-only segments (1MB by default) instead of giving each item its own
+//! heap allocation. Items are bucketed into segments by TTL, so a whole
+//! segment can be reclaimed in one step once every item in it has expired,
+//! rather than walking the store item by item. Because segments carry their
+//! own shared header, individual items only need a small fixed-size header
+//! of their own, which keeps per-item overhead low next to a design where
+//! every item tracks its own bookkeeping fields.
 //!
-//! It is a high-throughput and memory-efficient key-value store with eager
-//! expiration. Segcache uses a segment-structured design that stores data in
-//! fixed-size segments, grouping objects with nearby expiration time into the
-//! same segment, and lifting most per-object metadata into the shared segment
-//! header. This reduces object metadata by 88% compared to Memcached.
-//!
-//! A blog post about the overall design can be found here:
+//! For background on the design, see:
 //! <https://pelikan.io/2021/segcache.html>
 //!
-//! Goals:
-//! * high-throughput item storage
-//! * eager expiration of items
-//! * low metadata overhead
+//! Design goals:
+//! * sustain high request throughput under concurrent access
+//! * reclaim expired items without scanning the whole keyspace
+//! * keep the metadata stored alongside each item small
 
 // macro includes
 #[macro_use]
@@ -25,7 +22,7 @@ extern crate log;
 // external crate includes
 use clocksource::coarse::{Duration, Instant};
 
-// includes from core/std
+// core/std imports
 use core::hash::{BuildHasher, Hasher};
 
 // submodules
@@ -48,7 +45,7 @@ mod metrics;
 #[cfg(test)]
 mod tests;
 
-// publicly exported items from submodules
+// public API surface re-exported at the crate root
 pub use crate::segcache::Segcache;
 pub use builder::Builder;
 pub use error::SegcacheError;
@@ -57,7 +54,7 @@ pub use hashtable::Location;
 pub use item::Item;
 pub use keyvalue::Value;
 
-// items from submodules which are imported for convenience to the crate level
+// crate-internal re-exports so submodules can reach these without the full path
 pub(crate) use crate::rand::*;
 pub(crate) use cas::CasToken;
 pub(crate) use hashtable::{

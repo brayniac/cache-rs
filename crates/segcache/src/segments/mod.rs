@@ -1,4 +1,4 @@
-//! Segments are the backing storage of the cache.
+//! Backing storage for the cache: fixed-size segments and their metadata.
 
 mod builder;
 mod error;

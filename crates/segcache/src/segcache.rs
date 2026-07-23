@@ -92,28 +92,38 @@ impl Segcache {
     /// ```
     pub fn get(&self, key: &[u8]) -> Option<Item> {
         let verifier = self.verifier();
-        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
-        let (seg_id, offset) = unpack_location(location);
-        let seg_id = NonZeroU32::new(seg_id)?;
-        // Snapshot the incarnation the lookup resolved BEFORE pinning. The
-        // generation bumps on every Free->Reserved reuse (see `try_reserve`).
-        let generation = self.segments.generation(seg_id);
-        let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
-        // Re-check after the pin: if the segment was drained, recycled, and
-        // reused between the lookup and the pin, `raw` now points into a
-        // DIFFERENT item (aliased bytes) and its generation changed. The pin
-        // froze the current incarnation, so a matching generation means `raw`
-        // is genuinely the item the lookup verified; a mismatch means the
-        // location is stale — return None rather than a torn/aliased read
-        // (concurrent-write reader safety, item 7f). No item bytes are read on
-        // the stale path (the offset may be misaligned in the new incarnation).
-        if self.segments.generation(seg_id) != generation {
-            return None;
+        let mut attempts = 0;
+        loop {
+            let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+            let (seg_id, offset) = unpack_location(location);
+            let seg_id = NonZeroU32::new(seg_id)?;
+            let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
+            // Re-validate AFTER pinning (concurrent-write reader safety, item
+            // 7f). Between the lookup and the pin, `location`'s segment can be
+            // drained, recycled, and REUSED (a different item written at this
+            // offset), so `raw` may be an aliased/torn read. A fresh lookup only
+            // ever reads currently-published items — stale entries are removed
+            // from the hashtable BEFORE a segment is recycled — so it is safe
+            // and authoritative: if the key still resolves to this exact
+            // `location`, the (now pinned, hence un-recyclable) segment genuinely
+            // holds the item we want. If it no longer does, drop the pin and
+            // retry; give up after a few attempts (a key churning under us).
+            if self
+                .hashtable
+                .lookup_no_freq_update(key, &verifier)
+                .map(|(l, _)| l)
+                == Some(location)
+            {
+                raw.check_magic();
+                let cas = Self::token_for(&raw, location, self.segments.generation(seg_id));
+                return Some(Item::new(raw, cas, guard));
+            }
+            drop(guard);
+            attempts += 1;
+            if attempts >= RESERVE_RETRIES {
+                return None;
+            }
         }
-        raw.check_magic();
-
-        let cas = Self::token_for(&raw, location, generation);
-        Some(Item::new(raw, cas, guard))
     }
 
     /// Build the CAS token for an item: location + segment generation,
@@ -140,21 +150,31 @@ impl Segcache {
     /// ```
     pub fn get_no_freq_incr(&self, key: &[u8]) -> Option<Item> {
         let verifier = self.verifier();
-        let (location, _freq) = self.hashtable.lookup_no_freq_update(key, &verifier)?;
-        let (seg_id, offset) = unpack_location(location);
-        let seg_id = NonZeroU32::new(seg_id)?;
-        // See `get`: snapshot the incarnation before the pin and re-check after,
-        // so a segment recycled+reused between lookup and pin yields None rather
-        // than an aliased read (item 7f reader safety).
-        let generation = self.segments.generation(seg_id);
-        let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
-        if self.segments.generation(seg_id) != generation {
-            return None;
+        let mut attempts = 0;
+        loop {
+            let (location, _freq) = self.hashtable.lookup_no_freq_update(key, &verifier)?;
+            let (seg_id, offset) = unpack_location(location);
+            let seg_id = NonZeroU32::new(seg_id)?;
+            let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
+            // Re-validate after pinning (see `get`): a fresh lookup confirms the
+            // key still resolves to this exact location, so the pinned segment
+            // wasn't recycled+reused out from under us (item 7f reader safety).
+            if self
+                .hashtable
+                .lookup_no_freq_update(key, &verifier)
+                .map(|(l, _)| l)
+                == Some(location)
+            {
+                raw.check_magic();
+                let cas = Self::token_for(&raw, location, self.segments.generation(seg_id));
+                return Some(Item::new(raw, cas, guard));
+            }
+            drop(guard);
+            attempts += 1;
+            if attempts >= RESERVE_RETRIES {
+                return None;
+            }
         }
-        raw.check_magic();
-
-        let cas = Self::token_for(&raw, location, generation);
-        Some(Item::new(raw, cas, guard))
     }
 
     /// Insert a new item into the cache. May return an error indicating that
@@ -834,19 +854,18 @@ impl Segcache {
                 return Err(SegcacheError::NotFound);
             }
 
-            // Snapshot the incarnation before pinning (see `get`): a segment
-            // recycled+reused between lookup and pin would make `raw` point at a
-            // DIFFERENT item, and an in-place `op` would corrupt it.
-            let generation = self.segments.generation(seg_id);
             match self.segments.acquire_item_at(seg_id, offset) {
                 // Segment not readable (draining; a relocation is in
                 // flight) — retry from the lookup.
                 None => continue,
                 Some((raw, _guard)) => {
-                    // The segment was recycled+reused between lookup and pin —
-                    // `raw` is a stale/aliased item; retry from the lookup
-                    // rather than update the wrong item in place (item 7f).
-                    if self.segments.generation(seg_id) != generation {
+                    // Re-validate after pinning (see `get`): if the key no longer
+                    // resolves to this exact location, the segment was
+                    // recycled+reused between lookup and pin and `raw` is a
+                    // stale/aliased item — retry rather than update the WRONG
+                    // item in place (item 7f). The fresh lookup only reads
+                    // currently-published items, so it is safe and authoritative.
+                    if self.hashtable.lookup(key, &verifier).map(|(l, _)| l) != Some(location) {
                         continue;
                     }
                     return op(&raw).map_err(|_| SegcacheError::NotNumeric);

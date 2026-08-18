@@ -84,7 +84,12 @@ impl Segcache {
         self.segments.items()
     }
 
-    /// Get the item in the `Segcache` with the provided key
+    /// Get the item in the `Segcache` with the provided key.
+    ///
+    /// Expiry is lazy on access: an item past its TTL deadline returns
+    /// `None`, matching memcached, even before `expire()` or eviction
+    /// pressure reclaims its segment. Items stored with `Duration::ZERO`
+    /// never expire.
     ///
     /// ```
     /// use segcache::{Policy, Segcache};
@@ -138,6 +143,15 @@ impl Segcache {
                 .map(|(l, _)| l)
                 == Some(location)
             {
+                // Lazy expiry: an item past its segment deadline is treated
+                // as missing, matching memcached, even before the segment is
+                // reclaimed. The segment is pinned here, so its header's
+                // create_at/ttl are authoritative and cannot be recycled
+                // under us.
+                if self.remaining_ttl(seg_id).is_err() {
+                    drop(guard);
+                    return None;
+                }
                 raw.check_magic();
                 let cas = Self::token_for(&raw, location, self.segments.generation(seg_id));
                 return Some(Item::new(raw, cas, guard));
@@ -604,6 +618,10 @@ impl Segcache {
     /// Performs a CAS operation, inserting the item only if the CAS value
     /// matches the current value for that item.
     ///
+    /// Expiry is lazy on access: a cas against an item past its TTL
+    /// deadline fails with `NotFound`, matching memcached, even before
+    /// its segment is reclaimed.
+    ///
     /// ```
     /// use segcache::{Policy, Segcache, SegcacheError};
     /// use std::time::Duration;
@@ -647,6 +665,14 @@ impl Segcache {
 
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
+
+        // Lazy expiry: memcached returns NOT_FOUND for a cas on an expired
+        // key, even before the segment is reclaimed. The header is read
+        // unpinned here, so this is a semantic filter, not a safety
+        // mechanism — if the segment races a recycle, the token/generation
+        // check below still protects correctness.
+        self.remaining_ttl(seg_id)?;
+
         let current_cas = {
             // Pin briefly to read the item's seqlock version (numeric
             // items fold it into the token); drop the pin before the
@@ -683,6 +709,10 @@ impl Segcache {
 
     /// Remove the item with the given key, returns a bool indicating if it was
     /// removed.
+    ///
+    /// Expiry is lazy on access: deleting an item past its TTL deadline
+    /// returns `false`, matching memcached's NOT_FOUND, even before its
+    /// segment is reclaimed.
     /// ```
     /// use segcache::{Policy, Segcache, SegcacheError};
     /// use std::time::Duration;
@@ -713,6 +743,14 @@ impl Segcache {
             // (non-ghost) entries — but stay defensive: nothing to pin.
             return self.hashtable.remove(key, location);
         };
+
+        // Lazy expiry: DELETE on an expired key reports NOT_FOUND (false),
+        // matching memcached, even before the segment is reclaimed. The
+        // stale hashtable entry is left for expire()/eviction pressure to
+        // sweep.
+        if self.remaining_ttl(seg_id).is_err() {
+            return false;
+        }
 
         // Pin the item's segment BEFORE unlinking it (item 7f): the pin
         // brackets both the hashtable unlink below and the `remove_at`

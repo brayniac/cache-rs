@@ -105,7 +105,10 @@ Items are grouped into TTL buckets based on their TTL value. There are 1024 buck
 
 Items with TTL beyond ~18 hours are mapped to the last bucket. Items with TTL = 0 (no expiration) go to bucket 0.
 
-Expiration is **eager**: `expire()` walks each TTL bucket and checks if the head segment's TTL has elapsed. If so, the entire segment is freed — all items in it are expired in O(1) time. No per-item timers or lazy deletion needed. This behavior is shared by all eviction policies, including S3-FIFO.
+Expiration is **lazy on access, eager on pressure**:
+
+- **Lazy on access**: `get`, `cas`, `delete`, and the numeric update operations check the item's segment deadline and treat an expired item as missing (matching memcached), even before its segment is reclaimed. No per-item timers needed.
+- **Eager reclamation**: `expire()` walks each TTL bucket and checks if the head segment's TTL has elapsed. If so, the entire segment is freed — all items in it are expired in O(1) time. The eviction path also drops expired segments before performing real eviction. This behavior is shared by all eviction policies, including S3-FIFO.
 
 ## Eviction Policies
 

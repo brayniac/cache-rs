@@ -377,6 +377,98 @@ fn numeric_update_expired_counter_not_found() {
     ));
 }
 
+// Lazy expiry on the read path: an item past its segment deadline acts
+// missing on get/get_no_freq_incr, matching memcached — even if nothing
+// (expire(), eviction pressure) has reclaimed the segment yet.
+#[test]
+fn lazy_expiry_get_expired_item_not_found() {
+    let cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    // 2s requests the first tier-1 bucket, whose floor TTL is 1s
+    assert!(cache
+        .insert(b"latte", b"hot", None, Duration::from_secs(2))
+        .is_ok());
+    assert!(cache.get(b"latte").is_some());
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // no expire() call — the deadline alone makes the item invisible
+    assert!(cache.get(b"latte").is_none());
+    assert!(cache.get_no_freq_incr(b"latte").is_none());
+}
+
+// Lazy expiry on cas: a cas against an expired item fails NotFound
+// (memcached returns NOT_FOUND for cas on an expired key), even with
+// the token that was valid before the deadline passed.
+#[test]
+fn lazy_expiry_cas_expired_item_not_found() {
+    let cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache
+        .insert(b"latte", b"hot", None, Duration::from_secs(2))
+        .is_ok());
+    let token = cache.get(b"latte").expect("not found").cas();
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    assert_eq!(
+        cache.cas(b"latte", b"cold", None, Duration::from_secs(2), token),
+        Err(SegcacheError::NotFound)
+    );
+}
+
+// Lazy expiry on delete: deleting an expired item reports false
+// (memcached: DELETE on an expired key -> NOT_FOUND).
+#[test]
+fn lazy_expiry_delete_expired_item_not_found() {
+    let cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache
+        .insert(b"latte", b"hot", None, Duration::from_secs(2))
+        .is_ok());
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    assert!(!cache.delete(b"latte"));
+}
+
+// Control: `Duration::ZERO` means "never expires" — get/cas/delete all
+// behave normally after the same sleep the expiry tests use.
+#[test]
+fn lazy_expiry_zero_ttl_never_expires() {
+    let cache = Segcache::builder()
+        .segment_size(4096)
+        .heap_size(4096 * 64)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"latte", b"hot", None, Duration::ZERO).is_ok());
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let item = cache.get(b"latte").expect("not found");
+    assert_eq!(item.value(), b"hot");
+    let token = item.cas();
+    drop(item);
+    assert!(cache.get_no_freq_incr(b"latte").is_some());
+    assert!(cache
+        .cas(b"latte", b"cold", None, Duration::ZERO, token)
+        .is_ok());
+    assert!(cache.delete(b"latte"));
+}
+
 #[test]
 fn try_into_numeric_arms() {
     let ttl = Duration::ZERO;

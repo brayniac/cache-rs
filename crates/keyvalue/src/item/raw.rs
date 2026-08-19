@@ -338,14 +338,47 @@ impl RawItem {
     /// matching value and CRC.
     #[cfg(feature = "integrity")]
     fn locked_numeric_update(&self, op: impl Fn(u64) -> u64) -> Result<u64, NotNumericError> {
+        Ok(self.lock_numeric_version()?.update(op))
+    }
+
+    /// Acquire the numeric item's seqlock writer lock WITHOUT modifying
+    /// the value — a publish gate for engines layered above.
+    ///
+    /// While the returned guard is alive, every in-place numeric writer
+    /// (`fetch_wrapping_add`/`fetch_saturating_sub`, which serialize on
+    /// the same version word in `integrity` builds) is excluded, and the
+    /// version reported by [`NumericVersionGuard::version`] — the even
+    /// value observed at lock time — cannot advance. This lets a caller
+    /// atomically pair "the version is still V" with a publish action of
+    /// its own (e.g. a hashtable slot swap that supersedes this item):
+    /// any concurrent increment either completes before the lock (the
+    /// caller sees its bumped version) or starts after the guard drops
+    /// (and can then observe whatever the caller published).
+    ///
+    /// The guard resolves one of two ways: [`NumericVersionGuard::update`]
+    /// applies a value update under the lock and unlocks at version + 2
+    /// (the normal writer protocol — `fetch_wrapping_add` and friends are
+    /// built on it); dropping it without an update restores the same even
+    /// version, so "the version advances by exactly two per update" stays
+    /// true and concurrent seqlock readers resume with an identical
+    /// value/version pair. Hold it only across short, lock-free sections
+    /// (readers and writers spin while it is held).
+    ///
+    /// Only meaningful under `integrity` (where numeric writers take
+    /// the version-word lock); without that feature writers are
+    /// lock-free fetch-ops that would ignore this gate, so the API is
+    /// not offered.
+    #[cfg(feature = "integrity")]
+    pub fn lock_numeric_version(&self) -> Result<NumericVersionGuard<'_>, NotNumericError> {
         if !self.header().is_numeric() {
             return Err(NotNumericError);
         }
-
         // SAFETY: is_numeric checked; slot aligned by construction.
-        let (value_word, version_word) = unsafe { (self.value_word(), self.version_word()) };
+        let version_word = unsafe { self.version_word() };
 
-        // Lock: transition the version from even to odd.
+        // Lock: transition the version from even to odd (the same
+        // protocol as `locked_numeric_update`; Acquire pairs with the
+        // previous writer's Release unlock).
         let mut v = version_word.load(Ordering::Relaxed);
         loop {
             if v & 1 == 1 {
@@ -364,19 +397,10 @@ impl RawItem {
                 Err(observed) => v = observed,
             }
         }
-
-        // Order the odd (write-in-progress) version store before the
-        // data stores for the seqlock readers (see doc comment).
-        fence(Ordering::Release);
-
-        let new = op(value_word.load(Ordering::Relaxed));
-        value_word.store(new, Ordering::Relaxed);
-        let crc = self.compute_crc_numeric(new);
-        self.crc_word().store(crc, Ordering::Relaxed);
-
-        // Unlock: back to even, two above the pre-update version.
-        version_word.store(v.wrapping_add(2), Ordering::Release);
-        Ok(new)
+        Ok(NumericVersionGuard {
+            raw: self,
+            version: v,
+        })
     }
 
     /// Atomic view of the header CRC field.
@@ -521,6 +545,77 @@ impl RawItem {
         };
         let raw = ITEM_HDR_SIZE + olen + klen + extra + self.vlen() as usize;
         ((raw >> 3) + 1) << 3
+    }
+}
+
+/// RAII guard for a numeric item's seqlock writer lock — see
+/// [`RawItem::lock_numeric_version`]. While alive it excludes in-place
+/// numeric writers and freezes the observed version. It resolves one of
+/// two ways:
+///
+/// - [`NumericVersionGuard::update`] applies a value update under the
+///   lock (the seqlock writer protocol: value + CRC as one unit) and
+///   unlocks two above the observed version;
+/// - dropping it without an update restores the same even version
+///   (nothing changed).
+#[cfg(feature = "integrity")]
+pub struct NumericVersionGuard<'a> {
+    raw: &'a RawItem,
+    version: u64,
+}
+
+#[cfg(feature = "integrity")]
+impl NumericVersionGuard<'_> {
+    /// The item's seqlock version observed when the lock was taken —
+    /// always even, and frozen while this guard is alive.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Apply `op` to the value under this lock, consuming the guard.
+    /// Stores the new value and its CRC as one seqlocked unit, then
+    /// unlocks at `version() + 2`. Returns the new value.
+    ///
+    /// Any validation performed between taking the lock and calling this
+    /// is atomic with the update with respect to every other party that
+    /// serializes on this item's version word (in-place numeric writers,
+    /// and cas publishes that re-verify tokens under the lock).
+    pub fn update(self, op: impl FnOnce(u64) -> u64) -> u64 {
+        // SAFETY: lock_numeric_version checked is_numeric; slot aligned
+        // by construction.
+        let (value_word, version_word) =
+            unsafe { (self.raw.value_word(), self.raw.version_word()) };
+
+        // Order the odd (write-in-progress) version store — done by the
+        // lock acquisition — before the data stores for the seqlock
+        // readers (Boehm's seqlock writer; see `lock_numeric_version`).
+        fence(Ordering::Release);
+
+        let new = op(value_word.load(Ordering::Relaxed));
+        value_word.store(new, Ordering::Relaxed);
+        let crc = self.raw.compute_crc_numeric(new);
+        self.raw.crc_word().store(crc, Ordering::Relaxed);
+
+        // Unlock: back to even, two above the pre-update version. The
+        // guard's Drop (which would restore the OLD version) must not
+        // run.
+        version_word.store(self.version.wrapping_add(2), Ordering::Release);
+        core::mem::forget(self);
+        new
+    }
+}
+
+#[cfg(feature = "integrity")]
+impl Drop for NumericVersionGuard<'_> {
+    fn drop(&mut self) {
+        // Unlock by restoring the pre-lock even version (no update was
+        // applied). Release pairs with the next lock's Acquire CAS:
+        // everything the guard holder did (e.g. a hashtable publish) is
+        // visible to the next numeric writer before it applies its
+        // update.
+        // SAFETY: lock_numeric_version checked is_numeric.
+        unsafe { self.raw.version_word() }.store(self.version, Ordering::Release);
     }
 }
 

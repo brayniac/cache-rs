@@ -563,12 +563,26 @@ impl Segcache {
     /// retries in the loop below: `old_location` only ever lives in one
     /// slot at a time, so as long as `get_item_frequency` still finds
     /// `old_location` under `key`, it is still at `old_slot`.
+    ///
+    /// `expected_token`, when given (the `cas` path), is the caller's
+    /// full CAS token: it is RE-VERIFIED under the old segment's remover
+    /// pin immediately before the publish, with a numeric item's seqlock
+    /// writer lock held across both the re-verify and the slot CAS. The
+    /// slot CAS alone only observes the LOCATION — an in-place
+    /// `wrapping_add`/`saturating_sub` changes the item's version (which
+    /// the token folds in) without moving it, so without this gate an
+    /// increment landing in the token-check -> publish window (which
+    /// spans `reserve_and_define`, possibly a whole eviction pass) would
+    /// be silently overwritten by a cas that still reports success. On a
+    /// token mismatch the reservation is rolled back and `Exists` is
+    /// returned, exactly as a token-check failure would have.
     fn replace_at(
         &self,
         key: &[u8],
         old_location: Location,
         old_slot: SlotRef,
         reserved: ReservedItem,
+        expected_token: Option<u64>,
     ) -> Result<(), SegcacheError> {
         let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
         // Capture the reservation's own location up front so the rollback paths
@@ -639,6 +653,78 @@ impl Segcache {
                 }
             };
 
+            // Token re-verify under the remover pin (cas path only; see the
+            // doc comment). Ordering of the safety argument:
+            //
+            // 1. Location-uniqueness before touching item bytes: the entry
+            //    must still map key -> old_location. Under the pin the
+            //    segment cannot drain or recycle, and a drain must unlink
+            //    entries BEFORE its segment is recycled, so entry-present
+            //    implies a real item still starts at `old_offset`. (The ABA
+            //    where the same key was re-inserted at this exact location
+            //    after a full drain+recycle is a real item too — and the
+            //    recycle bumped the generation, which the token compare
+            //    below catches.)
+            // 2. For a numeric item, take its seqlock WRITER lock
+            //    (`lock_numeric_version`) and hold it across the re-verify
+            //    AND the slot CAS. In-place numeric writers serialize
+            //    their own check-linkage-then-write step on that same lock
+            //    (`numeric_update`), so the two critical sections cannot
+            //    interleave; whichever completes first decides:
+            //      - increment first: its bumped version fails the compare
+            //        below — `Exists`, the increment's ack survives (and a
+            //        cas whose token was read after the increment
+            //        legitimately carries it forward);
+            //      - this publish first: the increment's in-lock linkage
+            //        re-check (its lock acquire synchronizes-with our
+            //        unlock) observes the published NEW location and
+            //        retries against the new item before acking.
+            //    Residual window: none — every lost-acked-write
+            //    interleaving requires an increment and a token-gated
+            //    publish inside one another's critical sections, which the
+            //    shared lock forbids.
+            // 3. The generation is re-read under the pin (frozen), so the
+            //    recomputed token is exact, not racy.
+            let old_raw;
+            let version_guard = if let Some(expected) = expected_token {
+                if self
+                    .hashtable
+                    .get_item_frequency(key, old_location)
+                    .is_none()
+                {
+                    drop(pin);
+                    self.rollback_reservation(reserved, new_seg, new_offset);
+                    return Err(SegcacheError::Exists);
+                }
+                old_raw = self.segments.get_item_at(Some(old_seg_id), old_offset);
+                let raw = old_raw.as_ref().expect("pinned segment id is valid");
+                let base =
+                    CasToken::new(old_location, self.segments.generation(old_seg_id)).as_raw();
+                match raw.lock_numeric_version() {
+                    Ok(guard) => {
+                        if crate::cas::mix_version(base, guard.version()) != expected {
+                            drop(guard);
+                            drop(pin);
+                            self.rollback_reservation(reserved, new_seg, new_offset);
+                            return Err(SegcacheError::Exists);
+                        }
+                        Some(guard)
+                    }
+                    Err(_) => {
+                        // Non-numeric item: the token is bare
+                        // location + generation.
+                        if base != expected {
+                            drop(pin);
+                            self.rollback_reservation(reserved, new_seg, new_offset);
+                            return Err(SegcacheError::Exists);
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             // Publish under the pin: `reserved` (and its WriterPin) is held
             // across the exchange so a concurrent drain cannot recycle the
             // segment between define and publish (item 7d, H2).
@@ -646,6 +732,11 @@ impl Segcache {
                 .hashtable
                 .cas_location_at(old_slot, old_location, new_location, true)
             {
+                // Unlock the old item's seqlock the instant the publish
+                // resolves — numeric writers spinning on it re-validate
+                // and follow the new location.
+                drop(version_guard);
+
                 #[cfg(feature = "metrics")]
                 ITEM_REPLACE.increment();
 
@@ -667,7 +758,9 @@ impl Segcache {
                 return Ok(());
             }
 
-            // The exchange failed while pinned — release the remover pin.
+            // The exchange failed while pinned — release the seqlock (if
+            // held) and the remover pin.
+            drop(version_guard);
             drop(pin);
 
             if self
@@ -804,7 +897,15 @@ impl Segcache {
         // `reserved` (and its WriterPin) is handed to `replace_at` by value and
         // stays alive there until publish — never dropped/destructured here
         // before the hashtable exchange (item 7d, H2).
-        self.replace_at(key, location, slot, reserved)
+        //
+        // The token is passed down for a second, pinned verification
+        // right before the publish: the slot CAS inside `replace_at`
+        // only observes the LOCATION, so an in-place numeric increment
+        // landing after the check above (the window spans
+        // `reserve_and_define`, possibly a whole eviction pass) would
+        // otherwise be invisible to it — a false STORED that destroys an
+        // acked increment.
+        self.replace_at(key, location, slot, reserved, Some(cas))
     }
 
     /// Remove the item with the given key, returns a bool indicating if it was
@@ -1018,7 +1119,7 @@ impl Segcache {
     /// alias the same memory and observe updates (seqlock-consistent,
     /// never torn).
     pub fn wrapping_add(&self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
-        self.numeric_update(key, |raw| raw.fetch_wrapping_add(rhs))
+        self.numeric_update(key, |v| v.wrapping_add(rhs))
     }
 
     /// Perform a saturating subtraction on the value stored at the supplied
@@ -1028,7 +1129,7 @@ impl Segcache {
     /// See [`Self::wrapping_add`] for the update and CAS-token semantics.
     /// Returns the new value.
     pub fn saturating_sub(&self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
-        self.numeric_update(key, |raw| raw.fetch_saturating_sub(rhs))
+        self.numeric_update(key, |v| v.saturating_sub(rhs))
     }
 
     /// Shared in-place update for the numeric operations.
@@ -1044,11 +1145,8 @@ impl Segcache {
     /// memory cannot be moved or reused out from under the update.
     ///
     /// Returns the value this call published.
-    fn numeric_update(
-        &self,
-        key: &[u8],
-        op: impl Fn(&RawItem) -> Result<u64, keyvalue::NotNumericError>,
-    ) -> Result<u64, SegcacheError> {
+    fn numeric_update(&self, key: &[u8], op: impl Fn(u64) -> u64) -> Result<u64, SegcacheError> {
+        let backoff = Backoff::new();
         loop {
             let verifier = self.verifier();
             let (location, _freq) = self
@@ -1065,8 +1163,13 @@ impl Segcache {
 
             match self.segments.acquire_item_at(seg_id, offset) {
                 // Segment not readable (draining; a relocation is in
-                // flight) — retry from the lookup.
-                None => continue,
+                // flight) — back off and retry from the lookup, giving
+                // the drain a chance to finish instead of busy-waiting
+                // through its whole window.
+                None => {
+                    backoff.snooze();
+                    continue;
+                }
                 Some((raw, _guard)) => {
                     // Re-validate after pinning (see `get`): if the key no longer
                     // resolves to this exact location, the segment was
@@ -1074,10 +1177,51 @@ impl Segcache {
                     // stale/aliased item — retry rather than update the WRONG
                     // item in place (item 7f). The fresh lookup only reads
                     // currently-published items, so it is safe and authoritative.
+                    // It also establishes `raw` as a REAL item, making the
+                    // version-word access below sound.
                     if self.hashtable.lookup(key, &verifier).map(|(l, _)| l) != Some(location) {
                         continue;
                     }
-                    return op(&raw).map_err(|_| SegcacheError::NotNumeric);
+
+                    // Take the item's seqlock writer lock, then re-validate
+                    // linkage INSIDE it, so the "still the published item"
+                    // check and the value write are one atomic step with
+                    // respect to every party that serializes on this lock —
+                    // in particular a cas publish, which re-verifies its
+                    // token and swaps the hashtable slot while holding it
+                    // (`replace_at`). Interleavings:
+                    //
+                    //   - cas critical section completed first and
+                    //     PUBLISHED: the re-check below sees the new
+                    //     location, we drop the lock unchanged and retry —
+                    //     the increment applies (once) to the NEW item.
+                    //     Acked only after it is visible.
+                    //   - cas critical section completed first but FAILED
+                    //     (token stale): slot unchanged, we update in
+                    //     place. Correct.
+                    //   - our update completes first: the cas's in-lock
+                    //     token re-verify sees our bumped version and
+                    //     fails `Exists` — our acked increment survives on
+                    //     the still-linked item. A cas whose token was
+                    //     read AFTER our update legitimately carries our
+                    //     increment forward in the value it publishes.
+                    //
+                    // A checked-then-written window simply cannot contain
+                    // a token-gated publish, and non-token-gated writes
+                    // (set/delete/convert) owe no preservation to a
+                    // concurrent increment — losing to them is a legal
+                    // linearization. This is why the validation must sit
+                    // inside the lock: a post-write re-check variant
+                    // double-applies when a fresh-token cas lands between
+                    // the write and the re-check.
+                    let vguard = raw
+                        .lock_numeric_version()
+                        .map_err(|_| SegcacheError::NotNumeric)?;
+                    if self.hashtable.lookup(key, &verifier).map(|(l, _)| l) != Some(location) {
+                        drop(vguard);
+                        continue;
+                    }
+                    return Ok(vguard.update(&op));
                 }
             }
         }
@@ -1136,7 +1280,11 @@ impl Segcache {
 
         let reserved =
             self.reserve_and_define(key, Value::U64(parsed), &opt_buf[..olen], seg_ttl)?;
-        self.replace_at(key, location, slot, reserved)
+        // No caller token here (this is a convert-in-place, not a cas):
+        // location-only publish semantics are the intent — any
+        // concurrent replacement fails the slot CAS and surfaces as
+        // `Exists`.
+        self.replace_at(key, location, slot, reserved, None)
     }
 
     /// Test-only access to the segment collection, for asserting on segment

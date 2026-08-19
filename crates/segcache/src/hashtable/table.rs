@@ -492,7 +492,30 @@ impl MultiChoiceHashtable {
             return SlotVerify::Match;
         }
 
-        Self::classify_failed_verify(bucket, slot_index, packed)
+        let outcome = Self::classify_failed_verify(bucket, slot_index, packed);
+
+        // Turn the invariant into a checked PRECONDITION rather than only
+        // testing for its visible failure. `DifferentKey` claims the slot
+        // held `location` continuously, so `location`'s key bytes were
+        // stable — a published item's key is immutable in place (delete's
+        // `set_deleted` runs under a remover pin and touches only the
+        // header; numeric updates rewrite value/CRC, never the key). Then a
+        // second verify MUST agree. Disagreement means clause (a) or (b)
+        // above no longer holds — a dangling entry, or a relocation that
+        // did not go through the slot — and the "unchanged slot" conclusion
+        // is unsound. Debug builds only, and only on the already-cold
+        // failure path.
+        #[cfg(debug_assertions)]
+        if outcome == SlotVerify::DifferentKey {
+            debug_assert!(
+                !verifier.verify(key, location, allow_deleted),
+                "STALE-LOCATION INVARIANT violated: slot word unchanged across two \
+                 verifies that disagree, so an unchanged slot no longer proves the \
+                 compared bytes were this entry's"
+            );
+        }
+
+        outcome
     }
 
     /// Failure half of [`Self::verify_slot`]: decide whether a `false` from
@@ -1474,18 +1497,18 @@ impl Hashtable for MultiChoiceHashtable {
 mod tests {
     use super::*;
 
-    struct MockVerifier {
+    pub(super) struct MockVerifier {
         entries: Vec<(Vec<u8>, Location, bool)>,
     }
 
     impl MockVerifier {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 entries: Vec::new(),
             }
         }
 
-        fn add(&mut self, key: &[u8], location: Location, deleted: bool) {
+        pub(super) fn add(&mut self, key: &[u8], location: Location, deleted: bool) {
             self.entries.push((key.to_vec(), location, deleted));
         }
     }
@@ -1911,6 +1934,205 @@ mod tests {
                 );
             });
         }
+    }
+}
+
+/// Deterministic reproduction of the stale-location ABA on the read path.
+///
+/// The hazard window is between loading `packed` from a slot and `verify`
+/// reading the storage bytes at the location it encodes. `verify` is a
+/// caller-supplied callback, so it IS the seam: a verifier that performs
+/// the relocation-and-recycle from inside its own `verify` puts the race
+/// exactly where it happens in production, with no scheduler involvement
+/// and no test-only hook in the production path.
+///
+/// Each test drives one read entry point and fails in milliseconds instead
+/// of racing for a ~1-in-2,400 interleaving.
+#[cfg(all(test, not(feature = "loom")))]
+mod stale_location_tests {
+    use super::*;
+    use crate::sync::AtomicU64;
+
+    const KEY: &[u8] = b"hotkey";
+    const OLD: u64 = 0x1000;
+    const NEW: u64 = 0x2000;
+
+    /// Verifier that models a merge drain landing mid-`verify`.
+    ///
+    /// The FIRST comparison against `KEY` is the racing read: before
+    /// answering, it relocates the entry to a new location via
+    /// `cas_location` — exactly what `Segment::copy_into` does — and then
+    /// reports `false`, because in production the old segment has by now
+    /// been finalized, recycled, and rewritten, so the bytes at the old
+    /// location belong to somebody else's key.
+    ///
+    /// Every later comparison answers from the post-relocation state, so
+    /// the verifier is CONSISTENT: the old location never verifies for
+    /// `KEY` again. A guard that re-reads the slot therefore resolves the
+    /// key at its new location; a guard that does not concludes "different
+    /// key" and reports a false absent.
+    struct RelocatingVerifier<'a> {
+        ht: &'a MultiChoiceHashtable,
+        /// Where the entry currently lives (raw `Location`).
+        live: AtomicU64,
+        /// 0 until the relocation has fired, 1 afterwards.
+        fired: AtomicU64,
+    }
+
+    impl<'a> RelocatingVerifier<'a> {
+        fn new(ht: &'a MultiChoiceHashtable) -> Self {
+            Self {
+                ht,
+                live: AtomicU64::new(OLD),
+                fired: AtomicU64::new(0),
+            }
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::Acquire) == 1
+        }
+    }
+
+    impl KeyVerifier for RelocatingVerifier<'_> {
+        fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
+            if key != KEY {
+                return false;
+            }
+
+            if self
+                .fired
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Mid-verify: the drain relocates the entry and recycles
+                // the source segment under us.
+                assert!(
+                    self.ht
+                        .cas_location(KEY, Location::new(OLD), Location::new(NEW), true),
+                    "test setup: the relocation CAS must land"
+                );
+                self.live.store(NEW, Ordering::Release);
+                // The old location's bytes are now another key's.
+                return false;
+            }
+
+            location.as_raw() == self.live.load(Ordering::Acquire)
+        }
+    }
+
+    /// Seed `KEY` at `OLD`, then run `f` with a verifier that races a
+    /// relocation into the first comparison. Asserts the race actually
+    /// fired, so a test can never pass by failing to enter the window.
+    fn with_relocation_race<R>(
+        f: impl FnOnce(&MultiChoiceHashtable, &RelocatingVerifier<'_>) -> R,
+    ) -> R {
+        let ht = MultiChoiceHashtable::new(10);
+
+        let mut seed = super::tests::MockVerifier::new();
+        seed.add(KEY, Location::new(OLD), false);
+        ht.insert(KEY, Location::new(OLD), &seed)
+            .expect("test setup: seed insert");
+
+        let verifier = RelocatingVerifier::new(&ht);
+        let result = f(&ht, &verifier);
+
+        assert!(
+            verifier.fired(),
+            "test setup: the read never reached the verify window"
+        );
+        result
+    }
+
+    #[test]
+    fn lookup_survives_relocation_during_verify() {
+        with_relocation_race(|ht, verifier| {
+            let got = ht.lookup(KEY, verifier);
+            assert_eq!(
+                got.map(|(loc, _)| loc),
+                Some(Location::new(NEW)),
+                "a relocation landing inside verify must not turn a live key \
+                 into a miss: the slot changed, so the scan owes it a re-read"
+            );
+        });
+    }
+
+    #[test]
+    fn lookup_no_freq_update_survives_relocation_during_verify() {
+        with_relocation_race(|ht, verifier| {
+            assert_eq!(
+                ht.lookup_no_freq_update(KEY, verifier).map(|(loc, _)| loc),
+                Some(Location::new(NEW)),
+            );
+        });
+    }
+
+    #[test]
+    fn lookup_slot_survives_relocation_during_verify() {
+        with_relocation_race(|ht, verifier| {
+            assert_eq!(
+                ht.lookup_slot(KEY, verifier).map(|(loc, _)| loc),
+                Some(Location::new(NEW)),
+            );
+        });
+    }
+
+    #[test]
+    fn contains_survives_relocation_during_verify() {
+        with_relocation_race(|ht, verifier| {
+            assert!(
+                ht.contains(KEY, verifier),
+                "contains must not report a live key absent"
+            );
+        });
+    }
+
+    #[test]
+    fn get_frequency_survives_relocation_during_verify() {
+        with_relocation_race(|ht, verifier| {
+            assert!(
+                ht.get_frequency(KEY, verifier).is_some(),
+                "get_frequency must not report a live key absent"
+            );
+        });
+    }
+
+    /// The write path shares `verify_slot`, so pin its behaviour too: an
+    /// `insert` whose verify races a relocation must resolve to a REPLACE
+    /// of the existing entry, never publish a duplicate.
+    ///
+    /// NB this one does NOT go red when the guard is removed — `insert`
+    /// re-checks for an existing entry under the stripe lock, and by then
+    /// the relocation has settled, so the second pass finds it. It is a
+    /// regression test for the outcome, not a reproducer.
+    #[test]
+    fn insert_replaces_through_relocation_during_verify() {
+        with_relocation_race(|ht, verifier| {
+            let replaced = ht
+                .insert(KEY, Location::new(0x3000), verifier)
+                .expect("insert must not fail");
+            assert_eq!(
+                replaced,
+                Some(Location::new(NEW)),
+                "insert must replace the relocated entry in place"
+            );
+        });
+    }
+
+    /// A genuine tag collision — two different keys landing in the same
+    /// bucket with the same tag — must still resolve to "different key".
+    /// Guards against the fix turning every mismatch into a retry.
+    #[test]
+    fn genuine_key_mismatch_still_reports_absent() {
+        let ht = MultiChoiceHashtable::new(10);
+        let mut verifier = super::tests::MockVerifier::new();
+        let loc = Location::new(OLD);
+        verifier.add(b"present", loc, false);
+
+        ht.insert(b"present", loc, &verifier).unwrap();
+
+        assert!(ht.lookup(b"absent", &verifier).is_none());
+        assert!(!ht.contains(b"absent", &verifier));
+        assert!(ht.get_frequency(b"absent", &verifier).is_none());
     }
 }
 

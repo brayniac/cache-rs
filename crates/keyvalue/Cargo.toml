@@ -1,6 +1,6 @@
 [package]
 name = "keyvalue"
-version = "0.3.0"
+version = "0.3.1"
 description = "Shared key-value item types for cache storage engines"
 
 edition = { workspace = true }

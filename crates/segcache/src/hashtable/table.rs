@@ -2118,21 +2118,90 @@ mod stale_location_tests {
         });
     }
 
-    /// A genuine tag collision — two different keys landing in the same
-    /// bucket with the same tag — must still resolve to "different key".
-    /// Guards against the fix turning every mismatch into a retry.
+    /// Find two DISTINCT keys that share both a 12-bit tag and their first
+    /// candidate bucket, so a lookup of one genuinely reaches the other's
+    /// slot and calls `verify` on it.
+    ///
+    /// Sharing `buckets[0]` specifically (rather than any candidate) is what
+    /// makes the collision reliable: `try_claim_new_slot` scans candidates in
+    /// order, so into an empty table the resident key lands in its first
+    /// choice — which is the first bucket the probing key examines.
+    ///
+    /// `RandomState` is seeded per hashtable, so this searches the live
+    /// instance rather than hardcoding keys. Expected cost is a few hundred
+    /// candidates (birthday over 4096 tags x 128 buckets).
+    fn find_tag_colliding_pair(ht: &MultiChoiceHashtable) -> (Vec<u8>, Vec<u8>) {
+        let mut seen: std::collections::HashMap<(u16, usize), Vec<u8>> =
+            std::collections::HashMap::new();
+
+        for i in 0u64..5_000_000 {
+            let cand = format!("tagcollide-{i}").into_bytes();
+            let (tag, buckets) = ht.probe(&cand);
+            let key = (tag, buckets[0]);
+            if let Some(prev) = seen.get(&key) {
+                return (prev.clone(), cand);
+            }
+            seen.insert(key, cand);
+        }
+        panic!("no tag-colliding key pair found");
+    }
+
+    /// A GENUINE 12-bit tag collision — a different key whose probe really
+    /// does land on the resident key's slot — must still resolve to
+    /// "different key" and report absent.
+    ///
+    /// This is the control for the whole fix: it is what fails if the guard
+    /// degrades into "retry on every mismatch". That regression is not a
+    /// wrong answer but an infinite loop — the slot never changes, so an
+    /// unconditional `Changed` re-reads the same word forever — so this test
+    /// catches it by hanging rather than by asserting.
+    ///
+    /// The keys MUST be tag-colliding for any of that to be true. An earlier
+    /// version of this test used unrelated keys (`b"present"` / `b"absent"`);
+    /// with a 12-bit tag the SIMD mask screened the probe out before `verify`
+    /// was ever called, so it made ZERO calls into the guard and could not
+    /// have failed if the regression occurred. If you change the keys here,
+    /// re-check that the assertion below still holds.
     #[test]
-    fn genuine_key_mismatch_still_reports_absent() {
+    fn genuine_tag_collision_still_reports_absent() {
         let ht = MultiChoiceHashtable::new(10);
+        let (present, absent) = find_tag_colliding_pair(&ht);
+
+        // The precondition that makes this test non-vacuous. Without it the
+        // tag filter rejects `absent` before `verify` runs and nothing below
+        // exercises the guard.
+        assert_ne!(present, absent, "the pair must be two distinct keys");
+        let (present_tag, present_buckets) = ht.probe(&present);
+        let (absent_tag, absent_buckets) = ht.probe(&absent);
+        assert_eq!(
+            present_tag, absent_tag,
+            "keys must share a 12-bit tag or the SIMD filter screens the probe out"
+        );
+        assert_eq!(
+            present_buckets[0], absent_buckets[0],
+            "keys must share their first candidate bucket or the probe never \
+             examines the resident slot"
+        );
+
         let mut verifier = super::tests::MockVerifier::new();
         let loc = Location::new(OLD);
-        verifier.add(b"present", loc, false);
+        verifier.add(&present, loc, false);
+        ht.insert(&present, loc, &verifier).unwrap();
 
-        ht.insert(b"present", loc, &verifier).unwrap();
+        // The resident key still resolves: the guard has not broken hits.
+        assert_eq!(
+            ht.lookup(&present, &verifier).map(|(l, _)| l),
+            Some(loc),
+            "the resident key must still resolve"
+        );
 
-        assert!(ht.lookup(b"absent", &verifier).is_none());
-        assert!(!ht.contains(b"absent", &verifier));
-        assert!(ht.get_frequency(b"absent", &verifier).is_none());
+        // The colliding key reaches that slot, fails `verify`, and must be
+        // reported absent by every read entry point.
+        assert!(ht.lookup(&absent, &verifier).is_none());
+        assert!(ht.lookup_no_freq_update(&absent, &verifier).is_none());
+        assert!(ht.lookup_slot(&absent, &verifier).is_none());
+        assert!(!ht.contains(&absent, &verifier));
+        assert!(ht.get_frequency(&absent, &verifier).is_none());
     }
 }
 

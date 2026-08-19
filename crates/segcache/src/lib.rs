@@ -48,6 +48,9 @@ mod metrics;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, not(feature = "loom")))]
+mod pin_failure_tests;
+
 // publicly exported items from submodules
 pub use crate::segcache::Segcache;
 pub use builder::Builder;

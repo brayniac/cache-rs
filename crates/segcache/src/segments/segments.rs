@@ -618,6 +618,19 @@ impl Segments {
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 
+        // Reset the write statistics while the segment is still exclusively
+        // ours (Draining, reader count observed zero): removals that
+        // unlinked hashtable entries WITHOUT a remover pin (a delete racing
+        // this drain, the fresh-key insert de-dup race, a reservation
+        // rollback) could not decrement the counters, and the drain sweep
+        // skipped those already-unlinked items, so `live_*`/`write_offset`
+        // may be transiently over-counted (see the item 7f note on
+        // `Segment::clear`). Resetting here keeps a Free segment reporting
+        // zero items (`items()`, `check_integrity`); `try_reserve` repeats
+        // the reset as the authoritative one, covering the condemned path
+        // (guard-drop free) that does not pass through here.
+        self.headers[id_idx].reset_write_stats();
+
         let freed = self.headers[id_idx].cas_metadata(
             State::Draining,
             State::Free,

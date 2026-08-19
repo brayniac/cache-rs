@@ -626,9 +626,10 @@ impl Segments {
         // skipped those already-unlinked items, so `live_*`/`write_offset`
         // may be transiently over-counted (see the item 7f note on
         // `Segment::clear`). Resetting here keeps a Free segment reporting
-        // zero items (`items()`, `check_integrity`); `try_reserve` repeats
-        // the reset as the authoritative one, covering the condemned path
-        // (guard-drop free) that does not pass through here.
+        // zero items (`items()`); `try_reserve` repeats the reset as the
+        // authoritative one, covering the condemned path (guard-drop free)
+        // that does not pass through here — which is also why
+        // `check_integrity` skips out-of-service segments.
         self.headers[id_idx].reset_write_stats();
 
         let freed = self.headers[id_idx].cas_metadata(
@@ -2040,6 +2041,18 @@ impl Segments {
             let seg_start = self.segment_size as usize * idx;
             let seg_end = seg_start + self.segment_size as usize;
             let header = &self.headers[idx];
+            // Only in-service segments (Live/Sealed/Relinking) have a
+            // meaningful counted-vs-header comparison. A drained segment
+            // that left service via the condemned path (AwaitingRelease ->
+            // guard-drop free) can legitimately carry residual counters
+            // from unlinked-without-pin removals until `try_reserve` resets
+            // them (see `reset_write_stats`); counting it would report a
+            // false mismatch. Draining segments are mid-parse by their
+            // owner and equally transient.
+            match header.state() {
+                State::Live | State::Sealed | State::Relinking => {}
+                _ => continue,
+            }
             // SAFETY: we only read the data here; the borrow is scoped.
             let data = unsafe {
                 std::slice::from_raw_parts_mut(self.data.as_ptr() as *mut u8, self.data.len())

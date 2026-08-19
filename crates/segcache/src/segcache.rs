@@ -611,7 +611,16 @@ impl Segcache {
             //   pin and normally finishes on its own — spin briefly. The
             //   spin is still bounded (cross-thread pin cycles, see
             //   `insert`): once the backoff is exhausted, roll back and
-            //   fail safe with `Exists` as well.
+            //   fail safe with `Exists` as well. The bound also covers the
+            //   `Relinking` case (the checked item lives in a mid-fill
+            //   merge/promotion DESTINATION): pre-fix the spin waited for
+            //   `publish_dest_sealed` and then succeeded, but that wait is
+            //   not deadlock-free — the fill's owner can simultaneously be
+            //   claiming OUR (concurrently sealed) reservation segment and
+            //   waiting on our WriterPin — so a fill longer than the
+            //   backoff now surfaces as a spurious-but-safe `Exists` on an
+            //   unmodified token; a get-then-cas retry succeeds once the
+            //   fill seals.
             let pin = match self.segments.try_pin_remover(old_seg_id) {
                 Some(pin) => pin,
                 None => {
@@ -837,6 +846,12 @@ impl Segcache {
                 return self.hashtable.remove(key, location);
             };
 
+            // Capture the segment generation before anything else: the
+            // unpinned-unlink path below uses it to detect a recycle of
+            // `seg_id` between this lookup and its remove (see the ABA note
+            // there).
+            let observed_gen = self.segments.generation(seg_id);
+
             // Lazy expiry: DELETE on an expired key reports NOT_FOUND (false),
             // matching memcached, even before the segment is reclaimed. The
             // stale hashtable entry is left for expire()/eviction pressure to
@@ -866,13 +881,41 @@ impl Segcache {
             // covers it — every parse path (`clear`, `prune`, `copy_into`,
             // `s3fifo_promote_from`) consults `get_item_frequency` and treats
             // the unlinked item as dead (no relocation, no double remove),
-            // and the counters are reset wholesale when the segment recycles
-            // (`init()`), the same accepted transient over-count documented
-            // in `Segment::clear` (item 7f). If the unlink races `copy_into`
+            // and the counters are reset wholesale when the segment is
+            // recycled/re-reserved (`reset_write_stats`), the same accepted
+            // transient over-count documented in `Segment::clear` (item 7f). If the unlink races `copy_into`
             // after its liveness check, the relink CAS simply fails and the
             // copy aborts — an eviction-legal drop, not corruption.
+            //
+            // ABA guard: `location` is (segment, offset) with NO generation,
+            // and `hashtable.remove` matches (tag, location) without
+            // re-verifying key bytes — the pinned path below is exempt only
+            // because its pin freezes the segment against recycling (the
+            // location-uniqueness precondition documented on
+            // `cas_location_at`). Unpinned, the segment could have been
+            // drained, recycled, and refilled since the lookup, with a
+            // colliding-tag key freshly written at this exact offset. Two
+            // defenses: (1) refuse the unpinned unlink when the generation
+            // moved since the lookup — the entry is stale either way; (2)
+            // after a successful unlink, re-verify the key stopped
+            // resolving, retrying if it did not — so an acked delete NEVER
+            // leaves the key reachable (a retry against a concurrent
+            // re-insert deletes the newer value: a legal linearization of
+            // concurrent set+delete). The residual window (generation load
+            // to remove-CAS) requires a full drain+recycle+refill+publish
+            // plus a 12-bit tag collision in an overlapping bucket to land
+            // within a few instructions; its worst case is a spurious
+            // unlink of ONE colliding key — observably an eviction, which a
+            // cache may always perform — never corruption (the unlink
+            // touches no segment state).
             let Some(pin) = self.segments.try_pin_remover(seg_id) else {
-                if self.hashtable.remove(key, location) {
+                if self.segments.generation(seg_id) == observed_gen
+                    && self.hashtable.remove(key, location)
+                    && self
+                        .hashtable
+                        .lookup_no_freq_update(key, &verifier)
+                        .is_none()
+                {
                     #[cfg(feature = "metrics")]
                     {
                         HASH_REMOVE.increment();
@@ -880,9 +923,10 @@ impl Segcache {
                     }
                     return true;
                 }
-                // The entry moved (a merge republished it elsewhere) or was
-                // removed concurrently — retry from the lookup, which
-                // resolves the fresh location or reports the key gone.
+                // The entry moved (a merge republished it elsewhere), was
+                // removed concurrently, or the key still resolves after the
+                // unlink — retry from the lookup, which resolves the fresh
+                // location or reports the key gone.
                 backoff.snooze();
                 continue;
             };

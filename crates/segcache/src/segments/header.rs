@@ -152,12 +152,31 @@ impl SegmentHeader {
     /// observed zero (`recycle`), or a just-won `Free -> Reserved` CAS
     /// (`try_reserve`) — since a reset under live readers would corrupt
     /// their offset math.
+    ///
+    /// With `metrics`, any residual live items/bytes being zeroed here are
+    /// items that leaked their `remove_at` decrement (unlinked without a
+    /// remover pin — a delete racing a drain, the fresh-key insert de-dup
+    /// race, a reservation rollback), so the global item gauges are
+    /// corrected by the residue. Exactly-once: the first reset zeroes the
+    /// counters, so a second reset (recycle then try_reserve) subtracts
+    /// nothing.
     pub fn reset_write_stats(&self) {
         let initial_offset = if cfg!(feature = "integrity") {
             std::mem::size_of::<u64>() as i32
         } else {
             0
         };
+        #[cfg(feature = "metrics")]
+        {
+            let leaked_items = self.live_items.load(Ordering::Relaxed);
+            let leaked_bytes = self.live_bytes.load(Ordering::Relaxed) - initial_offset;
+            if leaked_items > 0 {
+                crate::ITEM_CURRENT.sub(leaked_items as _);
+            }
+            if leaked_bytes > 0 {
+                crate::ITEM_CURRENT_BYTES.sub(leaked_bytes as _);
+            }
+        }
         self.write_offset.store(initial_offset, Ordering::Relaxed);
         self.live_bytes.store(initial_offset, Ordering::Relaxed);
         self.live_items.store(0, Ordering::Relaxed);

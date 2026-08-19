@@ -6,11 +6,13 @@
 //! Numeric items (`Value::U64`) use an extended, 8-aligned value slot:
 //! `[ItemHeader][optional][key][pad][value: u64][version: u64]`, where the
 //! derived pad brings the value to an 8-byte boundary. Both words are
-//! accessed atomically, and in-place updates run under a seqlock on the
-//! version word so that the value and the item CRC stay consistent for
-//! concurrent readers. The version also feeds CAS-token construction: every
-//! in-place update bumps it, so tokens observe increments (matching
-//! memcached, where incr/decr assign a fresh cas unique).
+//! accessed atomically, and in-place updates may race each other AND
+//! readers: without the `integrity` feature the value RMW is lock-free;
+//! with `integrity` the version word doubles as a per-item seqlock writer
+//! lock so the value and the item CRC change as one unit. The version also
+//! feeds CAS-token construction: every in-place update bumps it by two, so
+//! tokens observe increments (matching memcached, where incr/decr assign a
+//! fresh cas unique).
 
 use crate::item::*;
 use crate::NotNumericError;
@@ -98,11 +100,16 @@ impl RawItem {
     /// Borrow the value, returning either bytes or a decoded u64.
     ///
     /// Numeric values are read with a seqlock so a concurrent in-place
-    /// update can never be observed torn. The retry loop is degenerate
-    /// today (all mutation is serialized by `&mut` at the cache level)
-    /// and becomes load-bearing when readers go concurrent. Note that
-    /// loom cannot verify seqlock orderings (no SC total order in its
-    /// model) — the protocol shape is pinned by unit tests instead.
+    /// update can never be observed torn. Updates are word-atomic, so
+    /// the value load itself cannot tear; the odd-check and version
+    /// re-check are load-bearing for `integrity` builds, where they keep
+    /// this read ordered against a writer's paired value+CRC update. In
+    /// non-`integrity` builds writers never publish an odd version and a
+    /// version change merely causes a harmless retry. Note that loom
+    /// cannot verify seqlock orderings (no SC total order in its model,
+    /// and these atomics are conjured from raw buffer pointers, which
+    /// loom's types cannot model) — the protocol shape is pinned by
+    /// concurrency tests instead.
     pub fn value(&self) -> Value<'_> {
         if self.header().is_numeric() {
             // SAFETY: is_numeric checked; slot aligned by construction.
@@ -241,23 +248,96 @@ impl RawItem {
     }
 
     /// Wrapping in-place addition on a numeric value, returning the new
-    /// value. The write runs under the item's seqlock: the version goes
-    /// odd (staling any outstanding CAS token — fail-safe ordering,
-    /// before the value moves), the value and CRC are updated, and the
-    /// version lands even. The CRC therefore covers the value at all
-    /// times, and concurrent seqlock readers can never observe a torn
-    /// value/CRC pair.
+    /// value.
+    ///
+    /// The read-modify-write is atomic with respect to OTHER WRITERS:
+    /// callers may race `fetch_wrapping_add`/`fetch_saturating_sub` on
+    /// the same item from multiple threads (the engine above pins the
+    /// segment only as a reader, so writers are NOT serialized
+    /// externally) and no update is lost. Every update also bumps the
+    /// item's version by exactly two, staling outstanding CAS tokens.
+    ///
+    /// Without the `integrity` feature the update is lock-free: the
+    /// value word RMW is a native atomic (wrapping is `fetch_add`'s
+    /// overflow behavior on `AtomicU64`). With `integrity`, the update
+    /// additionally recomputes the stored CRC, and value + CRC must
+    /// change as one unit; the version word then acts as a per-item
+    /// writer lock (odd = write in progress), which keeps
+    /// [`Self::check_integrity`] exact under concurrency — it never
+    /// misreports a healthy racing update as corruption and always
+    /// detects real value corruption.
     pub fn fetch_wrapping_add(&self, rhs: u64) -> Result<u64, NotNumericError> {
-        self.seqlocked_update(|v| v.wrapping_add(rhs))
+        #[cfg(feature = "integrity")]
+        return self.locked_numeric_update(|v| v.wrapping_add(rhs));
+
+        #[cfg(not(feature = "integrity"))]
+        {
+            let (value_word, version_word) = self.numeric_words()?;
+            // Wait-free: wrapping on overflow is fetch_add's native
+            // behavior. AcqRel chains each writer's RMW with its
+            // neighbors on the value word; the returned value is exact
+            // for this call even under contention.
+            let new = value_word
+                .fetch_add(rhs, Ordering::AcqRel)
+                .wrapping_add(rhs);
+            version_word.fetch_add(2, Ordering::Release);
+            Ok(new)
+        }
     }
 
     /// Saturating in-place subtraction on a numeric value, returning the
-    /// new value. See [`Self::fetch_wrapping_add`] for the protocol.
+    /// new value. See [`Self::fetch_wrapping_add`] for the concurrency
+    /// contract.
     pub fn fetch_saturating_sub(&self, rhs: u64) -> Result<u64, NotNumericError> {
-        self.seqlocked_update(|v| v.saturating_sub(rhs))
+        #[cfg(feature = "integrity")]
+        return self.locked_numeric_update(|v| v.saturating_sub(rhs));
+
+        #[cfg(not(feature = "integrity"))]
+        {
+            let (value_word, version_word) = self.numeric_words()?;
+            // Lock-free CAS loop: saturation has no native fetch_ op.
+            let prev = value_word
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(rhs))
+                })
+                .expect("closure never returns None");
+            version_word.fetch_add(2, Ordering::Release);
+            Ok(prev.saturating_sub(rhs))
+        }
     }
 
-    fn seqlocked_update(&self, op: impl Fn(u64) -> u64) -> Result<u64, NotNumericError> {
+    /// Both numeric atomic words, or `NotNumericError`.
+    #[cfg(not(feature = "integrity"))]
+    #[inline]
+    fn numeric_words(&self) -> Result<(&AtomicU64, &AtomicU64), NotNumericError> {
+        if !self.header().is_numeric() {
+            return Err(NotNumericError);
+        }
+        // SAFETY: is_numeric checked; slot aligned by construction.
+        Ok(unsafe { (self.value_word(), self.version_word()) })
+    }
+
+    /// Serialized numeric update for `integrity` builds: value and CRC
+    /// are two separate words that must change together, so concurrent
+    /// writers take a per-item spin lock on the version word (CAS the
+    /// even version to odd). This is the classic seqlock writer side —
+    /// readers already treat an odd version as write-in-progress — and
+    /// it doubles as the mutual exclusion that makes the RMW atomic.
+    ///
+    /// Ordering: the successful lock CAS is `Acquire`, pairing with the
+    /// previous writer's `Release` unlock, so this writer observes the
+    /// prior value and CRC. A `Release` fence sits between the odd
+    /// version store and the data stores (Boehm's seqlock writer): a
+    /// reader that reads-from one of the data stores and then executes
+    /// its `Acquire` fence is thereby guaranteed to observe the odd
+    /// version on its re-check and retry — without the fence, a reader
+    /// could formally pair a new value with a stale CRC while both
+    /// version loads still returned the old even value. The unlock
+    /// store is `Release`: any reader whose `Acquire` load of the
+    /// version returns the new even value is guaranteed to observe the
+    /// matching value and CRC.
+    #[cfg(feature = "integrity")]
+    fn locked_numeric_update(&self, op: impl Fn(u64) -> u64) -> Result<u64, NotNumericError> {
         if !self.header().is_numeric() {
             return Err(NotNumericError);
         }
@@ -265,19 +345,37 @@ impl RawItem {
         // SAFETY: is_numeric checked; slot aligned by construction.
         let (value_word, version_word) = unsafe { (self.value_word(), self.version_word()) };
 
-        // Seqlock write. Writers are serialized externally (today by
-        // `&mut` at the cache level; later by the segment reader-pin
-        // protocol, which also excludes eviction byte-copies while the
-        // pin is held).
-        version_word.fetch_add(1, Ordering::AcqRel); // odd: write in progress
+        // Lock: transition the version from even to odd.
+        let mut v = version_word.load(Ordering::Relaxed);
+        loop {
+            if v & 1 == 1 {
+                // another writer holds the lock
+                std::hint::spin_loop();
+                v = version_word.load(Ordering::Relaxed);
+                continue;
+            }
+            match version_word.compare_exchange_weak(
+                v,
+                v.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => v = observed,
+            }
+        }
+
+        // Order the odd (write-in-progress) version store before the
+        // data stores for the seqlock readers (see doc comment).
+        fence(Ordering::Release);
+
         let new = op(value_word.load(Ordering::Relaxed));
         value_word.store(new, Ordering::Relaxed);
-        #[cfg(feature = "integrity")]
-        {
-            let crc = self.compute_crc_numeric(new);
-            self.crc_word().store(crc, Ordering::Relaxed);
-        }
-        version_word.fetch_add(1, Ordering::Release); // even: stable
+        let crc = self.compute_crc_numeric(new);
+        self.crc_word().store(crc, Ordering::Relaxed);
+
+        // Unlock: back to even, two above the pre-update version.
+        version_word.store(v.wrapping_add(2), Ordering::Release);
         Ok(new)
     }
 
@@ -571,6 +669,134 @@ mod tests {
         // corrupting it can only cause spurious CAS-token mismatches
         let version_off = raw.value_offset() + 8;
         unsafe { *raw.data.add(version_off) ^= 0x02 };
+        assert!(raw.check_integrity());
+    }
+
+    /// Concurrent increments on one item must not lose updates: the
+    /// value RMW has to be atomic, not load/op/store. Before the fix,
+    /// N threads x M `fetch_wrapping_add(1)` ended short of N*M.
+    #[test]
+    fn concurrent_wrapping_add_loses_no_updates() {
+        const THREADS: usize = 8;
+        const OPS: usize = 10_000;
+
+        let mut buf = aligned_buf(64);
+        let raw = define_numeric(&mut buf, b"counter", 0, b"");
+        // RawItem is a raw pointer and deliberately not Send/Sync; the
+        // test shares the (valid for the scope) address as usize, the
+        // same way concurrent engine threads alias one item buffer.
+        let addr = raw.data as usize;
+
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(move || {
+                    let raw = RawItem::from_ptr(addr as *mut u8);
+                    for _ in 0..OPS {
+                        raw.fetch_wrapping_add(1).unwrap();
+                    }
+                });
+            }
+        });
+
+        let expected = (THREADS * OPS) as u64;
+        assert_eq!(
+            raw.value(),
+            Value::U64(expected),
+            "lost updates: expected {expected}"
+        );
+        // every update bumps the version by exactly 2, never leaving it odd
+        assert_eq!(raw.numeric_version(), Some(2 * expected));
+    }
+
+    /// Concurrent decrements: with the initial value equal to the total
+    /// number of subtractions, any lost update leaves the counter above
+    /// zero. A second phase then verifies the floor under contention.
+    #[test]
+    fn concurrent_saturating_sub_loses_no_updates_and_floors_at_zero() {
+        const THREADS: usize = 8;
+        const OPS: usize = 10_000;
+        let total = (THREADS * OPS) as u64;
+
+        let mut buf = aligned_buf(64);
+        let raw = define_numeric(&mut buf, b"counter", total, b"");
+        let addr = raw.data as usize;
+
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(move || {
+                    let raw = RawItem::from_ptr(addr as *mut u8);
+                    for _ in 0..OPS {
+                        raw.fetch_saturating_sub(1).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(raw.value(), Value::U64(0), "lost updates: expected 0");
+        assert_eq!(raw.numeric_version(), Some(2 * total));
+
+        // floor: many concurrent subs against a small value saturate at 0
+        raw.fetch_wrapping_add(3).unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(move || {
+                    let raw = RawItem::from_ptr(addr as *mut u8);
+                    for _ in 0..OPS {
+                        raw.fetch_saturating_sub(2).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(raw.value(), Value::U64(0));
+        assert_eq!(raw.numeric_version(), Some(2 * (2 * total + 1)));
+    }
+
+    /// The stored CRC must stay consistent with the value under
+    /// concurrent writers and concurrent readers: `check_integrity`
+    /// may never report corruption on a healthy item. Before the fix,
+    /// overlapped writers broke the odd-version write-in-progress
+    /// invariant, so a reader could pair a value with a stale CRC.
+    #[cfg(feature = "integrity")]
+    #[test]
+    fn integrity_holds_under_concurrent_updates() {
+        use std::sync::atomic::AtomicBool;
+
+        const WRITERS: usize = 4;
+        const OPS: usize = 20_000;
+
+        let mut buf = aligned_buf(64);
+        let raw = define_numeric(&mut buf, b"counter", 0, b"");
+        let addr = raw.data as usize;
+        let done = AtomicBool::new(false);
+        let done = &done;
+
+        std::thread::scope(|s| {
+            let checker = s.spawn(move || {
+                let raw = RawItem::from_ptr(addr as *mut u8);
+                let mut checks = 0u64;
+                while !done.load(Ordering::Acquire) {
+                    assert!(raw.check_integrity(), "false corruption report");
+                    checks += 1;
+                }
+                checks
+            });
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    s.spawn(move || {
+                        let raw = RawItem::from_ptr(addr as *mut u8);
+                        for _ in 0..OPS {
+                            raw.fetch_wrapping_add(1).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.join().unwrap();
+            }
+            done.store(true, Ordering::Release);
+            let checks = checker.join().unwrap();
+            assert!(checks > 0, "checker never ran concurrently");
+        });
+        assert_eq!(raw.value(), Value::U64((WRITERS * OPS) as u64));
         assert!(raw.check_integrity());
     }
 

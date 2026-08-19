@@ -7,7 +7,6 @@
 use crate::Value;
 use crate::*;
 use core::num::NonZeroU32;
-use crossbeam_utils::Backoff;
 use std::cmp::min;
 
 const RESERVE_RETRIES: usize = 3;
@@ -528,37 +527,22 @@ impl Segcache {
             return Err(SegcacheError::NotFound);
         };
 
-        let backoff = Backoff::new();
         loop {
-            // Pin the OLD item's segment BEFORE unlinking it (item 7f): the
-            // pin brackets both the `cas_location` unlink below and the
-            // `remove_at` decrement on success, so a concurrent drain of
-            // `old_seg_id` cannot interleave with the decrement. If a drain
-            // has already claimed the segment, check whether the entry still
-            // resolves to `old_location`: if not, it was already moved or
-            // removed — roll back and report `Exists` (same as the
-            // post-CAS-failure check below); if it does, the drain claimed
-            // the segment but has not yet drained this hashtable entry —
-            // retry until it does.
-            let pin = match self.segments.try_pin_remover(old_seg_id) {
-                Some(pin) => pin,
-                None => {
-                    if self
-                        .hashtable
-                        .get_item_frequency(key, old_location)
-                        .is_none()
-                    {
-                        self.rollback_reservation(reserved, new_seg, new_offset);
-                        return Err(SegcacheError::Exists);
-                    }
-                    backoff.snooze();
-                    continue;
-                }
-            };
+            // Pin the OLD item's segment across the unlink + decrement
+            // (item 7f). If a drain has already claimed it, DO NOT WAIT
+            // (issue #49 — the drain may be waiting on this writer's own
+            // `WriterPin`): fall through to an unpinned exchange. The
+            // exchange validates the exact packed word so a stale slot
+            // fails safe (the post-failure check below then reports
+            // `Exists`), and on unpinned success the decrement is skipped
+            // — the drain owns the segment's accounting wholesale. Same
+            // accepted-gap semantics as `delete()`'s pin-fail arm; the
+            // no-generation ABA residual is issue #50's class.
+            let pin = self.segments.try_pin_remover(old_seg_id);
 
-            // Publish under the pin: `reserved` (and its WriterPin) is held
-            // across the exchange so a concurrent drain cannot recycle the
-            // segment between define and publish (item 7d, H2).
+            // Publish under the WriterPin: `reserved` is held across the
+            // exchange so a concurrent drain cannot recycle the segment
+            // between define and publish (item 7d, H2).
             if self
                 .hashtable
                 .cas_location_at(old_slot, old_location, new_location, true)
@@ -573,18 +557,22 @@ impl Segcache {
                 // 7d lock-order invariant). The remover `pin` above brackets
                 // the unlink just performed and the decrement below (item
                 // 7f); `remove_at` releases it, also before any `chain_lock`.
+                // Unpinned (the fallback above), there is nothing to
+                // release and nothing to decrement.
                 drop(reserved);
-                let _ = self.segments.remove_at(
-                    old_seg_id,
-                    old_offset,
-                    &self.ttl_buckets,
-                    &self.hashtable,
-                    pin,
-                );
+                if let Some(pin) = pin {
+                    let _ = self.segments.remove_at(
+                        old_seg_id,
+                        old_offset,
+                        &self.ttl_buckets,
+                        &self.hashtable,
+                        pin,
+                    );
+                }
                 return Ok(());
             }
 
-            // The exchange failed while pinned — release the remover pin.
+            // The exchange failed — release any remover pin.
             drop(pin);
 
             if self
@@ -601,8 +589,11 @@ impl Segcache {
 
             // The entry is still at old_location: the exchange failed
             // spuriously (a concurrent reader bumped the frequency bits
-            // in the packed slot mid-exchange). Unreachable under &mut
-            // today; retry for the concurrent future.
+            // in the packed slot mid-exchange). Reachable and
+            // load-bearing under `&self` — retry the exchange. This is
+            // the loop's ONLY remaining `continue`: since issue #49 the
+            // pin failure no longer loops, so every iteration after the
+            // first is a genuine lost-CAS retry, not a wait.
         }
     }
 

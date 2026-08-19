@@ -2209,3 +2209,113 @@ fn replace_into_drain_claimed_segment_does_not_wedge() {
         ),
     }
 }
+
+/// Test 12 — issue #49, cas variant: `replace_at` (the cas publish path)
+/// had the same pin-retry spin as `insert`'s replace arm, and it must fall
+/// through to an unpinned exchange instead of waiting.
+///
+/// DELIBERATE DEVIATION from Test 11's scaffold, and the reason for it: a
+/// DRAIN-CLAIMED old segment is unreachable from `cas`. `cas` reads the
+/// item's current token through `acquire_item_at` first, and `Draining` is
+/// not a readable state — so against a claimed segment `cas` returns
+/// `NotFound` long before `replace_at` (verified: with segment 1 claimed,
+/// `cas` == `Err(NotFound)`). The pin-failure arm is therefore reached
+/// through the states that are READABLE but not REMOVABLE
+/// (`state_is_removable` == `Live | Sealed`), of which the live one is
+/// `Relinking`: a merge destination publishes each copied item into the
+/// hashtable (`copy_into`'s `cas_location`) while the target is still
+/// `Relinking`, so a concurrent `cas` on a just-copied key resolves it and
+/// then fails `try_pin_remover`.
+///
+/// That is the same #49 cycle, one hop wider: pre-fix the cas thread spins
+/// on `try_pin_remover` while HOLDING the `WriterPin` its reservation took
+/// on the write tail, and the merge owner that holds the destination in
+/// `Relinking` waits on `active_writers` of the segments it is claiming —
+/// the tail among them once it seals. Neither side can finish.
+///
+/// The blocked owner is simulated the same way Test 11 simulates the
+/// blocked drain: park segment 1 in `Relinking` by hand and never move it
+/// out. Segment 1 must be SEALED (not the Live tail) before the flip, or
+/// the reservation itself would spin in `TtlBucket::reserve`'s
+/// `NotWritable` retry instead of reaching `replace_at`.
+#[test]
+fn cas_into_relinking_segment_does_not_wedge() {
+    use crate::sync::Ordering;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
+
+    const SEGMENT_SIZE: i32 = 4096;
+    let cache = Segcache::builder()
+        .segment_size(SEGMENT_SIZE)
+        .heap_size(SEGMENT_SIZE as usize * 16)
+        .hash_power(12)
+        .build()
+        .expect("failed to build cache");
+    let cache = Arc::new(cache);
+
+    // The key under test goes in first, so its only copy lands in segment 1.
+    cache
+        .insert(b"victim", b"old-value", None, Duration::ZERO)
+        .expect("seed insert");
+
+    // Fill until segment 1 seals (the tail seals when the chain extends),
+    // then park it in `Relinking` — readable, so `cas` gets past its token
+    // read, but not removable, so `try_pin_remover` fails.
+    let seg1 = NonZeroU32::new(1).unwrap();
+    let mut parked = false;
+    for i in 0..10_000u32 {
+        let key = format!("filler-{i:06}");
+        let val = [0u8; 128];
+        cache
+            .insert(key.as_bytes(), &val[..], None, Duration::ZERO)
+            .expect("filler insert");
+        if cache.segments.header(seg1).cas_metadata(
+            State::Sealed,
+            State::Relinking,
+            None,
+            None,
+            Ordering::AcqRel,
+        ) {
+            parked = true;
+            break;
+        }
+    }
+    assert!(
+        parked,
+        "never managed to seal + park segment 1 in Relinking — adjust sizing"
+    );
+
+    // The victim is still readable in `Relinking`, so its cas token can be
+    // taken — this is exactly the state a merge destination is in while it
+    // republishes copied items.
+    let item = cache
+        .get(b"victim")
+        .expect("victim resolves while Relinking");
+    let token = item.cas();
+    drop(item); // release the reader pin before the cas
+
+    let (tx, rx) = mpsc::channel();
+    let writer = Arc::clone(&cache);
+    std::thread::spawn(move || {
+        let r = writer.cas(b"victim", b"cas-value", None, Duration::ZERO, token);
+        let _ = tx.send(r);
+    });
+
+    match rx.recv_timeout(StdDuration::from_secs(10)) {
+        Ok(r) => {
+            r.expect("cas into a non-removable segment must succeed");
+            let item = cache.get(b"victim").expect("victim must resolve");
+            assert_value_eq(
+                item.value(),
+                b"cas-value",
+                "cas must have published the new value",
+            );
+        }
+        Err(_) => panic!(
+            "issue #49 deadlock (cas variant): replace_at wedged waiting on a \
+             segment it cannot pin (the spinning thread is leaked; the test \
+             harness will reap it at process exit)"
+        ),
+    }
+}

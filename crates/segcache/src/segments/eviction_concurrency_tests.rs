@@ -2245,6 +2245,9 @@ fn cas_into_relinking_segment_does_not_wedge() {
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
+    // The sizing must guarantee no eviction runs while segment 1 is parked:
+    // `TtlBucket::drain_chain` debug_asserts every chain segment is Sealed
+    // or Live, which a parked `Relinking` segment would trip.
     const SEGMENT_SIZE: i32 = 4096;
     let cache = Segcache::builder()
         .segment_size(SEGMENT_SIZE)

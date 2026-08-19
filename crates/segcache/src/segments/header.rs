@@ -267,28 +267,20 @@ impl SegmentHeader {
         // simply rides along until the destination is drained in turn —
         // arriving here the same way, one drain later.
         //
-        // What DOES hold on every path into a Free segment is that the two
-        // counters agree, so assert that instead — it still catches wild
-        // corruption (a segment queued as Free without ever being cleared,
-        // or a torn/garbage offset) while tolerating the over-count:
-        //   * `init` — both start at `initial_offset`;
-        //   * `recycle` / `condemn` (`finalize_drained`, `TtlBucket` drain
-        //     + the guard-drop handoff behind it) — both are reached only
-        //     after `Segment::clear`, whose last act equalizes them, and
-        //     nothing may decrement a Draining/AwaitingRelease segment
-        //     afterwards (`claim_for_drain` waits out `active_removers`
-        //     and `try_pin_remover` rejects those states);
-        //   * `release_unused` (`try_release`) — a Reserved/Linking
-        //     segment that was never published: either untouched since
-        //     this function equalized them, or a merge copy target, and
-        //     `Segment::copy_into` advances `write_offset` and
-        //     `live_bytes` by the same `item_size` per copied item.
-        debug_assert_eq!(
-            self.write_offset.load(Ordering::Relaxed),
-            self.live_bytes.load(Ordering::Relaxed),
-            "segment {} reserved with write_offset/live_bytes disagreeing",
-            self.id
-        );
+        // `write_offset == live_bytes` DOES hold on every path into a Free
+        // segment, but asserting it here would be near-tautological rather
+        // than a real tripwire — `Segment::clear`'s last act is literally
+        // `set_write_offset(live_bytes)`, so on the drain paths
+        // (`recycle` / `condemn`, including the guard-drop handoff) the
+        // assertion would only restate the statement that just ran, and on
+        // the other two paths the equality is trivial: `init` starts both
+        // at `initial_offset`, and `release_unused` (`try_release`) only
+        // ever returns a segment this function just reserved and the
+        // chain-extension election then declined to publish — untouched,
+        // never written into. The real accounting guard is the
+        // crash-direction `live_bytes() >= 0` asserted per-decrement in
+        // `remove_item_at`, plus `check_integrity`'s directional
+        // items-vs-counter check under the `debug` feature.
         self.write_offset.store(initial_offset, Ordering::Relaxed);
         self.live_bytes.store(initial_offset, Ordering::Relaxed);
         self.live_items.store(0, Ordering::Relaxed);

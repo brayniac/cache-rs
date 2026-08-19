@@ -303,6 +303,12 @@ impl Segcache {
                     //   `Reserved` would likewise mean an entry a drain
                     //   never unlinked — issue #50's ABA class, not a
                     //   state this fallback can create.)
+                    //
+                    // The global `ITEM_CURRENT*` gauges are NOT skipped
+                    // with the decrement: `Segment::clear` settles them
+                    // for whatever is still counted when the segment is
+                    // finally drained (they have no recycle reset, so
+                    // the drift would otherwise be permanent).
                     let pin = self.segments.try_pin_remover(old_seg_id);
 
                     if self
@@ -569,7 +575,8 @@ impl Segcache {
             // get here) leaves a bounded over-count until that segment's
             // own eventual drain, conservative-direction only;
             // `AwaitingRelease` is unreachable, since `clear` unlinks
-            // every entry before condemn.
+            // every entry before condemn. The global `ITEM_CURRENT*`
+            // gauges are settled by `Segment::clear` either way.
             let pin = self.segments.try_pin_remover(old_seg_id);
 
             // Publish under the WriterPin: `reserved` is held across the
@@ -619,13 +626,15 @@ impl Segcache {
                 return Err(SegcacheError::Exists);
             }
 
-            // The entry is still at old_location: the exchange failed
-            // spuriously (a concurrent reader bumped the frequency bits
-            // in the packed slot mid-exchange). Reachable and
-            // load-bearing under `&self` — retry the exchange. This is
-            // the loop's ONLY remaining `continue`: since issue #49 the
-            // pin failure no longer loops, so every iteration after the
-            // first is a genuine lost-CAS retry, not a wait.
+            // The entry still resolves to old_location even though the
+            // exchange failed. Defensive only: `cas_location_at` retries
+            // in place across a reader's frequency-bump CAS and gives up
+            // only once the packed word no longer encodes `old_location`,
+            // so its `false` and the `Exists` arm just above should
+            // always coincide. Loop rather than assume it — and note this
+            // is the loop's only remaining `continue`, since issue #49 the
+            // pin failure no longer loops, so an iteration here is never a
+            // wait on another thread.
         }
     }
 

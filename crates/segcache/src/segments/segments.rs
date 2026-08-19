@@ -1862,6 +1862,17 @@ impl Segments {
                         {
                             ITEM_RELINK.increment();
                             ITEM_COMPACTED.increment();
+                            // The item MOVED, it did not die:
+                            // `remove_item_at` above already took it off
+                            // the live gauges, and the `dst.incr_*` calls
+                            // restore only the HEADER counters. Re-add it
+                            // here so the gauges stay in lockstep with the
+                            // headers — `Segment::copy_into` does the same
+                            // with its batched `ITEM_CURRENT.add`. Without
+                            // this the promotion silently under-counts the
+                            // live gauges, permanently.
+                            ITEM_CURRENT.increment();
+                            ITEM_CURRENT_BYTES.add(item_size as _);
                         }
                     }
                 }

@@ -1049,11 +1049,23 @@ impl MultiChoiceHashtable {
     /// - the slot holds a different key's entry that happens to have
     ///   landed there (bucket/slot indices are reused once vacated) — its
     ///   `location` is necessarily different from `old_location`, because
-    ///   `old_location` names a segment slot that stays claimed (a
-    ///   `WriterPin`/remover pin brackets the unlink and the segment
-    ///   decrement) until this exact CAS or its `cas_location` sibling
-    ///   resolves, so no other live entry can carry that same location
-    ///   value in the meantime;
+    ///   a location is only re-issued after its segment is drained and
+    ///   recycled, and a drain must win the unlink for every entry it
+    ///   reclaims (`Segment::clear`) before that can happen;
+    ///
+    ///   NOTE: this used to rest on the stronger claim that a remover pin
+    ///   always brackets the unlink + decrement. Since issue #49 that is
+    ///   no longer true — when `try_pin_remover` fails, `insert`'s replace
+    ///   arm and `replace_at` unlink through this CAS UNPINNED rather than
+    ///   wait on a segment a drain (or a merge) owns. The argument above
+    ///   is the one that survives, and it is weaker in exactly one way:
+    ///   without the pin, nothing excludes the full
+    ///   drain -> recycle -> re-reserve -> republish cycle completing
+    ///   inside a caller's lookup -> CAS window and re-issuing the same
+    ///   packed word for a different item. That is the no-generation ABA
+    ///   residual tracked as issue #50, which the unpinned paths (this
+    ///   one, the fresh-arm `raced_old` handling, and the rollback path)
+    ///   all share;
     /// - the same key was updated in place by a racing writer to a new
     ///   location — tag matches but `location` does not.
     ///

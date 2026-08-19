@@ -100,12 +100,28 @@ impl<'a> Segment<'a> {
             offset += item.size();
         }
 
-        if count != self.live_items() {
+        // DIRECTIONAL, not exact. `count` is what still resolves through the
+        // hashtable; `live_items` is what the header thinks it holds. An
+        // entry unlinked WITHOUT a remover pin (the accepted gap documented
+        // on `clear` — the fresh-arm `raced_old` path, the rollback path,
+        // `delete()`'s pin-fail arm, and issue #49's replace/cas fallback)
+        // stops resolving before anyone decrements, so `live_items > count`
+        // is expected and transient, and it is also the harmless direction:
+        // the segment merely looks fuller than it is. The corruption signal
+        // is the other way round — more items still reachable than the
+        // header admits to, i.e. a decrement that ran without an unlink, or
+        // a lost increment. (A truncated `write_offset` after `clear` cannot
+        // fake it either: the parse walks item-by-item from the segment
+        // start, so a short `max_offset` only ends the walk early — it never
+        // lands mid-item — which can only LOWER `count`.)
+        if count > self.live_items() {
             error!(
-                "seg: {} has mismatch between counted items: {} and header items: {}",
+                "seg: {} has {} items still reachable but a header count of {} \
+                 (excess: {}) — an unlink-free decrement or a lost increment",
                 self.id(),
                 count,
-                self.live_items()
+                self.live_items(),
+                count - self.live_items()
             );
             integrity = false;
         }
@@ -483,9 +499,10 @@ impl<'a> Segment<'a> {
         // in `Segcache::insert`'s fresh-key arm (a racing writer published
         // between the lookup miss and the hashtable upsert, resolved to a
         // replace under the stripe re-check) and the hashtable-full rollback
-        // path unlink an entry WITHOUT holding a remover pin — a narrow,
-        // ACCEPTED gap: if that item's segment is being cleared, it can be
-        // unlinked-but-not-yet-decremented while we sweep, so it is
+        // path unlink an entry WITHOUT holding a remover pin — as does the
+        // issue #49 replace/cas fallback, the widest of the three — a
+        // narrow, ACCEPTED gap: if that item's segment is being cleared, it
+        // can be unlinked-but-not-yet-decremented while we sweep, so it is
         // counted-yet-skipped and `live_items`/`live_bytes` may be transiently
         // over-counted. Not corruption (it self-heals when the segment is
         // recycled: `init()` resets the counters) — the drain owns the
@@ -494,6 +511,53 @@ impl<'a> Segment<'a> {
         // crash-direction (`live_bytes() >= 0`) is still asserted
         // per-decrement in `remove_item_at`. Reclaim uses the live counters, so
         // set write_offset to whatever remains.
+
+        // The GLOBAL item gauges do not get that free ride, though. An item
+        // enters them in `try_alloc_item` (up) and leaves in
+        // `remove_item_at` (down), in exact lockstep with
+        // `live_items`/`live_bytes`. Relocation is what makes that lockstep
+        // non-obvious and it is upheld deliberately: `copy_into` and
+        // `s3fifo_promote_from` both run `remove_item_at` on the source and
+        // then RE-ADD to the gauges what the destination's `incr_live_*`
+        // restores to the headers, so a move is gauge-neutral rather than a
+        // death. An unpinned unlink runs neither side, so the item simply
+        // stays counted in both. The header counters are reset wholesale at
+        // `try_reserve`, but a static Gauge has no recycle reset, so without
+        // this the skip would drift `ITEM_CURRENT`/`ITEM_CURRENT_BYTES`
+        // upward PERMANENTLY, once per occurrence.
+        //
+        // Settle it here instead of at the unlink: this is the single point
+        // every drain converges on, the residual is exactly this segment's
+        // contribution to the drift (lockstep, above), and — unlike the
+        // unlinking writer, which would have to parse the old item's header
+        // to learn its size while holding no pin against a concurrent
+        // recycle+reuse of those very bytes — the drain owns the segment and
+        // reads nothing racy. One subtraction, exactly once, covering every
+        // unpinned-unlink source rather than only #49's two.
+        #[cfg(feature = "metrics")]
+        {
+            let base = if cfg!(feature = "integrity") {
+                std::mem::size_of_val(&SEG_MAGIC) as i32
+            } else {
+                0
+            };
+            let residual_items = self.live_items();
+            // `decr_item` moves items and bytes together, so a non-zero
+            // item residual implies a non-zero byte residual — except
+            // under a #50 wrong-incarnation over-decrement, where bytes
+            // could already have gone negative. That is a bug in its own
+            // right, but clamping keeps it from becoming a SECOND one
+            // here: `Gauge::sub` of a negative would silently ADD.
+            let residual_bytes = (self.live_bytes() - base).max(0);
+            if residual_items > 0 {
+                // Mirrors `remove_item_at`'s block: live -> dead.
+                ITEM_CURRENT.sub(residual_items as _);
+                ITEM_CURRENT_BYTES.sub(residual_bytes as _);
+                ITEM_DEAD.add(residual_items as _);
+                ITEM_DEAD_BYTES.add(residual_bytes as _);
+            }
+        }
+
         self.set_write_offset(self.live_bytes());
     }
 }

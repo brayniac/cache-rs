@@ -321,8 +321,21 @@ impl Segments {
         assert!(seg_id.get() <= self.cap);
         let header = &self.headers[seg_id.get() as usize - 1];
 
-        if !header.try_acquire_reader() {
-            return None;
+        match header.try_acquire_reader() {
+            super::AcquireOutcome::Acquired => {}
+            super::AcquireOutcome::NotReadable => return None,
+            super::AcquireOutcome::ReleaseCondemned => {
+                // Backing the pin out left a condemned segment with no
+                // reader remaining, and this caller won its release.
+                self.return_segment(seg_id.get());
+
+                #[cfg(feature = "metrics")]
+                {
+                    SEGMENT_RETURN.increment();
+                    SEGMENT_FREE.increment();
+                }
+                return None;
+            }
         }
         // SAFETY: the acquire above succeeded, and both `headers` (a
         // boxed slice owned by `self`) and the boxed Injector outlive
@@ -926,13 +939,7 @@ impl Segments {
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 
-        let condemned = self.headers[id_idx].cas_metadata(
-            State::Draining,
-            State::AwaitingRelease,
-            Some(None),
-            Some(None),
-            Ordering::SeqCst,
-        );
+        let condemned = self.headers[id_idx].cas_condemn();
         debug_assert!(condemned, "condemned a segment that was not Draining");
 
         // Splice the neighbors using the captured links (this segment's

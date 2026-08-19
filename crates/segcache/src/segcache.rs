@@ -12,6 +12,98 @@ use std::cmp::min;
 
 const RESERVE_RETRIES: usize = 3;
 
+/// How many post-pin revalidation mismatches `get_pinned` tolerates before it
+/// reports a miss (#65).
+///
+/// A mismatch means another thread published a NEW location for this exact key
+/// between our pin and our revalidation, so every retry is paid for by real
+/// system-wide progress — the same termination argument `cas_location` and
+/// `try_unlink_in_bucket` rely on. That makes an UNBOUNDED loop lock-free but
+/// not starvation-free: unlike a drain (bounded, straight-line work that must
+/// finish), nothing bounds how long a stream of writers keeps rewriting a hot
+/// key, and this is the library's hottest path. So the loop keeps a hard cap.
+///
+/// The cap is its own constant rather than `RESERVE_RETRIES` because it bounds
+/// a different thing (concurrent republications of one key, not reservation
+/// attempts), and because 3 is far too tight: with retries that CONVERGE on
+/// the location the revalidation just returned, exhausting the budget needs 16
+/// consecutive republications each landing inside a pin+lookup window. At the
+/// ~1% per-attempt mismatch rate measured on the worst realistic workload
+/// (#65: one key rewritten by 24 oversubscribed `cas` threads while read) that
+/// is ~1e-32, versus ~1e-6 at 3 — while still capping a `get` at 16 pins.
+pub(crate) const REVALIDATE_RETRIES: usize = 16;
+
+/// Fault injection for `get_pinned`'s lookup/revalidate window. Compiled only
+/// under `feature = "fault-injection"`; a normal build has no trace of it.
+///
+/// The revalidation race is a two-thread interleaving that no unit test can
+/// schedule directly: a writer must republish the key in the window between a
+/// reader's lookup and its revalidation. These two hooks let a single-threaded
+/// test stand in for that writer at exactly the two points that matter, which
+/// is what makes the #65 coverage deterministic instead of a stress run.
+///
+/// - [`after_lookup`] fires after a FROM-SCRATCH lookup resolves a location.
+///   The converging retry loop does one of these per `get`, so a hook that
+///   republishes on every firing loops forever against the pre-#65 code (which
+///   re-looked-up on every attempt) and fires exactly once against this one.
+/// - [`before_revalidate`] fires after the pin, before the revalidation
+///   lookup — i.e. inside the window the retry budget exists to survive.
+#[cfg(feature = "fault-injection")]
+pub(crate) mod revalidation_fault {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Hook = Rc<dyn Fn()>;
+
+    thread_local! {
+        static AFTER_LOOKUP: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static BEFORE_REVALIDATE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Uninstalls both hooks when dropped, so a panicking test cannot leak one
+    /// into whatever else runs on this thread.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) struct HookGuard(());
+
+    #[cfg(all(test, not(feature = "loom")))]
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            AFTER_LOOKUP.with(|h| *h.borrow_mut() = None);
+            BEFORE_REVALIDATE.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn on_after_lookup(f: impl Fn() + 'static) -> HookGuard {
+        AFTER_LOOKUP.with(|h| *h.borrow_mut() = Some(Rc::new(f)));
+        HookGuard(())
+    }
+
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn on_before_revalidate(f: impl Fn() + 'static) -> HookGuard {
+        BEFORE_REVALIDATE.with(|h| *h.borrow_mut() = Some(Rc::new(f)));
+        HookGuard(())
+    }
+
+    // The hook is cloned out before it is called: the callback re-enters the
+    // cache (that is the point — it republishes the key), and a live
+    // `RefCell` borrow across that call would be a re-entrancy panic waiting
+    // for the first hook that also reads a hook.
+    #[inline]
+    pub(crate) fn after_lookup() {
+        if let Some(hook) = AFTER_LOOKUP.with(|h| h.borrow().clone()) {
+            hook();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn before_revalidate() {
+        if let Some(hook) = BEFORE_REVALIDATE.with(|h| h.borrow().clone()) {
+            hook();
+        }
+    }
+}
+
 /// A pre-allocated key-value store with eager expiration. It uses a
 /// segment-structured design that stores data in fixed-size segments, grouping
 /// objects with nearby expiration time into the same segment, and lifting most
@@ -117,57 +209,40 @@ impl Segcache {
     #[inline(always)]
     fn get_pinned(&self, key: &[u8], update_freq: bool) -> Option<Item> {
         let verifier = self.verifier();
-        let mut attempts = 0;
         let backoff = Backoff::new();
+        let mut attempts = 0;
+        let mut location = self.lookup_location(key, &verifier, update_freq)?;
         loop {
-            let (location, _freq) = if update_freq {
-                self.hashtable.lookup(key, &verifier)?
-            } else {
-                self.hashtable.lookup_no_freq_update(key, &verifier)?
-            };
             let (seg_id, offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id)?;
             let Some((raw, guard)) = self.segments.acquire_item_at(seg_id, offset) else {
-                // Reader pin failed: the segment is in a transient non-
-                // readable state — a drain owns it (Draining) or it is mid
-                // linking. Under merge eviction a drain RETAINS live items
-                // (they are relocated into the copy destination and
-                // republished), so an unreadable segment does NOT mean the
-                // key is gone: returning `None` here is a false miss — the
-                // key "reappears" once the merge publishes the relocation,
-                // breaking read-your-writes and the add/replace semantics
-                // built on a get. Retry the lookup instead (the same
-                // protocol as `numeric_update`): the owning drain is
-                // bounded, straight-line work that either republishes the
-                // item at a new location (the fresh lookup resolves there,
-                // in a readable segment) or removes the entry (the lookup
-                // returns `None` above and we exit). The retry is
-                // deliberately NOT counted against `attempts`: a drain
-                // window is far longer than a few spins, so a
-                // RESERVE_RETRIES-bounded retry would still report false
-                // misses. Termination relies on writers/drains never
-                // wedging — see the replace-vs-drain rollback in
-                // `insert`/`replace_at`, which guarantees drains cannot
-                // block forever on a writer pin.
-                backoff.snooze();
+                location =
+                    self.relookup_after_pin_failure(key, &verifier, update_freq, &backoff)?;
                 continue;
             };
+            #[cfg(feature = "fault-injection")]
+            revalidation_fault::before_revalidate();
             // Re-validate AFTER pinning (concurrent-write reader safety, item
             // 7f). Between the lookup and the pin, `location`'s segment can be
             // drained, recycled, and REUSED (a different item written at this
-            // offset), so `raw` may be an aliased/torn read. A fresh lookup only
-            // ever reads currently-published items — stale entries are removed
-            // from the hashtable BEFORE a segment is recycled — so it is safe
-            // and authoritative: if the key still resolves to this exact
-            // `location`, the (now pinned, hence un-recyclable) segment genuinely
-            // holds the item we want. If it no longer does, drop the pin and
-            // retry; give up after a few attempts (a key churning under us).
-            if self
+            // offset), so `raw` may be an aliased/torn read — the CI-caught bug
+            // this protocol exists to prevent was a reader handing back ANOTHER
+            // KEY'S VALUE, not a miss.
+            //
+            // A fresh hashtable lookup is the soundness argument. It only ever
+            // reads currently-published items — stale entries are removed from
+            // the hashtable BEFORE a segment is recycled — so it is
+            // authoritative in both directions: resolving to this exact
+            // `location` means the (now pinned, hence un-recyclable) segment
+            // genuinely holds the item we want, and resolving ELSEWHERE hands
+            // us a location that is itself currently published. See
+            // `follow_republished` for why following the second is the same
+            // argument rather than a weakening of it.
+            let current = self
                 .hashtable
                 .lookup_no_freq_update(key, &verifier)
-                .map(|(l, _)| l)
-                == Some(location)
-            {
+                .map(|(l, _)| l);
+            if current == Some(location) {
                 // Lazy expiry: an item past its segment deadline is treated
                 // as missing, matching memcached, even before the segment is
                 // reclaimed. The segment is pinned here, so its header's
@@ -182,11 +257,87 @@ impl Segcache {
                 return Some(Item::new(raw, cas, guard));
             }
             drop(guard);
-            attempts += 1;
-            if attempts >= RESERVE_RETRIES {
-                return None;
-            }
+            location = Self::follow_republished(current, &mut attempts)?;
         }
+    }
+
+    /// Resolve `key` to a location from scratch, honouring `update_freq`.
+    #[inline(always)]
+    fn lookup_location(
+        &self,
+        key: &[u8],
+        verifier: &SegmentsVerifier<'_>,
+        update_freq: bool,
+    ) -> Option<Location> {
+        let (location, _freq) = if update_freq {
+            self.hashtable.lookup(key, verifier)?
+        } else {
+            self.hashtable.lookup_no_freq_update(key, verifier)?
+        };
+        #[cfg(feature = "fault-injection")]
+        revalidation_fault::after_lookup();
+        Some(location)
+    }
+
+    /// The revalidation lookup disagreed with the pinned location: `current` is
+    /// where `key` is published NOW (or `None` if it is published nowhere).
+    ///
+    /// Pinning THAT rather than looking the key up again is what makes these
+    /// retries converge (#65). It is sound by the revalidation's own argument —
+    /// `current` came out of a fresh lookup, so it is currently published — and
+    /// it is not the rejected "trust the pinned location" shape: the next thing
+    /// that happens to it is another pin AND another full revalidation lookup.
+    ///
+    /// Before this, every attempt re-raced from scratch, and each attempt's
+    /// vulnerable window spanned lookup + pin + lookup; now it spans only
+    /// pin + lookup, and the second lookup per attempt is gone from the `get`
+    /// path entirely (a cost flagged as "optimize later" when 7f landed).
+    ///
+    /// `None` out means the `get` is over: either the key is genuinely
+    /// unpublished, or the budget is spent. Spending it is a false absent —
+    /// the key is live and we know where — but the alternative, spinning until
+    /// the writers stop, is a starvation hazard on the hottest path. The budget
+    /// picks the first, sized so that reaching it is not a rate anyone will
+    /// observe (see `REVALIDATE_RETRIES`).
+    #[cold]
+    #[inline(never)]
+    fn follow_republished(current: Option<Location>, attempts: &mut usize) -> Option<Location> {
+        *attempts += 1;
+        if *attempts >= REVALIDATE_RETRIES {
+            return None;
+        }
+        current
+    }
+
+    /// The reader pin failed: the segment is in a transient non-readable state
+    /// — a drain owns it (Draining) or it is mid linking.
+    ///
+    /// Under merge eviction a drain RETAINS live items (they are relocated into
+    /// the copy destination and republished), so an unreadable segment does NOT
+    /// mean the key is gone: returning `None` here is a false miss — the key
+    /// "reappears" once the merge publishes the relocation, breaking
+    /// read-your-writes and the add/replace semantics built on a get. Look the
+    /// key up again instead (the same protocol as `numeric_update`): the owning
+    /// drain is bounded, straight-line work that either republishes the item at
+    /// a new location (the fresh lookup resolves there, in a readable segment)
+    /// or removes the entry (the lookup returns `None` and we exit).
+    ///
+    /// This retry is deliberately NOT counted against the revalidation budget:
+    /// a drain window is far longer than a few spins, so a bounded retry would
+    /// still report false misses. Termination relies on writers/drains never
+    /// wedging — see the replace-vs-drain rollback in `insert`/`replace_at`,
+    /// which guarantees drains cannot block forever on a writer pin.
+    #[cold]
+    #[inline(never)]
+    fn relookup_after_pin_failure(
+        &self,
+        key: &[u8],
+        verifier: &SegmentsVerifier<'_>,
+        update_freq: bool,
+        backoff: &Backoff,
+    ) -> Option<Location> {
+        backoff.snooze();
+        self.lookup_location(key, verifier, update_freq)
     }
 
     /// Build the CAS token for an item: location + segment generation,

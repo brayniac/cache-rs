@@ -2708,4 +2708,144 @@ mod loom_tests {
             );
         });
     }
+
+    // =====================================================================
+    // Stale-location ABA on the read path
+    // =====================================================================
+
+    /// Location holding the key before the relocation.
+    const SRC: u64 = 0x1000;
+    /// Location the relocation moves it to.
+    const DST: u64 = 0x2000;
+
+    /// A stateful location -> key oracle, in place of the `AlwaysVerifier`
+    /// stub, that can model the one thing the stub cannot: **a location
+    /// whose bytes were rewritten under a reader**.
+    ///
+    /// This is the whole reason the bug is loom-visible. `KeyVerifier` is
+    /// already the boundary between the hashtable and storage, so a verifier
+    /// that answers "no, that location does not hold your key (any more)"
+    /// reproduces a finalized-and-recycled segment exactly, with no
+    /// production hook and nothing to compile out of release.
+    ///
+    /// The two validity flags are sequenced by the relocator thread in
+    /// production order — copy-then-publish-then-recycle — so the model
+    /// never manufactures a mismatch the real system could not produce:
+    /// `DST` becomes valid BEFORE the relink CAS, `SRC` becomes invalid
+    /// only AFTER it.
+    struct RecyclingOracle {
+        src_valid: AtomicU64,
+        dst_valid: AtomicU64,
+    }
+
+    impl RecyclingOracle {
+        fn new() -> Self {
+            Self {
+                src_valid: AtomicU64::new(1),
+                dst_valid: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl KeyVerifier for RecyclingOracle {
+        fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
+            if key != b"key" {
+                return false;
+            }
+            match location.as_raw() {
+                SRC => self.src_valid.load(Ordering::Acquire) == 1,
+                DST => self.dst_valid.load(Ordering::Acquire) == 1,
+                _ => false,
+            }
+        }
+    }
+
+    /// Exhaustive model of the stale-location ABA: a reader resolving a key
+    /// while a merge drain relocates it and the source segment is recycled
+    /// underneath.
+    ///
+    /// The key is never deleted — only moved — so `lookup` must return it in
+    /// EVERY interleaving. Without the read-path guard, the interleaving
+    /// where the reader loads the slot before the relink CAS and runs
+    /// `verify` after the recycle makes `verify` report "different key", the
+    /// scan concludes, and `lookup` answers `None`: a false absent for a
+    /// live key.
+    #[test]
+    fn loom_lookup_survives_relocation_and_recycle() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let oracle = Arc::new(RecyclingOracle::new());
+
+            ht.insert(b"key", Location::new(SRC), &*oracle)
+                .expect("seed insert");
+
+            let ht_reader = ht.clone();
+            let o_reader = oracle.clone();
+            let reader = thread::spawn(move || ht_reader.lookup(b"key", &*o_reader));
+
+            let ht_drain = ht.clone();
+            let o_drain = oracle.clone();
+            let drain = thread::spawn(move || {
+                // 1. Copy the item into the destination: its bytes are
+                //    valid there before anything points at them.
+                o_drain.dst_valid.store(1, Ordering::Release);
+                // 2. Publish the relocation (Segment::copy_into's relink).
+                assert!(
+                    ht_drain.cas_location(b"key", Location::new(SRC), Location::new(DST), true),
+                    "relink CAS must land: nothing else touches this entry"
+                );
+                // 3. The source segment is finalized, recycled, and
+                //    rewritten by another writer: SRC no longer holds it.
+                o_drain.src_valid.store(0, Ordering::Release);
+            });
+
+            let found = reader.join().unwrap();
+            drain.join().unwrap();
+
+            assert!(
+                found.is_some(),
+                "false absent: a relocation + recycle racing the key comparison \
+                 must not turn a live key into a miss (STALE-LOCATION INVARIANT)"
+            );
+            assert!(
+                ht.lookup(b"key", &*oracle).is_some(),
+                "the entry must still resolve once the drain has settled"
+            );
+        });
+    }
+
+    /// Same race, driven through `contains` — a different read helper
+    /// (`search_bucket_exists`) with its own copy of the scan loop.
+    #[test]
+    fn loom_contains_survives_relocation_and_recycle() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let oracle = Arc::new(RecyclingOracle::new());
+
+            ht.insert(b"key", Location::new(SRC), &*oracle)
+                .expect("seed insert");
+
+            let ht_reader = ht.clone();
+            let o_reader = oracle.clone();
+            let reader = thread::spawn(move || ht_reader.contains(b"key", &*o_reader));
+
+            let ht_drain = ht.clone();
+            let o_drain = oracle.clone();
+            let drain = thread::spawn(move || {
+                o_drain.dst_valid.store(1, Ordering::Release);
+                assert!(ht_drain.cas_location(
+                    b"key",
+                    Location::new(SRC),
+                    Location::new(DST),
+                    true
+                ));
+                o_drain.src_valid.store(0, Ordering::Release);
+            });
+
+            let found = reader.join().unwrap();
+            drain.join().unwrap();
+
+            assert!(found, "contains must not report a live key absent");
+        });
+    }
 }

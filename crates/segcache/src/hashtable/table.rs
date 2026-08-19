@@ -2917,4 +2917,170 @@ mod loom_tests {
             assert!(found, "contains must not report a live key absent");
         });
     }
+
+    // =====================================================================
+    // get_pinned's post-pin revalidation retry (#65)
+    // =====================================================================
+
+    /// The chain of locations one key is republished through: a full `set`
+    /// writes the item somewhere new and relinks the slot, so a key rewritten
+    /// N times walks N+1 locations.
+    const CHAIN: [u64; 3] = [0x1000, 0x2000, 0x3000];
+
+    /// A location -> key oracle for a key that is REPUBLISHED under a reader,
+    /// as opposed to `RecyclingOracle`'s single relocation.
+    ///
+    /// Each republication is sequenced in production order — the new bytes
+    /// exist before anything points at them, the old segment is recycled only
+    /// after the relink — so the model cannot manufacture a state the real
+    /// system could not reach.
+    struct ChurnOracle {
+        valid: [AtomicU64; CHAIN.len()],
+    }
+
+    impl ChurnOracle {
+        fn new() -> Self {
+            Self {
+                valid: [AtomicU64::new(1), AtomicU64::new(0), AtomicU64::new(0)],
+            }
+        }
+    }
+
+    impl KeyVerifier for ChurnOracle {
+        fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
+            if key != b"key" {
+                return false;
+            }
+            CHAIN
+                .iter()
+                .position(|&l| l == location.as_raw())
+                .is_some_and(|i| self.valid[i].load(Ordering::Acquire) == 1)
+        }
+    }
+
+    /// Exhaustive model of `get_pinned`'s revalidation retry against a key
+    /// being republished under it (#65).
+    ///
+    /// **Scope, stated plainly.** The reader below is a transcription of
+    /// `Segcache::get_pinned`'s retry loop, not a call into it: the pin
+    /// (`acquire_item_at`) reads `Segments`' mmap'd headers, which are not
+    /// loom types, so it cannot appear here. What IS real is the part this
+    /// issue is about — the hashtable operations, their interleaving with the
+    /// republications, and the budget constant itself, which is imported from
+    /// the production module so that changing it changes this model. The pin's
+    /// own failure and success paths are covered deterministically by
+    /// `pin_failure_tests` and `revalidation_tests`.
+    ///
+    /// Two assertions, for the two halves of the fix:
+    ///
+    /// - **no false absent.** Each mismatch costs the writer one republication,
+    ///   so a reader survives exactly as long as its budget exceeds the
+    ///   republications racing it. That is what the budget is *for*, and it is
+    ///   why the budget may not be three.
+    /// - **`lookups <= CHAIN.len() + 1`.** One from-scratch lookup, then one
+    ///   revalidation per attempt. This is the convergence property itself
+    ///   stated as a cost: re-resolving the key after a mismatch doubles the
+    ///   count, and that doubling is what the old budget was spent on.
+    ///
+    /// **Proven to fail, twice** (it is not a control test):
+    ///
+    /// - setting the production `REVALIDATE_RETRIES` to 2 makes loom find the
+    ///   interleaving where both republications land in a revalidation window:
+    ///   *"false absent: the key was republished 2 times and never removed..."*
+    /// - restoring the pre-#65 reader (re-resolve from scratch each attempt,
+    ///   budget 3) trips the lookup count instead: *"each retry must follow the
+    ///   location the revalidation already returned: 6 lookups for 2
+    ///   republications..."*
+    #[test]
+    fn loom_revalidation_retry_survives_republication() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let oracle = Arc::new(ChurnOracle::new());
+
+            ht.insert(b"key", Location::new(CHAIN[0]), &*oracle)
+                .expect("seed insert");
+
+            let ht_reader = ht.clone();
+            let o_reader = oracle.clone();
+            let reader = thread::spawn(move || {
+                // `get_pinned`: resolve the key once from scratch, then pin
+                // and re-validate, following the location the revalidation
+                // returns rather than looking the key up again. `lookups`
+                // counts every hashtable lookup the get performs — the
+                // convergence property is a statement about that count.
+                let mut lookups = 1;
+                let Some((mut location, _freq)) =
+                    ht_reader.lookup_no_freq_update(b"key", &*o_reader)
+                else {
+                    return (None, lookups);
+                };
+                let mut attempts = 0;
+                loop {
+                    // (pin `location` — see the scope note above)
+                    lookups += 1;
+                    match ht_reader
+                        .lookup_no_freq_update(b"key", &*o_reader)
+                        .map(|(l, _)| l)
+                    {
+                        Some(current) if current == location => return (Some(location), lookups),
+                        Some(current) => {
+                            attempts += 1;
+                            if attempts >= crate::segcache::REVALIDATE_RETRIES {
+                                return (None, lookups);
+                            }
+                            location = current;
+                        }
+                        None => return (None, lookups),
+                    }
+                }
+            });
+
+            let ht_writer = ht.clone();
+            let o_writer = oracle.clone();
+            let writer = thread::spawn(move || {
+                for i in 0..CHAIN.len() - 1 {
+                    // 1. The replacement item's bytes exist before anything
+                    //    points at them.
+                    o_writer.valid[i + 1].store(1, Ordering::Release);
+                    // 2. Publish it (insert's replace relink).
+                    assert!(
+                        ht_writer.cas_location(
+                            b"key",
+                            Location::new(CHAIN[i]),
+                            Location::new(CHAIN[i + 1]),
+                            true
+                        ),
+                        "relink CAS must land: nothing else touches this entry"
+                    );
+                    // 3. The superseded item's segment is recycled.
+                    o_writer.valid[i].store(0, Ordering::Release);
+                }
+            });
+
+            let (resolved, lookups) = reader.join().unwrap();
+            writer.join().unwrap();
+
+            // One from-scratch lookup, then one revalidation per attempt.
+            // Re-resolving the key after a mismatch — what the pre-#65 loop
+            // did — doubles this and is what the budget was being spent on.
+            assert!(
+                lookups <= CHAIN.len() + 1,
+                "each retry must follow the location the revalidation already \
+                 returned: {lookups} lookups for {} republications means an \
+                 attempt re-raced from scratch",
+                CHAIN.len() - 1
+            );
+            assert!(
+                resolved.is_some(),
+                "false absent: the key was republished {} times and never removed, \
+                 so every lookup could resolve it — a retry budget that is spent \
+                 re-racing from scratch turns that into a miss (#65)",
+                CHAIN.len() - 1
+            );
+            assert!(
+                ht.lookup(b"key", &*oracle).is_some(),
+                "the entry must still resolve once the writer has settled"
+            );
+        });
+    }
 }

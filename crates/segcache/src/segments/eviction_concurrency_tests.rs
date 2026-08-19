@@ -2129,3 +2129,84 @@ fn concurrent_fresh_insert_no_resurrection() {
         );
     }
 }
+
+/// Test 11 — issue #49: a replace whose old copy lives in a DRAIN-CLAIMED
+/// segment must not wait for the drain (the drain may be waiting on this
+/// writer's own `WriterPin` — same-segment or crossed — so waiting can
+/// deadlock). This test simulates the blocked drain deterministically:
+/// claim a sealed segment via `claim_for_drain_for_test` and never finalize
+/// it, then overwrite a key living in that segment. Pre-fix the insert spins
+/// forever in the `try_pin_remover` retry; post-fix it publishes via an
+/// unpinned slot swap (the decrement is skipped — the drain owns the
+/// segment's accounting) and returns promptly.
+#[test]
+#[ignore = "red until the #49 fix lands (next commit)"]
+fn replace_into_drain_claimed_segment_does_not_wedge() {
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
+
+    // Small segments so a handful of inserts fills and seals segment 1;
+    // a generous free pool so no eviction runs before the claim.
+    const SEGMENT_SIZE: i32 = 4096;
+    let cache = Segcache::builder()
+        .segment_size(SEGMENT_SIZE)
+        .heap_size(SEGMENT_SIZE as usize * 16)
+        .hash_power(12)
+        .build()
+        .expect("failed to build cache");
+    let cache = Arc::new(cache);
+
+    // The key under test goes in first, so its only copy lands in segment 1
+    // (segment ids are 1-based and the free queue hands them out in order).
+    cache
+        .insert(b"victim", b"old-value", None, Duration::ZERO)
+        .expect("seed insert");
+
+    // `claim_for_drain` only applies to a Sealed segment, and the tail seals
+    // when the chain extends — so insert fillers until the claim CAS wins.
+    let seg1 = NonZeroU32::new(1).unwrap();
+    let mut claimed = false;
+    for i in 0..10_000u32 {
+        let key = format!("filler-{i:06}");
+        let val = [0u8; 128];
+        cache
+            .insert(key.as_bytes(), &val[..], None, Duration::ZERO)
+            .expect("filler insert");
+        if cache.segments.claim_for_drain_for_test(seg1) {
+            claimed = true;
+            break;
+        }
+    }
+    assert!(
+        claimed,
+        "never managed to seal + claim segment 1 — adjust sizing"
+    );
+
+    // The drain is now "blocked": segment 1 is claimed and never finalized.
+    // Overwrite the victim from another thread, under a watchdog — pre-fix
+    // this wedges in the `try_pin_remover` retry loop.
+    let (tx, rx) = mpsc::channel();
+    let writer = Arc::clone(&cache);
+    std::thread::spawn(move || {
+        let r = writer.insert(b"victim", b"new-value", None, Duration::ZERO);
+        let _ = tx.send(r);
+    });
+
+    match rx.recv_timeout(StdDuration::from_secs(10)) {
+        Ok(r) => {
+            r.expect("replace into a drain-claimed segment must succeed");
+            let item = cache.get(b"victim").expect("victim must resolve");
+            assert_value_eq(
+                item.value(),
+                b"new-value",
+                "replace must have published the new value",
+            );
+        }
+        Err(_) => panic!(
+            "issue #49 deadlock: replace wedged waiting on a drain-claimed \
+             segment (the spinning thread is leaked; the test harness will \
+             reap it at process exit)"
+        ),
+    }
+}

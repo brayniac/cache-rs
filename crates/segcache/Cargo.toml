@@ -35,7 +35,11 @@ ahash = { workspace = true }
 clocksource = { workspace = true }
 crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
-keyvalue = { workspace = true, features = [] }
+# keyvalue's `integrity` is REQUIRED (not merely defaulted): the cas
+# publish path serializes on the numeric item's seqlock writer lock
+# (`lock_numeric_version`), which only excludes numeric writers when they
+# take that lock — i.e. under keyvalue/integrity.
+keyvalue = { workspace = true, features = ["integrity"] }
 log = { workspace = true }
 metriken = { workspace = true, optional = true }
 rand = { workspace = true, features = ["sys_rng"] }

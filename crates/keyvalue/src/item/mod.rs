@@ -36,6 +36,8 @@ pub fn item_size(klen: usize, value: &crate::Value, olen: usize) -> usize {
 }
 
 pub use header::{ItemHeader, ITEM_HDR_SIZE};
+#[cfg(feature = "integrity")]
+pub use raw::NumericVersionGuard;
 pub use raw::RawItem;
 
 /// Trait for zero-copy read access to a cache item's data.

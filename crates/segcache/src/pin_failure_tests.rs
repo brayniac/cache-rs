@@ -818,18 +818,27 @@ fn merge_churn_no_false_miss_no_resurrection() {
                     }
                     // Miss: poll — a false miss reappears once the merge
                     // republishes the relocated item.
-                    let mut reappeared = false;
-                    for _ in 0..1000 {
+                    //
+                    // Two distinct bugs land here — a drain window the reader
+                    // failed to pin through, and a stale-location ABA on the
+                    // hashtable's own key verification — so the panic names
+                    // both and carries how many polls the key took to come
+                    // back: a rescued-immediately (0-1 polls) reappearance
+                    // points at the verify path, a long one at a drain.
+                    let mut reappeared_after = None;
+                    for i in 0..1000 {
                         if cache.get(k.as_bytes()).is_some() {
-                            reappeared = true;
+                            reappeared_after = Some(i);
                             break;
                         }
                         std::thread::yield_now();
                     }
-                    assert!(
-                        !reappeared,
-                        "hot key {k} reappeared after a miss: false miss during a merge drain"
-                    );
+                    if let Some(polls) = reappeared_after {
+                        panic!(
+                            "hot key {k} reappeared after {polls} poll(s): false miss \
+                             (drain window or stale-location verify)"
+                        );
+                    }
                     // Genuinely evicted: reinstall (this thread owns hot keys).
                     let _ = cache.insert(k.as_bytes(), b"Vhot000", None, ttl);
                 }

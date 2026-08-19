@@ -118,6 +118,7 @@ impl Segcache {
     fn get_pinned(&self, key: &[u8], update_freq: bool) -> Option<Item> {
         let verifier = self.verifier();
         let mut attempts = 0;
+        let backoff = Backoff::new();
         loop {
             let (location, _freq) = if update_freq {
                 self.hashtable.lookup(key, &verifier)?
@@ -126,7 +127,31 @@ impl Segcache {
             };
             let (seg_id, offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id)?;
-            let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
+            let Some((raw, guard)) = self.segments.acquire_item_at(seg_id, offset) else {
+                // Reader pin failed: the segment is in a transient non-
+                // readable state — a drain owns it (Draining) or it is mid
+                // linking. Under merge eviction a drain RETAINS live items
+                // (they are relocated into the copy destination and
+                // republished), so an unreadable segment does NOT mean the
+                // key is gone: returning `None` here is a false miss — the
+                // key "reappears" once the merge publishes the relocation,
+                // breaking read-your-writes and the add/replace semantics
+                // built on a get. Retry the lookup instead (the same
+                // protocol as `numeric_update`): the owning drain is
+                // bounded, straight-line work that either republishes the
+                // item at a new location (the fresh lookup resolves there,
+                // in a readable segment) or removes the entry (the lookup
+                // returns `None` above and we exit). The retry is
+                // deliberately NOT counted against `attempts`: a drain
+                // window is far longer than a few spins, so a
+                // RESERVE_RETRIES-bounded retry would still report false
+                // misses. Termination relies on writers/drains never
+                // wedging — see the replace-vs-drain rollback in
+                // `insert`/`replace_at`, which guarantees drains cannot
+                // block forever on a writer pin.
+                backoff.snooze();
+                continue;
+            };
             // Re-validate AFTER pinning (concurrent-write reader safety, item
             // 7f). Between the lookup and the pin, `location`'s segment can be
             // drained, recycled, and REUSED (a different item written at this
@@ -221,148 +246,189 @@ impl Segcache {
 
         let ttl = Self::coarse_ttl(ttl);
 
-        let reserved = self.reserve_and_define(key, value, optional, ttl)?;
+        // The whole reserve→publish operation restarts (fresh reservation)
+        // when publishing would deadlock against a drain of the reservation's
+        // own segment — see the replace arm's pin-failure handler below.
+        'operation: loop {
+            // `Value` is a borrowed enum without `Copy`; re-borrow it for this
+            // attempt so a restart can consume it again.
+            let attempt_value = match &value {
+                Value::Bytes(b) => Value::Bytes(b),
+                Value::U64(v) => Value::U64(*v),
+            };
+            let reserved = self.reserve_and_define(key, attempt_value, optional, ttl)?;
 
-        let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
-        let (new_seg, new_offset) = (reserved.seg(), reserved.offset());
-        let verifier = self.verifier();
+            let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
+            let (new_seg, new_offset) = (reserved.seg(), reserved.offset());
+            let verifier = self.verifier();
 
-        // Publish under the pin: `reserved` (and its WriterPin) is held across
-        // the hashtable op(s) below so a concurrent drain cannot recycle the
-        // segment between define and publish (item 7d, H2). It is dropped the
-        // instant publish succeeds, on every path below, BEFORE any
-        // `remove_at` — which can take a bucket `chain_lock` (empty-segment
-        // drain / merge-compact) and would deadlock a drainer that waits on
-        // `active_writers` WHILE holding that same `chain_lock` (lock-order
-        // inversion). Invariant: never hold a WriterPin across a `chain_lock`
-        // acquisition.
-        //
-        // Replace is now "lookup -> pinned cas_location-replace, else
-        // insert-if-absent" rather than one atomic hashtable upsert (item 7f,
-        // F2): the old item's location must be known BEFORE it is unlinked so
-        // its segment can be pinned (`try_pin_remover`) across the unlink AND
-        // the `remove_at` decrement — closing the window where a concurrent
-        // eviction drain of that segment could interleave with the decrement.
-        //
-        // `lookup_slot` (item 7f perf follow-up) returns the slot the old
-        // entry was found in alongside its location, so the publish below
-        // uses `cas_location_at` to CAS that exact slot directly instead of
-        // `cas_location` re-probing the key's candidate buckets from
-        // scratch — the hashtable does one hash per op regardless, so this
-        // only elides the redundant second bucket scan/verify.
-        let backoff = Backoff::new();
-        loop {
-            match self.hashtable.lookup_slot(key, &verifier) {
-                Some((old_location, slot)) => {
-                    if old_location == new_location {
-                        // Already published (a prior loop iteration's
-                        // fresh-key upsert below raced another insert of this
-                        // same reservation) — nothing left to unlink/decrement.
-                        return Ok(());
-                    }
-
-                    let (old_seg_raw, old_offset) = unpack_location(old_location);
-                    let Some(old_seg_id) = NonZeroU32::new(old_seg_raw) else {
-                        // Not expected — `lookup_slot` only returns real
-                        // (non-ghost) entries — but stay defensive and fall
-                        // through to the same rollback used below.
-                        break;
-                    };
-
-                    // Pin the OLD item's segment BEFORE unlinking it (item
-                    // 7f). If a drain has already claimed the segment, it
-                    // owns the item's removal — bail and retry the lookup.
-                    let Some(pin) = self.segments.try_pin_remover(old_seg_id) else {
-                        backoff.snooze();
-                        continue;
-                    };
-
-                    if self
-                        .hashtable
-                        .cas_location_at(slot, old_location, new_location, true)
-                    {
-                        #[cfg(feature = "metrics")]
-                        ITEM_REPLACE.increment();
-
-                        drop(reserved);
-                        let _ = self.segments.remove_at(
-                            old_seg_id,
-                            old_offset,
-                            &self.ttl_buckets,
-                            &self.hashtable,
-                            pin,
-                        );
-                        return Ok(());
-                    }
-
-                    // Lost the unlink race — release the pin and retry.
-                    drop(pin);
-                }
-                None => {
-                    // Fresh key: `hashtable.insert()` is an atomic upsert
-                    // whose entry CREATION is serialized per key-hash
-                    // stripe (table.rs), so concurrent fresh inserts of
-                    // one key can never publish duplicate entries. If a
-                    // racing writer published this key between our
-                    // `lookup_slot` miss and here, our call resolves to a
-                    // replace under the stripe's re-check and returns the
-                    // racer's location as `Ok(Some(raced_old))` — that
-                    // racer's segment accounting is then ours to
-                    // decrement, with the unlink already done by the call
-                    // above rather than by a pin-first `cas_location` (a
-                    // narrow, accepted gap: if a drain claims that
-                    // segment between the unlink and the pin attempt
-                    // below, the pin fails and the drain owns the
-                    // segment's accounting wholesale). The same gap has a
-                    // second face: the pin can also SUCCEED on a
-                    // recycled-and-reused incarnation of that segment id,
-                    // because a `Location` carries no generation — the
-                    // decrement then lands on the wrong incarnation.
-                    // Same accepted class, tracked as a follow-up
-                    // (generation-tagged locations).
-                    match self
-                        .hashtable
-                        .insert(reserved.item().key(), new_location, &verifier)
-                    {
-                        Ok(None) => {
-                            #[cfg(feature = "metrics")]
-                            HASH_INSERT.increment();
+            // Publish under the pin: `reserved` (and its WriterPin) is held across
+            // the hashtable op(s) below so a concurrent drain cannot recycle the
+            // segment between define and publish (item 7d, H2). It is dropped the
+            // instant publish succeeds, on every path below, BEFORE any
+            // `remove_at` — which can take a bucket `chain_lock` (empty-segment
+            // drain / merge-compact) and would deadlock a drainer that waits on
+            // `active_writers` WHILE holding that same `chain_lock` (lock-order
+            // inversion). Invariant: never hold a WriterPin across a `chain_lock`
+            // acquisition.
+            //
+            // Replace is now "lookup -> pinned cas_location-replace, else
+            // insert-if-absent" rather than one atomic hashtable upsert (item 7f,
+            // F2): the old item's location must be known BEFORE it is unlinked so
+            // its segment can be pinned (`try_pin_remover`) across the unlink AND
+            // the `remove_at` decrement — closing the window where a concurrent
+            // eviction drain of that segment could interleave with the decrement.
+            //
+            // `lookup_slot` (item 7f perf follow-up) returns the slot the old
+            // entry was found in alongside its location, so the publish below
+            // uses `cas_location_at` to CAS that exact slot directly instead of
+            // `cas_location` re-probing the key's candidate buckets from
+            // scratch — the hashtable does one hash per op regardless, so this
+            // only elides the redundant second bucket scan/verify.
+            let backoff = Backoff::new();
+            loop {
+                match self.hashtable.lookup_slot(key, &verifier) {
+                    Some((old_location, slot)) => {
+                        if old_location == new_location {
+                            // Already published (a prior loop iteration's
+                            // fresh-key upsert below raced another insert of this
+                            // same reservation) — nothing left to unlink/decrement.
                             return Ok(());
                         }
-                        Ok(Some(raced_old)) => {
-                            #[cfg(feature = "metrics")]
-                            HASH_INSERT.increment();
-                            drop(reserved);
-                            let (raced_seg, raced_offset) = unpack_location(raced_old);
-                            if let Some(raced_seg) = NonZeroU32::new(raced_seg) {
-                                if let Some(pin) = self.segments.try_pin_remover(raced_seg) {
-                                    let _ = self.segments.remove_at(
-                                        raced_seg,
-                                        raced_offset,
-                                        &self.ttl_buckets,
-                                        &self.hashtable,
-                                        pin,
-                                    );
-                                }
+
+                        let (old_seg_raw, old_offset) = unpack_location(old_location);
+                        let Some(old_seg_id) = NonZeroU32::new(old_seg_raw) else {
+                            // Not expected — `lookup_slot` only returns real
+                            // (non-ghost) entries — but stay defensive and fall
+                            // through to the same rollback used below.
+                            break;
+                        };
+
+                        // Pin the OLD item's segment BEFORE unlinking it (item
+                        // 7f). If a drain has already claimed the segment, the
+                        // drain owns the item's removal; how to wait for it
+                        // depends on WHICH segment it is:
+                        //
+                        // - `old_seg_id == new_seg` (common: the old value and
+                        //   our new reservation co-locate in the Live tail —
+                        //   e.g. a re-set of a recently written key): the drain
+                        //   that claimed the segment is now waiting for
+                        //   `active_writers == 0`, i.e. for the WriterPin held
+                        //   inside `reserved`. It can never sweep the old entry
+                        //   while we hold that pin, so a spin-and-relookup here
+                        //   NEVER resolves — both threads wedge at 100% CPU
+                        //   (and the drainer holds the bucket `chain_lock`,
+                        //   wedging every writer of the TTL bucket). Roll the
+                        //   reservation back — dropping the WriterPin unblocks
+                        //   the drain — and restart the whole operation; the
+                        //   retry reserves in a fresh tail because this segment
+                        //   is no longer writable.
+                        //
+                        // - `old_seg_id != new_seg`: that drain is not waiting
+                        //   on OUR pin and normally finishes on its own, so a
+                        //   brief spin-and-relookup is productive (the entry is
+                        //   swept or republished elsewhere). But it can be
+                        //   waiting on ANOTHER writer's pin whose owner is
+                        //   symmetrically blocked on a drain of OUR segment (a
+                        //   cross-thread cycle), so the spin is bounded: once
+                        //   the backoff is exhausted, roll back and restart
+                        //   here too — releasing our pin breaks any such cycle.
+                        let Some(pin) = self.segments.try_pin_remover(old_seg_id) else {
+                            if old_seg_id == new_seg || backoff.is_completed() {
+                                self.rollback_reservation(reserved, new_seg, new_offset);
+                                continue 'operation;
                             }
+                            backoff.snooze();
+                            continue;
+                        };
+
+                        if self
+                            .hashtable
+                            .cas_location_at(slot, old_location, new_location, true)
+                        {
+                            #[cfg(feature = "metrics")]
+                            ITEM_REPLACE.increment();
+
+                            drop(reserved);
+                            let _ = self.segments.remove_at(
+                                old_seg_id,
+                                old_offset,
+                                &self.ttl_buckets,
+                                &self.hashtable,
+                                pin,
+                            );
                             return Ok(());
                         }
-                        Err(()) => {
-                            // Hashtable full — roll back the (unpublished)
-                            // reservation.
-                            #[cfg(feature = "metrics")]
-                            HASH_INSERT_EX.increment();
-                            self.rollback_reservation(reserved, new_seg, new_offset);
-                            return Err(SegcacheError::HashTableInsertEx);
+
+                        // Lost the unlink race — release the pin and retry.
+                        drop(pin);
+                    }
+                    None => {
+                        // Fresh key: `hashtable.insert()` is an atomic upsert
+                        // whose entry CREATION is serialized per key-hash
+                        // stripe (table.rs), so concurrent fresh inserts of
+                        // one key can never publish duplicate entries. If a
+                        // racing writer published this key between our
+                        // `lookup_slot` miss and here, our call resolves to a
+                        // replace under the stripe's re-check and returns the
+                        // racer's location as `Ok(Some(raced_old))` — that
+                        // racer's segment accounting is then ours to
+                        // decrement, with the unlink already done by the call
+                        // above rather than by a pin-first `cas_location` (a
+                        // narrow, accepted gap: if a drain claims that
+                        // segment between the unlink and the pin attempt
+                        // below, the pin fails and the drain owns the
+                        // segment's accounting wholesale). The same gap has a
+                        // second face: the pin can also SUCCEED on a
+                        // recycled-and-reused incarnation of that segment id,
+                        // because a `Location` carries no generation — the
+                        // decrement then lands on the wrong incarnation.
+                        // Same accepted class, tracked as a follow-up
+                        // (generation-tagged locations).
+                        match self
+                            .hashtable
+                            .insert(reserved.item().key(), new_location, &verifier)
+                        {
+                            Ok(None) => {
+                                #[cfg(feature = "metrics")]
+                                HASH_INSERT.increment();
+                                return Ok(());
+                            }
+                            Ok(Some(raced_old)) => {
+                                #[cfg(feature = "metrics")]
+                                HASH_INSERT.increment();
+                                drop(reserved);
+                                let (raced_seg, raced_offset) = unpack_location(raced_old);
+                                if let Some(raced_seg) = NonZeroU32::new(raced_seg) {
+                                    if let Some(pin) = self.segments.try_pin_remover(raced_seg) {
+                                        let _ = self.segments.remove_at(
+                                            raced_seg,
+                                            raced_offset,
+                                            &self.ttl_buckets,
+                                            &self.hashtable,
+                                            pin,
+                                        );
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            Err(()) => {
+                                // Hashtable full — roll back the (unpublished)
+                                // reservation.
+                                #[cfg(feature = "metrics")]
+                                HASH_INSERT_EX.increment();
+                                self.rollback_reservation(reserved, new_seg, new_offset);
+                                return Err(SegcacheError::HashTableInsertEx);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Defensive fallback for the "invalid old location" break above.
-        self.rollback_reservation(reserved, new_seg, new_offset);
-        Err(SegcacheError::HashTableInsertEx)
+            // Defensive fallback for the "invalid old location" break above.
+            self.rollback_reservation(reserved, new_seg, new_offset);
+            return Err(SegcacheError::HashTableInsertEx);
+        }
     }
 
     /// Roll back an unpublished reservation: release its `WriterPin` (item
@@ -525,9 +591,36 @@ impl Segcache {
             // has already claimed the segment, check whether the entry still
             // resolves to `old_location`: if not, it was already moved or
             // removed — roll back and report `Exists` (same as the
-            // post-CAS-failure check below); if it does, the drain claimed
-            // the segment but has not yet drained this hashtable entry —
-            // retry until it does.
+            // post-CAS-failure check below). If it does, the drain claimed
+            // the segment but has not yet drained this hashtable entry;
+            // whether waiting can ever succeed depends on WHICH segment it
+            // is (the same deadlock analysis as `insert`'s replace arm):
+            //
+            // - `old_seg_id == new_seg` (the checked item and our new
+            //   reservation co-locate in the Live tail): the drain is
+            //   waiting for the WriterPin held inside `reserved`, so it can
+            //   never sweep the entry while we spin — a guaranteed
+            //   two-thread wedge. Roll back (releasing the pin unblocks the
+            //   drain) and fail safe with `Exists`: the caller's token is
+            //   about to be invalidated anyway (tokens encode location +
+            //   generation, and the drain relocates or removes the item),
+            //   so a retry through get-then-cas observes the settled state.
+            //   This mirrors delete's drain-owns-the-segment reasoning.
+            //
+            // - `old_seg_id != new_seg`: the drain is not waiting on OUR
+            //   pin and normally finishes on its own — spin briefly. The
+            //   spin is still bounded (cross-thread pin cycles, see
+            //   `insert`): once the backoff is exhausted, roll back and
+            //   fail safe with `Exists` as well. The bound also covers the
+            //   `Relinking` case (the checked item lives in a mid-fill
+            //   merge/promotion DESTINATION): pre-fix the spin waited for
+            //   `publish_dest_sealed` and then succeeded, but that wait is
+            //   not deadlock-free — the fill's owner can simultaneously be
+            //   claiming OUR (concurrently sealed) reservation segment and
+            //   waiting on our WriterPin — so a fill longer than the
+            //   backoff now surfaces as a spurious-but-safe `Exists` on an
+            //   unmodified token; a get-then-cas retry succeeds once the
+            //   fill seals.
             let pin = match self.segments.try_pin_remover(old_seg_id) {
                 Some(pin) => pin,
                 None => {
@@ -535,6 +628,8 @@ impl Segcache {
                         .hashtable
                         .get_item_frequency(key, old_location)
                         .is_none()
+                        || old_seg_id == new_seg
+                        || backoff.is_completed()
                     {
                         self.rollback_reservation(reserved, new_seg, new_offset);
                         return Err(SegcacheError::Exists);
@@ -735,59 +830,129 @@ impl Segcache {
     /// ```
     // TODO(bmartin): a result would be better here
     pub fn delete(&self, key: &[u8]) -> bool {
-        // Look up the item to get its location
         let verifier = self.verifier();
-        let (location, _freq) = match self.hashtable.lookup_no_freq_update(key, &verifier) {
-            Some(result) => result,
-            None => return false,
-        };
+        let backoff = Backoff::new();
+        loop {
+            // Look up the item to get its location
+            let (location, _freq) = match self.hashtable.lookup_no_freq_update(key, &verifier) {
+                Some(result) => result,
+                None => return false,
+            };
 
-        let (seg_id, offset) = unpack_location(location);
-        let Some(seg_id) = NonZeroU32::new(seg_id) else {
-            // Not expected — `lookup_no_freq_update` only returns real
-            // (non-ghost) entries — but stay defensive: nothing to pin.
-            return self.hashtable.remove(key, location);
-        };
+            let (seg_id, offset) = unpack_location(location);
+            let Some(seg_id) = NonZeroU32::new(seg_id) else {
+                // Not expected — `lookup_no_freq_update` only returns real
+                // (non-ghost) entries — but stay defensive: nothing to pin.
+                return self.hashtable.remove(key, location);
+            };
 
-        // Lazy expiry: DELETE on an expired key reports NOT_FOUND (false),
-        // matching memcached, even before the segment is reclaimed. The
-        // stale hashtable entry is left for expire()/eviction pressure to
-        // sweep.
-        if self.remaining_ttl(seg_id).is_err() {
-            return false;
-        }
+            // Capture the segment generation before anything else: the
+            // unpinned-unlink path below uses it to detect a recycle of
+            // `seg_id` between this lookup and its remove (see the ABA note
+            // there).
+            let observed_gen = self.segments.generation(seg_id);
 
-        // Pin the item's segment BEFORE unlinking it (item 7f): the pin
-        // brackets both the hashtable unlink below and the `remove_at`
-        // decrement, so a concurrent drain of this segment cannot interleave
-        // with the decrement. If a drain has already claimed the segment, it
-        // owns this item's removal — the key is going away either way (the
-        // drain's own hashtable sweep will unlink it), so report success.
-        let Some(pin) = self.segments.try_pin_remover(seg_id) else {
+            // Lazy expiry: DELETE on an expired key reports NOT_FOUND (false),
+            // matching memcached, even before the segment is reclaimed. The
+            // stale hashtable entry is left for expire()/eviction pressure to
+            // sweep.
+            if self.remaining_ttl(seg_id).is_err() {
+                return false;
+            }
+
+            // Pin the item's segment BEFORE unlinking it (item 7f): the pin
+            // brackets both the hashtable unlink below and the `remove_at`
+            // decrement, so a concurrent drain of this segment cannot
+            // interleave with the decrement.
+            //
+            // If the pin FAILS, the segment is Draining (a drain owns it) or
+            // Relinking (a merge/promotion copy destination mid-fill). The
+            // delete must still unlink the hashtable entry itself: a merge
+            // drain RETAINS live items — `copy_into` relocates every item
+            // still present in the hashtable — and a Relinking destination is
+            // never swept at all, so "the drain will remove it" does NOT
+            // hold; an acked delete that leaves the entry behind resurrects.
+            //
+            // Doing the unlink WITHOUT the pin is safe: `hashtable.remove`
+            // only CASes the hashtable slot — it touches neither segment
+            // bytes nor the live-item/live-byte counters, so it cannot race
+            // the drain's exclusive access to the segment. What is skipped is
+            // only `remove_at`'s accounting decrement: the segment's owner
+            // covers it — every parse path (`clear`, `prune`, `copy_into`,
+            // `s3fifo_promote_from`) consults `get_item_frequency` and treats
+            // the unlinked item as dead (no relocation, no double remove),
+            // and the counters are reset wholesale when the segment is
+            // recycled/re-reserved (`reset_write_stats`), the same accepted
+            // transient over-count documented in `Segment::clear` (item 7f). If the unlink races `copy_into`
+            // after its liveness check, the relink CAS simply fails and the
+            // copy aborts — an eviction-legal drop, not corruption.
+            //
+            // ABA guard: `location` is (segment, offset) with NO generation,
+            // and `hashtable.remove` matches (tag, location) without
+            // re-verifying key bytes — the pinned path below is exempt only
+            // because its pin freezes the segment against recycling (the
+            // location-uniqueness precondition documented on
+            // `cas_location_at`). Unpinned, the segment could have been
+            // drained, recycled, and refilled since the lookup, with a
+            // colliding-tag key freshly written at this exact offset. Two
+            // defenses: (1) refuse the unpinned unlink when the generation
+            // moved since the lookup — the entry is stale either way; (2)
+            // after a successful unlink, re-verify the key stopped
+            // resolving, retrying if it did not — so an acked delete NEVER
+            // leaves the key reachable (a retry against a concurrent
+            // re-insert deletes the newer value: a legal linearization of
+            // concurrent set+delete). The residual window (generation load
+            // to remove-CAS) requires a full drain+recycle+refill+publish
+            // plus a 12-bit tag collision in an overlapping bucket to land
+            // within a few instructions; its worst case is a spurious
+            // unlink of ONE colliding key — observably an eviction, which a
+            // cache may always perform — never corruption (the unlink
+            // touches no segment state).
+            let Some(pin) = self.segments.try_pin_remover(seg_id) else {
+                if self.segments.generation(seg_id) == observed_gen
+                    && self.hashtable.remove(key, location)
+                    && self
+                        .hashtable
+                        .lookup_no_freq_update(key, &verifier)
+                        .is_none()
+                {
+                    #[cfg(feature = "metrics")]
+                    {
+                        HASH_REMOVE.increment();
+                        ITEM_DELETE.increment();
+                    }
+                    return true;
+                }
+                // The entry moved (a merge republished it elsewhere), was
+                // removed concurrently, or the key still resolves after the
+                // unlink — retry from the lookup, which resolves the fresh
+                // location or reports the key gone.
+                backoff.snooze();
+                continue;
+            };
+
+            // Remove from hashtable
+            if !self.hashtable.remove(key, location) {
+                drop(pin);
+                return false;
+            }
+
+            #[cfg(feature = "metrics")]
+            {
+                HASH_REMOVE.increment();
+                ITEM_DELETE.increment();
+            }
+
+            // Remove from segment
+            if let Some(mut item) = self.segments.get_item_at(Some(seg_id), offset) {
+                item.set_deleted(true);
+            }
+            let _ =
+                self.segments
+                    .remove_at(seg_id, offset, &self.ttl_buckets, &self.hashtable, pin);
+
             return true;
-        };
-
-        // Remove from hashtable
-        if !self.hashtable.remove(key, location) {
-            drop(pin);
-            return false;
         }
-
-        #[cfg(feature = "metrics")]
-        {
-            HASH_REMOVE.increment();
-            ITEM_DELETE.increment();
-        }
-
-        // Remove from segment
-        if let Some(mut item) = self.segments.get_item_at(Some(seg_id), offset) {
-            item.set_deleted(true);
-        }
-        let _ = self
-            .segments
-            .remove_at(seg_id, offset, &self.ttl_buckets, &self.hashtable, pin);
-
-        true
     }
 
     /// Loops through the TTL Buckets to handle eager expiration, returns the

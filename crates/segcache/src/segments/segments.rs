@@ -811,6 +811,17 @@ impl Segments {
             // verifier reads, never while holding or waiting on anything
             // here. The snooze yields after a short spin so a descheduled
             // pin holder gets CPU on an oversubscribed host.
+            //
+            // Termination rests on a global rule (issue #49): a WRITER
+            // NEVER WAITS ON A SEGMENT IT CANNOT PIN. `insert`'s replace
+            // arm and `replace_at` fall through to an unpinned slot swap
+            // when `try_pin_remover` fails, and `delete` walks away — so
+            // no counted writer can be parked on a `Draining` segment,
+            // including this one (the same-segment case, where its own
+            // reservation lives in the segment we just claimed). A
+            // counted writer therefore always runs publish -> unpin,
+            // waiting on nothing a drain holds except that leaf mutex,
+            // and this loop drains.
             let backoff = Backoff::new();
             while self.headers[id_idx].active_writers() != 0 {
                 backoff.snooze();

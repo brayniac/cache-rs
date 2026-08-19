@@ -261,6 +261,11 @@ impl SegmentHeader {
         // pin-fail arm, and (issue #49) the replace/cas unpinned fallback
         // all unlink unpinned by design. Not corruption, never an
         // under-count, and the stores below ARE the wholesale reset.
+        // The unpinned unlink does not have to race THIS segment's own
+        // drain, either: an old copy sitting in a `Relinking` merge
+        // destination is also unpinnable, and that skipped decrement
+        // simply rides along until the destination is drained in turn —
+        // arriving here the same way, one drain later.
         //
         // What DOES hold on every path into a Free segment is that the two
         // counters agree, so assert that instead — it still catches wild

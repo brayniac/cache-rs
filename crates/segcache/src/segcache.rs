@@ -283,6 +283,26 @@ impl Segcache {
                     // accepted-gap semantics as `delete()`'s pin-fail arm
                     // and the fresh-arm raced_old path; the no-generation
                     // ABA residual is issue #50's class.
+                    //
+                    // Which state we fell through on decides how long the
+                    // skipped decrement is visible (`try_pin_remover`
+                    // accepts only `Live | Sealed`):
+                    // - `Draining` — a drain owns the segment; its
+                    //   `clear` + recycle reset the counters wholesale,
+                    //   so the gap closes almost immediately.
+                    // - `Relinking` — a merge DESTINATION mid-fill; no
+                    //   drain owns it, so the skip persists as a bounded
+                    //   over-count until that segment is itself drained
+                    //   later. Conservative direction only: the segment
+                    //   merely looks fuller than it is (it is evicted
+                    //   slightly sooner), and a skip can never underflow
+                    //   `live_bytes`.
+                    // - `AwaitingRelease` — unreachable here: `clear`
+                    //   unlinks every entry before condemn, so
+                    //   `lookup_slot` cannot resolve into one. (`Free` /
+                    //   `Reserved` would likewise mean an entry a drain
+                    //   never unlinked — issue #50's ABA class, not a
+                    //   state this fallback can create.)
                     let pin = self.segments.try_pin_remover(old_seg_id);
 
                     if self
@@ -538,6 +558,18 @@ impl Segcache {
             // — the drain owns the segment's accounting wholesale. Same
             // accepted-gap semantics as `delete()`'s pin-fail arm; the
             // no-generation ABA residual is issue #50's class.
+            //
+            // As in `insert`'s replace arm, the state we fell through on
+            // decides how long the skipped decrement is visible
+            // (`try_pin_remover` accepts only `Live | Sealed`):
+            // `Draining` closes the gap on the drain's wholesale reset;
+            // `Relinking` (a merge destination mid-fill, and the state
+            // this path is actually reachable in from `cas` — `Draining`
+            // is not readable, so `acquire_item_at` rejects it before we
+            // get here) leaves a bounded over-count until that segment's
+            // own eventual drain, conservative-direction only;
+            // `AwaitingRelease` is unreachable, since `clear` unlinks
+            // every entry before condemn.
             let pin = self.segments.try_pin_remover(old_seg_id);
 
             // Publish under the WriterPin: `reserved` is held across the

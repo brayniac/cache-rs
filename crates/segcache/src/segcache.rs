@@ -250,7 +250,6 @@ impl Segcache {
         // `cas_location` re-probing the key's candidate buckets from
         // scratch — the hashtable does one hash per op regardless, so this
         // only elides the redundant second bucket scan/verify.
-        let backoff = Backoff::new();
         loop {
             match self.hashtable.lookup_slot(key, &verifier) {
                 Some((old_location, slot)) => {
@@ -269,13 +268,23 @@ impl Segcache {
                         break;
                     };
 
-                    // Pin the OLD item's segment BEFORE unlinking it (item
-                    // 7f). If a drain has already claimed the segment, it
-                    // owns the item's removal — bail and retry the lookup.
-                    let Some(pin) = self.segments.try_pin_remover(old_seg_id) else {
-                        backoff.snooze();
-                        continue;
-                    };
+                    // Pin the OLD item's segment across the unlink +
+                    // decrement (item 7f). If a drain has already claimed
+                    // the segment, DO NOT WAIT (issue #49): the drain may
+                    // itself be waiting on THIS writer's `WriterPin`
+                    // (same-segment or crossed), and `try_pin_remover`
+                    // rejects `Draining`, so waiting can cycle. Fall
+                    // through to an UNPINNED slot swap instead:
+                    // `cas_location_at` validates the exact packed word so
+                    // a stale slot fails safe, and on success the
+                    // decrement is SKIPPED — the drain owns the segment's
+                    // accounting wholesale (its finalize resets the
+                    // counters; its sweep loses the unlink race for this
+                    // slot and, per F1, skips its own decrement). Same
+                    // accepted-gap semantics as `delete()`'s pin-fail arm
+                    // and the fresh-arm raced_old path; the no-generation
+                    // ABA residual is issue #50's class.
+                    let pin = self.segments.try_pin_remover(old_seg_id);
 
                     if self
                         .hashtable
@@ -285,17 +294,20 @@ impl Segcache {
                         ITEM_REPLACE.increment();
 
                         drop(reserved);
-                        let _ = self.segments.remove_at(
-                            old_seg_id,
-                            old_offset,
-                            &self.ttl_buckets,
-                            &self.hashtable,
-                            pin,
-                        );
+                        if let Some(pin) = pin {
+                            let _ = self.segments.remove_at(
+                                old_seg_id,
+                                old_offset,
+                                &self.ttl_buckets,
+                                &self.hashtable,
+                                pin,
+                            );
+                        }
                         return Ok(());
                     }
 
-                    // Lost the unlink race — release the pin and retry.
+                    // Lost the unlink race — release any pin and retry the
+                    // lookup.
                     drop(pin);
                 }
                 None => {

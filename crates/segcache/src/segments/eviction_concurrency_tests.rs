@@ -2140,7 +2140,6 @@ fn concurrent_fresh_insert_no_resurrection() {
 /// unpinned slot swap (the decrement is skipped — the drain owns the
 /// segment's accounting) and returns promptly.
 #[test]
-#[ignore = "red until the #49 fix lands (next commit)"]
 fn replace_into_drain_claimed_segment_does_not_wedge() {
     use std::sync::mpsc;
     use std::sync::Arc;

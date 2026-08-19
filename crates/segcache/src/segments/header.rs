@@ -248,10 +248,40 @@ impl SegmentHeader {
         } else {
             0
         };
+        // A recycled segment can arrive here with a NON-ZERO
+        // `write_offset`, so this deliberately does NOT assert
+        // `write_offset == initial_offset`. `Segment::clear` ends with
+        // `set_write_offset(live_bytes)`, and `live_bytes` can be
+        // OVER-counted by an entry that was unlinked from the hashtable
+        // without a remover pin — the drain's sweep then finds it already
+        // unlinked and, per F1 (single decrement), skips its own
+        // decrement, so nobody decremented. That is the accepted gap
+        // documented on `clear`: `insert`'s fresh-arm `raced_old`
+        // handling, the hashtable-full rollback path, `delete()`'s
+        // pin-fail arm, and (issue #49) the replace/cas unpinned fallback
+        // all unlink unpinned by design. Not corruption, never an
+        // under-count, and the stores below ARE the wholesale reset.
+        //
+        // What DOES hold on every path into a Free segment is that the two
+        // counters agree, so assert that instead — it still catches wild
+        // corruption (a segment queued as Free without ever being cleared,
+        // or a torn/garbage offset) while tolerating the over-count:
+        //   * `init` — both start at `initial_offset`;
+        //   * `recycle` / `condemn` (`finalize_drained`, `TtlBucket` drain
+        //     + the guard-drop handoff behind it) — both are reached only
+        //     after `Segment::clear`, whose last act equalizes them, and
+        //     nothing may decrement a Draining/AwaitingRelease segment
+        //     afterwards (`claim_for_drain` waits out `active_removers`
+        //     and `try_pin_remover` rejects those states);
+        //   * `release_unused` (`try_release`) — a Reserved/Linking
+        //     segment that was never published: either untouched since
+        //     this function equalized them, or a merge copy target, and
+        //     `Segment::copy_into` advances `write_offset` and
+        //     `live_bytes` by the same `item_size` per copied item.
         debug_assert_eq!(
             self.write_offset.load(Ordering::Relaxed),
-            initial_offset,
-            "segment {} reserved with unreset write_offset",
+            self.live_bytes.load(Ordering::Relaxed),
+            "segment {} reserved with write_offset/live_bytes disagreeing",
             self.id
         );
         self.write_offset.store(initial_offset, Ordering::Relaxed);

@@ -2213,7 +2213,22 @@ mod loom_tests {
     use loom::sync::Arc;
     use loom::thread;
 
-    /// Simple verifier that always returns true for testing hashtable mechanics.
+    /// Verifier that always returns true, for models about hashtable
+    /// MECHANICS: CAS uniqueness, election winners, mutex-serialized entry
+    /// creation, message-passing publication order.
+    ///
+    /// KNOW WHAT IT CANNOT MODEL. It answers "yes, your key is there" for
+    /// every location, so under it the entire verify-FAILURE half of the
+    /// slot protocol is unreachable: `verify_slot`, its `Changed` retries,
+    /// `allow_deleted`, and every "is this still MY entry" decision. A model
+    /// built on `AlwaysVerifier` is blind to key identity BY CONSTRUCTION —
+    /// it cannot represent a location whose bytes were rewritten under a
+    /// reader, which is the hazard the read paths actually defend against.
+    ///
+    /// Reach for `KeyOracle` (`crate::hashtable::loom_oracle`, used by the
+    /// models at the bottom of this file) whenever the invariant depends on
+    /// WHICH key a location holds. Verified: neutering any of the five
+    /// read-path guards leaves every `AlwaysVerifier` model above green.
     struct AlwaysVerifier;
 
     impl KeyVerifier for AlwaysVerifier {
@@ -2779,142 +2794,367 @@ mod loom_tests {
     }
 
     // =====================================================================
-    // Stale-location ABA on the read path
+    // Oracle-backed slot-protocol models
+    //
+    // Everything below swaps `AlwaysVerifier` for `KeyOracle` (see
+    // `crate::hashtable::loom_oracle`), a stateful location -> key map.
+    // `AlwaysVerifier` verifies anything, so under it the whole
+    // verify-failure half of the slot protocol — `verify_slot`, its
+    // `Changed` retries, `allow_deleted`, every "is this really MY entry"
+    // decision — is unreachable code. The models above are blind to it BY
+    // CONSTRUCTION; these are the ones that exercise it.
+    //
+    // Every model below asserts an SC-INDEPENDENT property: a Release-CAS
+    // winner count, a retry outcome, a live-entry count. None depends on a
+    // sequentially-consistent total order, because loom admits
+    // store-buffering outcomes even for pure-SeqCst litmus tests (see the
+    // note in segments/header.rs's loom_tests) and would report false
+    // violations for any Dekker/SB-shaped assertion. Invariants that DO need
+    // SC — "a pinned reader never observes a committed drain" and friends —
+    // are shuttle's territory, not loom's.
+    //
+    // NOT MODELED HERE, deliberately: the converse of the STALE-LOCATION
+    // guard, "a genuine tag collision must still report absent". The
+    // regression that would break it is `verify_slot` degrading into
+    // "retry on every mismatch", and that is not a wrong answer but an
+    // infinite loop — the slot never changes, so the re-read spins on a
+    // stable word forever. loom detects deadlock, not livelock, so such a
+    // model would hang rather than fail. That direction is pinned by
+    // `stale_location_tests::genuine_tag_collision_still_reports_absent`,
+    // which catches it the only way it can be caught: by hanging.
     // =====================================================================
 
-    /// Location holding the key before the relocation.
-    const SRC: u64 = 0x1000;
-    /// Location the relocation moves it to.
-    const DST: u64 = 0x2000;
+    use crate::hashtable::loom_oracle::{KeyOracle, DST, KEY, MID, NEW, SRC};
 
-    /// A stateful location -> key oracle, in place of the `AlwaysVerifier`
-    /// stub, that can model the one thing the stub cannot: **a location
-    /// whose bytes were rewritten under a reader**.
+    /// Drive one read entry point through a merge drain that relocates the
+    /// key out from under it and recycles the location it was holding.
     ///
-    /// This is the whole reason the bug is loom-visible. `KeyVerifier` is
-    /// already the boundary between the hashtable and storage, so a verifier
-    /// that answers "no, that location does not hold your key (any more)"
-    /// reproduces a finalized-and-recycled segment exactly, with no
-    /// production hook and nothing to compile out of release.
+    /// The key is LIVE at every instant — at `SRC`, then at `DST`, never
+    /// nowhere — so the read must find it in EVERY interleaving. Asserts:
     ///
-    /// The two validity flags are sequenced by the relocator thread in
-    /// production order — copy-then-publish-then-recycle — so the model
-    /// never manufactures a mismatch the real system could not produce:
-    /// `DST` becomes valid BEFORE the relink CAS, `SRC` becomes invalid
-    /// only AFTER it.
-    struct RecyclingOracle {
-        src_valid: AtomicU64,
-        dst_valid: AtomicU64,
-    }
-
-    impl RecyclingOracle {
-        fn new() -> Self {
-            Self {
-                src_valid: AtomicU64::new(1),
-                dst_valid: AtomicU64::new(0),
-            }
-        }
-    }
-
-    impl KeyVerifier for RecyclingOracle {
-        fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
-            if key != b"key" {
-                return false;
-            }
-            match location.as_raw() {
-                SRC => self.src_valid.load(Ordering::Acquire) == 1,
-                DST => self.dst_valid.load(Ordering::Acquire) == 1,
-                _ => false,
-            }
-        }
-    }
-
-    /// Exhaustive model of the stale-location ABA: a reader resolving a key
-    /// while a merge drain relocates it and the source segment is recycled
-    /// underneath.
+    /// 1. **no false absent.** The dangerous interleaving is: reader loads
+    ///    the slot (`SRC`), drain relinks to `DST` and recycles `SRC`,
+    ///    reader's `verify` then compares the key against a recycled
+    ///    location and gets `false`. Reading that as "different key" ends
+    ///    the scan and reports a live key absent.
+    /// 2. **the relink lands.** Nothing else mutates this entry except the
+    ///    reader's frequency bump, which CASes the same slot word. So
+    ///    `try_cas_in_bucket` must absorb a lost CAS by re-reading the slot
+    ///    rather than giving up — abandoning it there would abort a merge
+    ///    mid-candidate. (Only the `lookup` variant bumps; the others reach
+    ///    this assertion trivially.)
+    /// 3. **the key resolves at `DST` once the drain settles** — the read
+    ///    did not merely fail to notice, it tracked the entry to its new
+    ///    home.
     ///
-    /// The key is never deleted — only moved — so `lookup` must return it in
-    /// EVERY interleaving. Without the read-path guard, the interleaving
-    /// where the reader loads the slot before the relink CAS and runs
-    /// `verify` after the recycle makes `verify` report "different key", the
-    /// scan concludes, and `lookup` answers `None`: a false absent for a
-    /// live key.
-    #[test]
-    fn loom_lookup_survives_relocation_and_recycle() {
-        loom::model(|| {
+    /// `read` is a fn pointer rather than a closure so each entry point is
+    /// its own `#[test]`: the five read helpers each carry their own copy
+    /// of the scan loop and its guard, and a copy that loses the guard must
+    /// fail on its own model, not hide behind a sibling's.
+    fn assert_read_survives_relocation_and_recycle(
+        read: fn(&MultiChoiceHashtable, &KeyOracle) -> bool,
+    ) {
+        loom::model(move || {
             let ht = Arc::new(MultiChoiceHashtable::new(7));
-            let oracle = Arc::new(RecyclingOracle::new());
+            let oracle = Arc::new(KeyOracle::new());
 
-            ht.insert(b"key", Location::new(SRC), &*oracle)
+            oracle.place(SRC, KEY);
+            ht.insert(KEY, KeyOracle::location(SRC), &*oracle)
                 .expect("seed insert");
 
-            let ht_reader = ht.clone();
-            let o_reader = oracle.clone();
-            let reader = thread::spawn(move || ht_reader.lookup(b"key", &*o_reader));
+            let reader = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || read(&ht, &oracle))
+            };
 
-            let ht_drain = ht.clone();
-            let o_drain = oracle.clone();
-            let drain = thread::spawn(move || {
-                // 1. Copy the item into the destination: its bytes are
-                //    valid there before anything points at them.
-                o_drain.dst_valid.store(1, Ordering::Release);
-                // 2. Publish the relocation (Segment::copy_into's relink).
-                assert!(
-                    ht_drain.cas_location(b"key", Location::new(SRC), Location::new(DST), true),
-                    "relink CAS must land: nothing else touches this entry"
-                );
-                // 3. The source segment is finalized, recycled, and
-                //    rewritten by another writer: SRC no longer holds it.
-                o_drain.src_valid.store(0, Ordering::Release);
-            });
+            let drain = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || oracle.drain_relocate(&ht, SRC, DST))
+            };
 
             let found = reader.join().unwrap();
-            drain.join().unwrap();
+            let relinked = drain.join().unwrap();
 
             assert!(
-                found.is_some(),
-                "false absent: a relocation + recycle racing the key comparison \
+                found,
+                "FALSE ABSENT: a relocation + recycle racing the key comparison \
                  must not turn a live key into a miss (STALE-LOCATION INVARIANT)"
             );
             assert!(
-                ht.lookup(b"key", &*oracle).is_some(),
+                relinked,
+                "the relink CAS must land: only a reader's frequency bump can \
+                 lose it the slot word, and that must cost a retry, not the \
+                 relocation"
+            );
+            assert!(
+                read(&ht, &oracle),
                 "the entry must still resolve once the drain has settled"
+            );
+            assert_eq!(
+                ht.lookup_no_freq_update(KEY, &*oracle).map(|(loc, _)| loc),
+                Some(KeyOracle::location(DST)),
+                "the settled entry must be published at the relocation target"
             );
         });
     }
 
-    /// Same race, driven through `contains` — a different read helper
-    /// (`search_bucket_exists`) with its own copy of the scan loop.
+    /// `lookup` — `search_bucket_for_get`, the only read path that also
+    /// CASes the slot to bump frequency.
+    #[test]
+    fn loom_lookup_survives_relocation_and_recycle() {
+        assert_read_survives_relocation_and_recycle(|ht, oracle| ht.lookup(KEY, oracle).is_some());
+    }
+
+    /// `contains` — `search_bucket_exists`. No in-tree caller today (the
+    /// `Hashtable` trait is `#[allow(dead_code)]`), but it carries its own
+    /// copy of the scan loop and answers exactly, not approximately, so a
+    /// false `false` here is the same bug as a false absent from `lookup`.
     #[test]
     fn loom_contains_survives_relocation_and_recycle() {
-        loom::model(|| {
-            let ht = Arc::new(MultiChoiceHashtable::new(7));
-            let oracle = Arc::new(RecyclingOracle::new());
+        assert_read_survives_relocation_and_recycle(|ht, oracle| ht.contains(KEY, oracle));
+    }
 
-            ht.insert(b"key", Location::new(SRC), &*oracle)
+    /// `lookup_no_freq_update` — `search_bucket_no_freq`.
+    #[test]
+    fn loom_lookup_no_freq_update_survives_relocation_and_recycle() {
+        assert_read_survives_relocation_and_recycle(|ht, oracle| {
+            ht.lookup_no_freq_update(KEY, oracle).is_some()
+        });
+    }
+
+    /// `lookup_slot` — `search_bucket_no_freq_slot`, the entry point behind
+    /// `segcache`'s replace and numeric-update paths (`lookup_slot` +
+    /// `cas_location_at`). A false absent here reports a live key missing to
+    /// a caller that is about to relink it.
+    #[test]
+    fn loom_lookup_slot_survives_relocation_and_recycle() {
+        assert_read_survives_relocation_and_recycle(|ht, oracle| {
+            ht.lookup_slot(KEY, oracle).is_some()
+        });
+    }
+
+    /// `get_frequency` — `search_bucket_for_freq`. Like `contains`, a trait
+    /// method with no in-tree caller today; its location-keyed sibling
+    /// `get_item_frequency` IS on the merge path, where a missing frequency
+    /// is read as "this item is dead, drop it". Modeled because it is the
+    /// fifth hand-written copy of the scan loop and the one most likely to
+    /// be reached for next.
+    #[test]
+    fn loom_get_frequency_survives_relocation_and_recycle() {
+        assert_read_survives_relocation_and_recycle(|ht, oracle| {
+            ht.get_frequency(KEY, oracle).is_some()
+        });
+    }
+
+    /// Insert's replace scan (`try_replace_existing`) against a drain that
+    /// relocates the key TWICE.
+    ///
+    /// INVARIANT: the key ends with exactly ONE live entry, and the insert
+    /// resolves as a REPLACE (`Ok(Some(_))`), never as a creation.
+    ///
+    /// Why two relocations. `insert` scans for an existing entry twice —
+    /// once lock-free, then again under the key's stripe lock — and only
+    /// creates a new entry if BOTH scans miss. A single relocation cannot
+    /// fool both: by the time the second scan runs, the drain has settled
+    /// and the entry verifies at its new location. Two successive drains
+    /// (`SRC -> MID -> DST`) is the smallest trace that can strand a stale
+    /// location in each scan — and it is an ordinary production trace, since
+    /// a hot key is relocated by every merge that touches its segment.
+    ///
+    /// Without the guard, both scans conclude "different key", `insert`
+    /// takes the creation path, and the table ends with the drain's entry
+    /// AND the writer's entry both live for one key — the #46 duplicate.
+    ///
+    /// Both assertions below were checked non-vacuous SEPARATELY against the
+    /// neutered guard: the replace assertion fires first (`inserted` is
+    /// `Ok(None)`), and with that assertion removed the count assertion
+    /// fires on its own with `left: 2`. Keep them independent if you edit
+    /// this — the second is the one that names the actual damage.
+    #[test]
+    fn loom_insert_replace_scan_survives_repeated_relocation() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let oracle = Arc::new(KeyOracle::new());
+
+            oracle.place(SRC, KEY);
+            ht.insert(KEY, KeyOracle::location(SRC), &*oracle)
                 .expect("seed insert");
 
-            let ht_reader = ht.clone();
-            let o_reader = oracle.clone();
-            let reader = thread::spawn(move || ht_reader.contains(b"key", &*o_reader));
+            let drain = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || {
+                    // Two successive merges relocate the same hot key.
+                    // Either relink may lose to the writer's replace — that
+                    // is a normal outcome, not a model failure.
+                    oracle.drain_relocate(&ht, SRC, MID);
+                    oracle.drain_relocate(&ht, MID, DST);
+                })
+            };
 
-            let ht_drain = ht.clone();
-            let o_drain = oracle.clone();
-            let drain = thread::spawn(move || {
-                o_drain.dst_valid.store(1, Ordering::Release);
-                assert!(ht_drain.cas_location(
-                    b"key",
-                    Location::new(SRC),
-                    Location::new(DST),
-                    true
-                ));
-                o_drain.src_valid.store(0, Ordering::Release);
-            });
+            let writer = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || {
+                    // Write the replacement item, then publish it.
+                    oracle.place(NEW, KEY);
+                    ht.insert(KEY, KeyOracle::location(NEW), &*oracle)
+                })
+            };
 
-            let found = reader.join().unwrap();
             drain.join().unwrap();
+            let inserted = writer
+                .join()
+                .unwrap()
+                .expect("insert must not report the table full");
 
-            assert!(found, "contains must not report a live key absent");
+            assert!(
+                inserted.is_some(),
+                "insert must resolve to a REPLACE: the key's entry is published \
+                 at some location at every instant, so a scan that reports it \
+                 absent has mistaken a stale location for a different key"
+            );
+            assert_eq!(
+                KeyOracle::drain_live_entries(&ht),
+                1,
+                "one key must leave exactly one live entry: a replace scan that \
+                 misses through a relocation publishes a DUPLICATE"
+            );
+        });
+    }
+
+    /// `remove`'s expected-location check is an ABA guard: it must unlink
+    /// the entry the caller named, and refuse an entry that has since moved
+    /// on.
+    ///
+    /// A deleter unlinks `KEY` at `SRC` while a merge drain relocates it to
+    /// `DST`. Both name the same slot; exactly one may claim it.
+    ///
+    /// INVARIANT: exactly one of {relink, unlink} succeeds, and the table
+    /// agrees with the winner — if the relink won, the entry is still
+    /// reachable at `DST`; if the unlink won, the key is gone.
+    ///
+    /// Dropping the location check would let the unlink take the RELOCATED
+    /// entry: `remove` reports success to a caller that asked about `SRC`
+    /// (which `Segment::clear` reads as "that segment's entry is mine to
+    /// recycle") while the item the drain just published at `DST` becomes
+    /// unreachable — a live item leaked out of the index.
+    #[test]
+    fn loom_remove_does_not_unlink_a_relocated_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let oracle = Arc::new(KeyOracle::new());
+
+            oracle.place(SRC, KEY);
+            ht.insert(KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert");
+
+            let drain = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || oracle.drain_relocate(&ht, SRC, DST))
+            };
+
+            let remover = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || {
+                    let removed = ht.remove(KEY, KeyOracle::location(SRC));
+                    if removed {
+                        // The item is freed and its space released.
+                        oracle.vacate(SRC);
+                    }
+                    removed
+                })
+            };
+
+            let relinked = drain.join().unwrap();
+            let removed = remover.join().unwrap();
+
+            assert_ne!(
+                relinked, removed,
+                "exactly one of the relink and the unlink may claim the entry \
+                 (both succeeding means the unlink took an entry that had \
+                 already moved to another location)"
+            );
+            assert_eq!(
+                ht.lookup_no_freq_update(KEY, &*oracle).map(|(loc, _)| loc),
+                if relinked {
+                    Some(KeyOracle::location(DST))
+                } else {
+                    None
+                },
+                "a relocated entry must stay reachable at its new location; a \
+                 removed one must be gone"
+            );
+        });
+    }
+
+    /// The ghost-conversion sibling of the model above:
+    /// `try_to_ghost_in_bucket` carries its own copy of the expected-location
+    /// check, and it fails differently — a wrongly-ghosted entry does not
+    /// merely vanish, it leaves a ghost that keeps answering frequency
+    /// queries for a key whose live item is still published elsewhere.
+    ///
+    /// INVARIANT: exactly one of {relink, ghost} succeeds; if the relink won
+    /// the key resolves live at `DST` and has NO ghost; if the ghosting won
+    /// the key is not live and has one.
+    #[test]
+    fn loom_ghost_conversion_does_not_capture_a_relocated_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let oracle = Arc::new(KeyOracle::new());
+
+            oracle.place(SRC, KEY);
+            ht.insert(KEY, KeyOracle::location(SRC), &*oracle)
+                .expect("seed insert");
+
+            let drain = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || oracle.drain_relocate(&ht, SRC, DST))
+            };
+
+            let evictor = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || {
+                    let ghosted = ht.convert_to_ghost(KEY, KeyOracle::location(SRC));
+                    if ghosted {
+                        // S3-FIFO evicted the item; its space is released.
+                        oracle.vacate(SRC);
+                    }
+                    ghosted
+                })
+            };
+
+            let relinked = drain.join().unwrap();
+            let ghosted = evictor.join().unwrap();
+
+            assert_ne!(
+                relinked, ghosted,
+                "exactly one of the relink and the ghost conversion may claim \
+                 the entry (both succeeding means the eviction ghosted an entry \
+                 that had already moved to another location)"
+            );
+            assert_eq!(
+                ht.lookup_no_freq_update(KEY, &*oracle).map(|(loc, _)| loc),
+                if relinked {
+                    Some(KeyOracle::location(DST))
+                } else {
+                    None
+                },
+                "a relocated entry must stay live at its new location"
+            );
+            assert_eq!(
+                ht.get_ghost_frequency(KEY).is_some(),
+                ghosted,
+                "a ghost may exist only if the ghost conversion actually won"
+            );
         });
     }
 

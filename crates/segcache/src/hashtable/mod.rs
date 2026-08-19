@@ -12,6 +12,12 @@ pub(crate) mod location;
 pub(crate) mod table;
 pub(crate) mod traits;
 
+/// Shared loom fixture. Test-only, and only under the `loom` feature —
+/// see the module docs for why the slot protocol needs a stateful verifier
+/// rather than `AlwaysVerifier`.
+#[cfg(all(test, feature = "loom"))]
+pub(crate) mod loom_oracle;
+
 pub use location::Location;
 pub(crate) use table::{MultiChoiceHashtable, SlotRef};
 pub(crate) use traits::{Hashtable, KeyVerifier};

@@ -441,6 +441,13 @@ impl<'a> Segment<'a> {
 
             debug_assert!(item.klen() > 0, "invalid klen: ({})", item.klen());
 
+            // F1 (single decrement): only the unlinker decrements. A
+            // `remove` returning false therefore has to mean another
+            // unlinker/replacer owns this entry — which holds because
+            // `try_unlink_in_bucket` retries the same slot across a
+            // racing reader's freq-bump CAS instead of abandoning the
+            // entry (table.rs). Without that retry a spurious false here
+            // would recycle the segment with the entry still published.
             let loc = pack_location(self.id(), offset as u64);
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if !deleted && hashtable.remove(item.key(), loc) {
@@ -472,15 +479,19 @@ impl<'a> Segment<'a> {
         // `active_removers == 0` wait (claim_for_drain, drain_chain) +
         // try_pin_remover's recheck-bail cover every replace/delete remove that
         // PINS BEFORE UNLINKING — those decrement before this sweep runs and are
-        // then skipped (get_item_frequency is None). But the fresh-key
-        // insert-vs-insert race and the hashtable-full rollback path unlink an
-        // entry WITHOUT holding a remover pin (a known tracked follow-up); such
-        // an item can be unlinked-but-not-yet-decremented while we clear, so it
-        // is counted-yet-skipped and `live_items`/`live_bytes` may be transiently
-        // over-counted. That is a leak, not corruption (it self-heals when the
-        // segment is recycled: `init()` resets the counters). A synchronous
-        // "empty after clear" assertion is therefore not a valid concurrent
-        // invariant; the crash-direction (`live_bytes() >= 0`) is still asserted
+        // then skipped (get_item_frequency is None). But the raced-old handling
+        // in `Segcache::insert`'s fresh-key arm (a racing writer published
+        // between the lookup miss and the hashtable upsert, resolved to a
+        // replace under the stripe re-check) and the hashtable-full rollback
+        // path unlink an entry WITHOUT holding a remover pin — a narrow,
+        // ACCEPTED gap: if that item's segment is being cleared, it can be
+        // unlinked-but-not-yet-decremented while we sweep, so it is
+        // counted-yet-skipped and `live_items`/`live_bytes` may be transiently
+        // over-counted. Not corruption (it self-heals when the segment is
+        // recycled: `init()` resets the counters) — the drain owns the
+        // segment's accounting wholesale. A synchronous "empty after clear"
+        // assertion is therefore not a valid concurrent invariant; the
+        // crash-direction (`live_bytes() >= 0`) is still asserted
         // per-decrement in `remove_item_at`. Reclaim uses the live counters, so
         // set write_offset to whatever remains.
         self.set_write_offset(self.live_bytes());

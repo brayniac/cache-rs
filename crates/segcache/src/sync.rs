@@ -5,3 +5,9 @@ pub use std::sync::atomic::{AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8
 
 #[cfg(feature = "loom")]
 pub use loom::sync::atomic::{AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+#[cfg(not(feature = "loom"))]
+pub use std::sync::Mutex;
+
+#[cfg(feature = "loom")]
+pub use loom::sync::Mutex;

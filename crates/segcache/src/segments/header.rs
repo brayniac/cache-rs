@@ -146,6 +146,42 @@ impl SegmentHeader {
             .store(Metadata::new_free().pack(), Ordering::Relaxed);
     }
 
+    /// Reset the write statistics (write offset, live bytes, live items)
+    /// to their initial values. Callers must hold exclusive ownership of
+    /// the segment's data — a `Draining` claim with the reader count
+    /// observed zero (`recycle`), or a just-won `Free -> Reserved` CAS
+    /// (`try_reserve`) — since a reset under live readers would corrupt
+    /// their offset math.
+    ///
+    /// With `metrics`, any residual live items/bytes being zeroed here are
+    /// items that leaked their `remove_at` decrement (unlinked without a
+    /// remover pin — a delete racing a drain, the fresh-key insert de-dup
+    /// race, a reservation rollback), so the global item gauges are
+    /// corrected by the residue. Exactly-once: the first reset zeroes the
+    /// counters, so a second reset (recycle then try_reserve) subtracts
+    /// nothing.
+    pub fn reset_write_stats(&self) {
+        let initial_offset = if cfg!(feature = "integrity") {
+            std::mem::size_of::<u64>() as i32
+        } else {
+            0
+        };
+        #[cfg(feature = "metrics")]
+        {
+            let leaked_items = self.live_items.load(Ordering::Relaxed);
+            let leaked_bytes = self.live_bytes.load(Ordering::Relaxed) - initial_offset;
+            if leaked_items > 0 {
+                crate::ITEM_CURRENT.sub(leaked_items as _);
+            }
+            if leaked_bytes > 0 {
+                crate::ITEM_CURRENT_BYTES.sub(leaked_bytes as _);
+            }
+        }
+        self.write_offset.store(initial_offset, Ordering::Relaxed);
+        self.live_bytes.store(initial_offset, Ordering::Relaxed);
+        self.live_items.store(0, Ordering::Relaxed);
+    }
+
     /// Get the generation counter. Incremented each time the segment is
     /// reserved from the free queue; wraps at `u16::MAX`.
     #[inline]
@@ -243,20 +279,20 @@ impl SegmentHeader {
             return false;
         }
 
-        let initial_offset = if cfg!(feature = "integrity") {
-            std::mem::size_of::<u64>() as i32
-        } else {
-            0
-        };
-        debug_assert_eq!(
-            self.write_offset.load(Ordering::Relaxed),
-            initial_offset,
-            "segment {} reserved with unreset write_offset",
-            self.id
-        );
-        self.write_offset.store(initial_offset, Ordering::Relaxed);
-        self.live_bytes.store(initial_offset, Ordering::Relaxed);
-        self.live_items.store(0, Ordering::Relaxed);
+        // NOTE: deliberately NO "empty at reserve" assertion here. A
+        // synchronous fully-drained-means-zeroed invariant does not hold
+        // under concurrency (see the item 7f note on `Segment::clear`):
+        // removals that unlink a hashtable entry WITHOUT a remover pin — a
+        // delete racing the drain that owns the segment, the fresh-key
+        // insert de-dup race, a reservation rollback against a claimed
+        // segment — cannot decrement the segment's counters, and the drain
+        // sweep skips the already-unlinked item, so a segment can
+        // legitimately reach Free with transiently over-counted
+        // `write_offset`/`live_bytes`/`live_items`. `recycle` resets them
+        // on the common path; a condemned segment (freed by its last
+        // reader's guard drop) carries them until here. The stores below
+        // are the authoritative reset either way.
+        self.reset_write_stats();
         self.mark_created();
         self.mark_merged();
         self.generation.fetch_add(1, Ordering::Relaxed);

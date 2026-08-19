@@ -48,6 +48,15 @@ mod metrics;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, not(feature = "loom")))]
+mod pin_failure_tests;
+
+#[cfg(all(test, not(feature = "loom")))]
+mod numeric_concurrency_tests;
+
+#[cfg(all(test, not(feature = "loom")))]
+mod numeric_relocation_tests;
+
 // publicly exported items from submodules
 pub use crate::segcache::Segcache;
 pub use builder::Builder;

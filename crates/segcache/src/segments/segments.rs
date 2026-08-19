@@ -618,6 +618,20 @@ impl Segments {
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 
+        // Reset the write statistics while the segment is still exclusively
+        // ours (Draining, reader count observed zero): removals that
+        // unlinked hashtable entries WITHOUT a remover pin (a delete racing
+        // this drain, the fresh-key insert de-dup race, a reservation
+        // rollback) could not decrement the counters, and the drain sweep
+        // skipped those already-unlinked items, so `live_*`/`write_offset`
+        // may be transiently over-counted (see the item 7f note on
+        // `Segment::clear`). Resetting here keeps a Free segment reporting
+        // zero items (`items()`); `try_reserve` repeats the reset as the
+        // authoritative one, covering the condemned path (guard-drop free)
+        // that does not pass through here — which is also why
+        // `check_integrity` skips out-of-service segments.
+        self.headers[id_idx].reset_write_stats();
+
         let freed = self.headers[id_idx].cas_metadata(
             State::Draining,
             State::Free,
@@ -1831,17 +1845,37 @@ impl Segments {
                 let write_offset = dst.write_offset() as usize;
                 if write_offset + item_size < seg_size {
                     let new_loc = pack_location(dst.id(), write_offset as u64);
+                    // NUMERIC RELOCATION GATE (see `Segment::copy_into` for
+                    // the full argument): hold the item's seqlock writer
+                    // lock across the byte copy AND the relink CAS so an
+                    // in-place numeric writer (reader-pinned only — the
+                    // drain claim does not exclude it) can neither tear the
+                    // copy, leak an acked increment into the orphaned
+                    // source, nor have its transient odd version published.
+                    // The destination is stamped back to the frozen even
+                    // version before the publish; the lock is a leaf, so no
+                    // cycle is added.
+                    let vguard = item.lock_numeric_version().ok();
                     // Copy-then-publish (see copy_into): write bytes before the
                     // Release-CAS publishes new_loc. On CAS failure the bytes are
                     // orphaned (write_offset not advanced) and the item stays in
                     // src to be evicted — same outcome as before, minus the
                     // torn-read window.
-                    unsafe {
+                    let d = unsafe {
                         let s = src.data_ptr().add(offset);
                         let d = dst.data_ptr().add(write_offset);
                         std::ptr::copy_nonoverlapping(s, d, item_size);
+                        d
+                    };
+                    if let Some(guard) = &vguard {
+                        guard.stamp_relocated_copy(&RawItem::from_ptr(d));
                     }
-                    if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
+                    let relinked = hashtable.cas_location(item.key(), old_loc, new_loc, true);
+                    // Unlock only AFTER the publish resolved (or failed), so
+                    // a spinning numeric writer's in-lock re-validation sees
+                    // the outcome.
+                    drop(vguard);
+                    if relinked {
                         src.remove_item_at(offset);
                         dst.incr_live_items();
                         dst.incr_live_bytes(item_size as i32);
@@ -2027,6 +2061,18 @@ impl Segments {
             let seg_start = self.segment_size as usize * idx;
             let seg_end = seg_start + self.segment_size as usize;
             let header = &self.headers[idx];
+            // Only in-service segments (Live/Sealed/Relinking) have a
+            // meaningful counted-vs-header comparison. A drained segment
+            // that left service via the condemned path (AwaitingRelease ->
+            // guard-drop free) can legitimately carry residual counters
+            // from unlinked-without-pin removals until `try_reserve` resets
+            // them (see `reset_write_stats`); counting it would report a
+            // false mismatch. Draining segments are mid-parse by their
+            // owner and equally transient.
+            match header.state() {
+                State::Live | State::Sealed | State::Relinking => {}
+                _ => continue,
+            }
             // SAFETY: we only read the data here; the borrow is scoped.
             let data = unsafe {
                 std::slice::from_raw_parts_mut(self.data.as_ptr() as *mut u8, self.data.len())

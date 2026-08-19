@@ -20,7 +20,7 @@
 //! │        AtomicU32/32b        │            96 bit           │
 //! └───────────────────────────────────────────────────────────┘
 //!
-//! METADATA = [8 unused][8 state][24 prev][24 next] (see segments::state)
+//! METADATA = [8 tag][8 state][24 prev][24 next] (see segments::state)
 //! GEN = generation (AtomicU16)   PL = SegmentPool (AtomicU8)
 //! PD = 8-bit alignment pad before ACTIVE WRITERS (AtomicU32)
 //! Total: 512 bits = 64 bytes = 1 cache line
@@ -37,6 +37,81 @@ use crate::segments::state::{Metadata, State};
 use crate::sync::{AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use clocksource::coarse::{AtomicInstant, Duration, Instant};
 use core::num::NonZeroU32;
+
+/// Outcome of a reader-pin attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquireOutcome {
+    /// A pin was taken; the caller owns it and must pair it with a guard.
+    Acquired,
+    /// The segment is not readable; no pin is held.
+    NotReadable,
+    /// The segment is not readable, and backing the pin out left a
+    /// condemned segment with no reader remaining to free it. This caller
+    /// won the AwaitingRelease -> Free transition and must return the
+    /// segment to the free queue.
+    ReleaseCondemned,
+}
+
+/// Test-only interposition inside [`SegmentHeader::try_acquire_reader`].
+///
+/// The acquire's increment/re-check window is only entered when the state
+/// changes underneath it, which no single-threaded test can arrange and no
+/// multi-threaded one can arrange *deterministically*. This hook lets a
+/// test park the acquire at either edge of that window and run the racing
+/// drain by hand, with no scheduler — the same "put the race where it
+/// happens" idiom as #60's `KeyVerifier` oracle.
+///
+/// Ambient (a thread-local) rather than a parameter so that
+/// `try_acquire_reader` keeps its exact production signature and body:
+/// outside `cfg(test)` the two [`fire`] calls compile away entirely, and
+/// the test drives the real `Segments::acquire_item_at`, not a copy.
+///
+/// Phases:
+///   0 — after the `ref_count` increment, before the state re-check
+///   1 — after the re-check failed, before the backout
+#[cfg(all(test, not(feature = "loom")))]
+pub(crate) mod acquire_hook {
+    use std::cell::RefCell;
+
+    /// What a test installs: called with the phase number.
+    pub(crate) type Hook = Box<dyn FnMut(u8)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Uninstalls the hook when dropped, so a failing test cannot leak it
+    /// onto the next test sharing this thread.
+    pub(crate) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Install `hook` on this thread until the returned guard drops.
+    pub(crate) fn install(hook: Hook) -> Installed {
+        HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        Installed
+    }
+
+    /// Run the installed hook, if any. It is taken out of the slot for the
+    /// duration of the call, so an acquire reached from *inside* the hook
+    /// runs unhooked (and cannot re-borrow the cell).
+    pub(super) fn fire(phase: u8) {
+        let taken = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = taken {
+            hook(phase);
+            HOOK.with(|h| {
+                let mut slot = h.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
+    }
+}
 
 /// Which pool a segment belongs to (for S3-FIFO eviction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +304,7 @@ impl SegmentHeader {
             state: new_state,
             next: new_next.unwrap_or(meta.next),
             prev: new_prev.unwrap_or(meta.prev),
+            tag: meta.tag,
         };
         self.metadata
             .compare_exchange(current, new.pack(), success, Ordering::Acquire)
@@ -254,6 +330,7 @@ impl SegmentHeader {
                 state: meta.state,
                 next: new_next.unwrap_or(meta.next),
                 prev: new_prev.unwrap_or(meta.prev),
+                tag: meta.tag,
             };
             match self.metadata.compare_exchange(
                 current,
@@ -332,6 +409,11 @@ impl SegmentHeader {
     /// SeqCst: this participates in the release-side Dekker pair (guard
     /// drop decrements ref_count SeqCst, then loads the state; the
     /// condemner CASes to AwaitingRelease SeqCst, then loads ref_count).
+    /// Single-shot, with no retry: every writer of an AwaitingRelease word
+    /// changes the state, so a lost CAS means one of the three claimants
+    /// performed the free. Were an `update_links` against a condemned word
+    /// ever to become reachable, that same lost CAS would strand the segment
+    /// permanently, since nothing sweeps AwaitingRelease.
     pub fn try_release_condemned(&self) -> bool {
         let current = self.metadata.load(Ordering::SeqCst);
         if Metadata::unpack(current).state != State::AwaitingRelease {
@@ -341,6 +423,44 @@ impl SegmentHeader {
             state: State::Free,
             next: None,
             prev: None,
+            tag: 0,
+        };
+        self.metadata
+            .compare_exchange(current, new.pack(), Ordering::SeqCst, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Condemn a drained segment (Draining -> AwaitingRelease, links
+    /// cleared), stamping the low byte of the generation into the spare
+    /// high byte of the metadata word.
+    ///
+    /// Without the stamp the condemned word is the constant
+    /// `{AwaitingRelease, None, None}` for every use of every segment, so
+    /// the token `try_release_condemned` CASes on carries no lifetime
+    /// identity: a thread stalled between that load and its CAS can win
+    /// the transition against a *later* incarnation of the same segment
+    /// that still has live readers, freeing it under them and stealing its
+    /// handoff. `try_reserve` bumps the generation, so a stalled token no
+    /// longer matches once the segment has been recycled.
+    ///
+    /// The tag rides in `Metadata` so `pack`/`unpack` round-trip it:
+    /// `update_links` is a read-modify-write through `Metadata`, reachable
+    /// against an AwaitingRelease segment because `condemn` and `recycle`
+    /// both splice neighbours after their own transition.
+    ///
+    /// The tag is 8 bits, so it aliases every 256 uses of a given segment;
+    /// the residual is a thread stalled across that many full lifecycles
+    /// inside a three-instruction window.
+    pub fn cas_condemn(&self) -> bool {
+        let current = self.metadata.load(Ordering::Acquire);
+        if Metadata::unpack(current).state != State::Draining {
+            return false;
+        }
+        let new = Metadata {
+            state: State::AwaitingRelease,
+            next: None,
+            prev: None,
+            tag: (self.generation.load(Ordering::Relaxed) & 0xFF) as u8,
         };
         self.metadata
             .compare_exchange(current, new.pack(), Ordering::SeqCst, Ordering::Acquire)
@@ -366,9 +486,9 @@ impl SegmentHeader {
     /// paired with exactly one [`Self::release_reader`] (or a
     /// `SegmentGuard` drop).
     #[inline]
-    pub fn try_acquire_reader(&self) -> bool {
+    pub fn try_acquire_reader(&self) -> AcquireOutcome {
         if !self.metadata(Ordering::Acquire).state.is_readable() {
-            return false;
+            return AcquireOutcome::NotReadable;
         }
 
         // `SeqCst` on the increment and the re-check is load-bearing.
@@ -385,14 +505,28 @@ impl SegmentHeader {
         // shape, not this ordering requirement.
         self.ref_count.fetch_add(1, Ordering::SeqCst);
 
+        #[cfg(all(test, not(feature = "loom")))]
+        acquire_hook::fire(0);
+
         // Re-check after the increment: a writer that observed
         // ref_count == 0 may have transitioned the state concurrently.
         if !self.metadata(Ordering::SeqCst).state.is_readable() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
-            return false;
+            #[cfg(all(test, not(feature = "loom")))]
+            acquire_hook::fire(1);
+
+            // Back out. The decrement must use the same SeqCst handoff as
+            // a guard drop, not a plain release: a condemner that observed
+            // this transient pin has already deferred reclamation to "the
+            // last reader", and a plain decrement here would leave the
+            // segment in AwaitingRelease with no reader left to free it.
+            let prev = self.release_reader_for_guard();
+            if prev == 1 && self.try_release_condemned() {
+                return AcquireOutcome::ReleaseCondemned;
+            }
+            return AcquireOutcome::NotReadable;
         }
 
-        true
+        AcquireOutcome::Acquired
     }
 
     /// Release a reader pin taken with [`Self::try_acquire_reader`]
@@ -452,10 +586,11 @@ impl SegmentHeader {
         self.active_writers.fetch_add(1, Ordering::SeqCst);
         if !self.metadata(Ordering::SeqCst).state.is_writable() {
             // Backout uses Release, not SeqCst (the design spec's pseudocode
-            // writes SeqCst): this pin never became visible to a claimer that
-            // acted on it — the SeqCst re-check above just proved the segment
-            // left the writable state — so unwinding it needs no place in the
-            // SC total order. Mirrors `try_acquire_reader`'s backout.
+            // writes SeqCst): a claimer that counted this pin WAITS for it
+            // (claim_for_drain spins on active_writers) rather than acting on
+            // it and deferring a handoff, so unwinding needs no place in the
+            // SC total order. Readers differ, and their backout has to
+            // complete the handoff — see try_acquire_reader.
             self.active_writers.fetch_sub(1, Ordering::Release);
             return false;
         }
@@ -789,7 +924,7 @@ mod loom_tests {
                     let h = Arc::clone(&header);
                     let c = Arc::clone(&committed);
                     thread::spawn(move || {
-                        if h.try_acquire_reader() {
+                        if h.try_acquire_reader() == AcquireOutcome::Acquired {
                             // The strong invariant — a pinned reader
                             // never observes a committed drain — is the
                             // SC-total-order property loom cannot model
@@ -856,13 +991,7 @@ mod loom_tests {
                 let f = Arc::clone(&freed);
                 thread::spawn(move || {
                     // condemn (mirrors Segments::condemn)
-                    assert!(h.cas_metadata(
-                        State::Draining,
-                        State::AwaitingRelease,
-                        Some(None),
-                        Some(None),
-                        Ordering::SeqCst,
-                    ));
+                    assert!(h.cas_condemn());
                     // race fix: the pin may have dropped before the CAS
                     if h.ref_count_seqcst() == 0 && h.try_release_condemned() {
                         f.fetch_add(1, Ordering::SeqCst);
@@ -903,8 +1032,8 @@ mod loom_tests {
     }
 
     // Acquisition must fail in every interleaving for non-readable
-    // states, leaving no pin behind — and AwaitingRelease must remain
-    // acquirable for in-flight readers.
+    // states, leaving no pin behind — AwaitingRelease included, so that
+    // no pin can arrive after a segment is condemned.
     #[test]
     fn loom_acquire_by_state() {
         loom::model(|| {
@@ -914,12 +1043,12 @@ mod loom_tests {
                 (State::Free, false),
                 (State::Reserved, false),
                 (State::Draining, false),
-                (State::AwaitingRelease, true),
+                (State::AwaitingRelease, false),
             ] {
                 header.set_state(state);
                 let h = Arc::clone(&header);
                 let reader = thread::spawn(move || {
-                    if h.try_acquire_reader() {
+                    if h.try_acquire_reader() == AcquireOutcome::Acquired {
                         h.release_reader();
                         true
                     } else {
@@ -1260,6 +1389,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Live,
+            tag: 0,
         });
         assert!(h.try_pin_writer());
         assert_eq!(h.active_writers(), 1);
@@ -1278,6 +1408,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Sealed,
+            tag: 0,
         });
         assert!(!h.try_pin_writer());
         assert_eq!(h.active_writers(), 0);
@@ -1295,6 +1426,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Sealed,
+            tag: 0,
         });
         assert!(h.try_pin_remover());
         assert_eq!(h.active_removers(), 1);
@@ -1303,6 +1435,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Live,
+            tag: 0,
         });
         assert!(h.try_pin_remover());
         assert_eq!(h.active_removers(), 2);
@@ -1315,8 +1448,128 @@ mod tests {
             next: None,
             prev: None,
             state: State::Draining,
+            tag: 0,
         });
         assert!(!h.try_pin_remover());
         assert_eq!(h.active_removers(), 0);
+    }
+
+    // ISSUE #64, DEFECT 2 — the tag's transport.
+    //
+    // `cas_condemn` stamps a lifetime tag into the spare high byte of the
+    // metadata word, and that tag is what makes the release CAS token
+    // unique to one use of a segment. `update_links` is a
+    // read-modify-write through `Metadata` that IS reachable against an
+    // AwaitingRelease segment — `condemn` and `recycle` both splice
+    // neighbours after their own transition, so a neighbour being
+    // condemned concurrently gets its links patched while it carries a
+    // tag. If that round-trip drops the tag, the condemned word falls
+    // back to the constant every segment shares and defect 2 is back.
+    #[test]
+    fn update_links_preserves_the_condemn_tag() {
+        use crate::segments::state::{Metadata, State};
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        h.store_metadata_for_test(Metadata {
+            next: NonZeroU32::new(5),
+            prev: NonZeroU32::new(6),
+            state: State::AwaitingRelease,
+            tag: 0xAB,
+        });
+
+        h.update_links(Some(NonZeroU32::new(7)), Some(None));
+
+        let meta = h.metadata(Ordering::Acquire);
+        assert_eq!(
+            meta.tag, 0xAB,
+            "splicing a neighbour must not erase the lifetime tag"
+        );
+        // The links it was called for still landed, and the state is untouched.
+        assert_eq!(meta.next, NonZeroU32::new(7));
+        assert_eq!(meta.prev, None);
+        assert_eq!(meta.state, State::AwaitingRelease);
+    }
+
+    // ISSUE #64, DEFECT 2 — deterministic reproduction.
+    //
+    // `try_release_condemned` loads the metadata word and then CASes it to
+    // Free. Without the generation stamp that word is the constant
+    // `{AwaitingRelease, None, None}` in every use of every segment, so a
+    // thread stalled between its load and its CAS can win the transition
+    // against a LATER incarnation of the same segment — freeing it out
+    // from under the readers that incarnation still has, and stealing the
+    // handoff its real last reader owes.
+    //
+    // The stall is driven by hand: the token is captured where the stalled
+    // thread's load happens, a full free/recycle/condemn cycle runs, and
+    // then the CAS `try_release_condemned` would perform is issued against
+    // that stale token. No scheduler involved.
+    #[test]
+    fn a_stale_release_token_cannot_free_a_later_incarnation() {
+        use crate::segments::state::{Metadata, State};
+
+        // Exactly the CAS in `try_release_condemned`, but on a token the
+        // caller loaded earlier — i.e. a thread descheduled between that
+        // function's own load and its own compare-exchange.
+        fn stale_release(h: &SegmentHeader, token: u64) -> bool {
+            let free = Metadata {
+                next: None,
+                prev: None,
+                state: State::Free,
+                tag: 0,
+            };
+            h.metadata
+                .compare_exchange(token, free.pack(), Ordering::SeqCst, Ordering::Acquire)
+                .is_ok()
+        }
+
+        let h = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+
+        // --- Incarnation N: reserved, filled, drained, then condemned
+        // because a reader still pinned it.
+        assert!(h.try_reserve());
+        h.set_state(State::Draining);
+        assert!(h.cas_condemn());
+        assert_eq!(h.state(), State::AwaitingRelease);
+
+        // N's last reader enters `try_release_condemned` and loads the
+        // word here — then stalls, for a very long time.
+        let stale_token = h.metadata.load(Ordering::SeqCst);
+
+        // --- Meanwhile N is released by someone else (the condemner's
+        // race-fix recheck) and returns to the pool.
+        assert!(h.try_release_condemned());
+        assert_eq!(h.state(), State::Free);
+
+        // --- Incarnation N+1: the same segment is reserved again (which
+        // bumps the generation), filled, drained, and condemned again —
+        // this time with a live reader still pinning and reading it.
+        assert!(h.try_reserve());
+        h.set_state(State::Draining);
+        h.ref_count.fetch_add(1, Ordering::SeqCst);
+        assert!(h.cas_condemn());
+        assert_eq!(h.state(), State::AwaitingRelease);
+
+        // --- The stalled thread from N finally runs its CAS.
+        assert!(
+            !stale_release(&h, stale_token),
+            "a release token from an earlier incarnation must not win the \
+             AwaitingRelease -> Free transition against a later one"
+        );
+        assert_eq!(
+            h.state(),
+            State::AwaitingRelease,
+            "the later incarnation must stay condemned, not be freed under \
+             its live reader"
+        );
+        assert_eq!(
+            h.ref_count(),
+            1,
+            "the live reader is still reading the segment bytes"
+        );
+
+        // The handoff still belongs to N+1's real last reader, and works.
+        assert_eq!(h.release_reader_for_guard(), 1);
+        assert!(h.try_release_condemned());
+        assert_eq!(h.state(), State::Free);
     }
 }

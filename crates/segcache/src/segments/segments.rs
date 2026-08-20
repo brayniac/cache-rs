@@ -11,6 +11,11 @@ use core::hash::{BuildHasher, Hasher};
 use core::num::NonZeroU32;
 use crossbeam_utils::Backoff;
 use memmap2::MmapOptions;
+// Deliberately aliased: `Instant` in this crate is the *coarse* (1-second)
+// clock, which is correct for segment expiry deadlines but cannot measure
+// the sub-millisecond duration of an eviction. Duration measurement uses this.
+#[cfg(feature = "metrics")]
+use std::time::Instant as StdInstant;
 
 /// `Segments` contain all items within the cache. This struct is a collection
 /// of individual `Segment`s which are represented by a `SegmentHeader` and a
@@ -1031,7 +1036,7 @@ impl Segments {
         }
 
         #[cfg(feature = "metrics")]
-        let now = Instant::now();
+        let now = StdInstant::now();
 
         match self.policy {
             Policy::Merge { .. } => {

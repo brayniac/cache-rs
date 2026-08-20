@@ -14,6 +14,10 @@
 use crate::sync::Ordering;
 use crate::*;
 use clocksource::coarse::AtomicInstant;
+// Deliberately aliased: `Instant` in this crate is the *coarse* (1-second)
+// clock, which is correct for expiry deadlines but cannot measure the
+// sub-millisecond duration of a sweep. Duration measurement uses this.
+use std::time::Instant as StdInstant;
 
 const BUCKETS_PER_TIER: usize = 256;
 const TIER_COUNT: usize = 4;
@@ -97,7 +101,7 @@ impl TtlBuckets {
             return 0;
         }
 
-        let start = Instant::now();
+        let start = StdInstant::now();
         let mut expired = 0;
         for bucket in self.buckets.iter() {
             expired += bucket.expire(hashtable, segments);
@@ -113,7 +117,7 @@ impl TtlBuckets {
 
     /// Clear all segments across all buckets. Returns total segments cleared.
     pub(crate) fn clear(&self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
-        let start = Instant::now();
+        let start = StdInstant::now();
         let mut cleared = 0;
         for bucket in self.buckets.iter() {
             cleared += bucket.clear(hashtable, segments);

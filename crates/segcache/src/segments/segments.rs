@@ -108,10 +108,24 @@ impl Segments {
             builder.heap_size, segment_size, segments
         );
 
-        assert!(
-            segments < (1 << 24),
-            "heap size requires too many segments, reduce heap size or increase segment size"
-        );
+        // HARD failure, never a debug assert: segment ids are 1-based and a
+        // `Location` encodes one in 18 bits (the other 26 are the 6-bit
+        // incarnation tag and the 20-bit offset). A heap with more segments
+        // than that would truncate ids and silently ALIAS distinct segments
+        // onto one another — corruption that no later check would catch — so
+        // an oversized configuration must fail at construction.
+        //
+        // The limit is `MAX_SEGMENTS`, one BELOW the id field's maximum: the
+        // top id is reserved so that no real location can equal
+        // `Location::GHOST` (all 44 bits set), whose id field is exactly that
+        // value. Reserving one id of 262,143 is cheaper than reasoning about
+        // when "max id + tag 63 + last offset" is reachable.
+        if segments > Location::MAX_SEGMENTS as usize {
+            return Err(SegmentsError::TooManySegments {
+                segments,
+                limit: Location::MAX_SEGMENTS as usize,
+            });
+        }
 
         let evict_policy = builder.evict_policy;
 
@@ -121,7 +135,8 @@ impl Segments {
         let mut headers = Vec::with_capacity(0);
         headers.reserve_exact(segments);
         for idx in 0..segments {
-            // SAFETY: idx + 1 is always >= 1 and constrained to < 2^24.
+            // SAFETY: idx + 1 is always >= 1 and, by the capacity check above,
+            // at most `Location::MAX_SEGMENT_ID` (< 2^18).
             let header = SegmentHeader::new(unsafe { NonZeroU32::new_unchecked(idx as u32 + 1) });
             headers.push(header);
         }
@@ -290,12 +305,82 @@ impl Segments {
         (header.create_at(), header.ttl())
     }
 
-    /// Returns the generation counter for a segment. Bumped each time the
-    /// segment is returned to the free queue, so CAS tokens built from it
-    /// are invalidated when the segment is recycled.
+    /// Returns the generation counter for a segment. Bumped once per
+    /// segment lifecycle, on the transition that ends a *used* incarnation
+    /// (`Draining -> Free` or the condemned `AwaitingRelease -> Free`), so
+    /// CAS tokens built from it are invalidated when the segment is
+    /// recycled. Returning a never-written segment (`release_unused`) does
+    /// not bump: no token can name it.
     #[inline]
     pub(crate) fn generation(&self, seg_id: NonZeroU32) -> u16 {
         self.header(seg_id).generation()
+    }
+
+    /// Resolve a published `Location` to the `(segment id, byte offset)` it
+    /// addresses, but ONLY if it still names the incarnation that published it.
+    ///
+    /// The location's 6-bit tag is compared against the segment's live
+    /// `generation`; the generation advances exactly once per used-segment
+    /// lifecycle (`Draining -> Free`, `AwaitingRelease -> Free`), so a mismatch
+    /// means the addressed bytes were reclaimed and handed to someone else.
+    ///
+    /// # `None` is not an error
+    ///
+    /// `None` always means **"this location is no longer yours"** — never a
+    /// failure, never something to surface to a caller. Every site has a
+    /// no-op-shaped answer for it already: a lookup treats it as a miss and
+    /// retries, an unlink skips its accounting decrement (the incarnation that
+    /// owned the item is gone and its counters were reset wholesale on reuse),
+    /// a pin fails, a relocation skips the item exactly as a lost relink CAS
+    /// does. Do not add an error path for it.
+    ///
+    /// # Freezing the answer
+    ///
+    /// The comparison is a plain read: the generation can advance the
+    /// instant after it, so an unvalidated `Some` is only as stable as the
+    /// caller's grip on the segment. Sites that act on the result — decrement
+    /// counters, write bytes — call this while holding a pin (reader, writer or
+    /// remover) or a drain claim, all of which block the `-> Free` transitions
+    /// that bump the generation; under one of those, `Some` stays true for the
+    /// whole operation. Unpinned callers get a cheap filter, not a guarantee.
+    #[inline]
+    pub(crate) fn resolve(&self, location: Location) -> Option<(NonZeroU32, usize)> {
+        let (seg_id, offset) = unpack_location(location);
+        let seg_id = NonZeroU32::new(seg_id)?;
+        if seg_id.get() > self.cap {
+            return None;
+        }
+        if !self.tag_matches(location, seg_id) {
+            return None;
+        }
+        Some((seg_id, offset))
+    }
+
+    /// Does `location`'s incarnation tag still match `seg_id`'s live
+    /// generation? Split out so callers that already hold the id (and have
+    /// bounds-checked it) can re-check without re-unpacking.
+    #[inline]
+    fn tag_matches(&self, location: Location, seg_id: NonZeroU32) -> bool {
+        Self::tag_matches_header(location, self.header(seg_id))
+    }
+
+    /// The same comparison against a header the caller already holds.
+    ///
+    /// Identical to [`Self::tag_matches`] in every respect that matters — same
+    /// field of the same header, read at the same point — but it skips
+    /// re-deriving the header's address from `self`, which is not free on the
+    /// pinned read path. `acquire_item_at` reaches its tag check with the
+    /// header address already in a register, yet routing through `self` forces
+    /// a reload of the `headers` slice pointer (the SeqCst atomics in the pin
+    /// clobber LLVM's view of memory, so the earlier load cannot be reused) and
+    /// a second bounds check on an index that was already checked. That is a
+    /// two-deep dependent load chain in front of the generation load, and it
+    /// sits after the pin's acquiring re-check, which forbids the CPU from
+    /// starting it early. Passing the header in collapses the chain to the one
+    /// load the check actually needs.
+    #[inline]
+    fn tag_matches_header(location: Location, header: &SegmentHeader) -> bool {
+        location.tag() == crate::hashtable::location::tag_for_generation(header.generation())
     }
 
     // ── Item access ──────────────────────────────────────────────────
@@ -318,11 +403,25 @@ impl Segments {
     /// guard first. While the guard is alive the segment cannot be
     /// recycled, merged, or compacted. Returns `None` if the segment is
     /// not in a readable state.
-    pub(crate) fn acquire_item_at(
-        &self,
-        seg_id: NonZeroU32,
-        offset: usize,
-    ) -> Option<(RawItem, SegmentGuard)> {
+    ///
+    /// Takes the whole `Location` so the pin can be refused for a STALE
+    /// incarnation: the tag is checked *after* the reader guard is taken, so
+    /// the generation is frozen when it is read and a `Some` return means the
+    /// pinned segment really is the incarnation the caller's location names.
+    /// A mismatch fails the pin ([`Self::resolve`]: not an error — "no longer
+    /// yours"), which every caller already handles as a transient
+    /// not-readable.
+    ///
+    /// Ordering the pin before the tag is what makes the check meaningful,
+    /// not merely cheap: only a held pin blocks the two `-> Free` transitions
+    /// that bump the generation, so the comparison below reads a value that
+    /// cannot move until the guard drops. It also means the tag is only ever
+    /// consulted for a segment that is *currently readable* — `AwaitingRelease`
+    /// is not readable (#63), so a condemned segment is refused by
+    /// `try_acquire_reader` above and never reaches the comparison at all.
+    pub(crate) fn acquire_item_at(&self, location: Location) -> Option<(RawItem, SegmentGuard)> {
+        let (seg_id, offset) = unpack_location(location);
+        let seg_id = NonZeroU32::new(seg_id)?;
         assert!(seg_id.get() <= self.cap);
         let header = &self.headers[seg_id.get() as usize - 1];
 
@@ -363,6 +462,18 @@ impl Segments {
         // boxed slice owned by `self`) and the boxed Injector outlive
         // any guard reachable through the public API.
         let guard = unsafe { SegmentGuard::new(header, &*self.free_queue) };
+
+        // Incarnation check UNDER the guard (see above). Returning here drops
+        // `guard`, releasing the reader — including the condemned-segment
+        // handoff, exactly as a caller-side drop would.
+        //
+        // Against `header` rather than `seg_id`: the two read the same field of
+        // the same header at the same point in the protocol, but the `seg_id`
+        // form re-derives an address this frame already holds (see
+        // `tag_matches_header`).
+        if !Self::tag_matches_header(location, header) {
+            return None;
+        }
 
         let byte_offset = self.segment_size() as usize * (seg_id.get() as usize - 1) + offset;
         let raw = RawItem::from_ptr(unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) });
@@ -418,9 +529,13 @@ impl Segments {
         // `offset + size <= segment_size`, so the granted region lies
         // inside this segment's slice of the data mmap.
         let ptr = unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) };
+        // Read the generation under the writer pin taken above: the pin blocks
+        // the `-> Free` transitions that bump it, so this is still the segment's
+        // generation when the caller publishes the location.
         AllocOutcome::Reserved(ReservedItem::new(
             RawItem::from_ptr(ptr),
             seg_id,
+            header.generation(),
             offset as usize,
             pin,
         ))
@@ -631,8 +746,10 @@ impl Segments {
     // ── Free queue ───────────────────────────────────────────────────
 
     /// Return a drained segment to the free queue. The segment must be in
-    /// the Draining state with no readers pinning it; its write statistics
-    /// are reset (and its generation bumped) at reserve time.
+    /// the Draining state with no readers pinning it. The `Draining ->
+    /// Free` transition bumps the generation (a used incarnation is
+    /// ending); the write statistics are reset here and again at reserve
+    /// time.
     pub(crate) fn recycle(&self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
         debug_assert_eq!(
@@ -667,13 +784,12 @@ impl Segments {
         // resets at its own free sites instead — see `reset_write_stats`.
         self.headers[id_idx].reset_write_stats();
 
-        let freed = self.headers[id_idx].cas_metadata(
-            State::Draining,
-            State::Free,
-            Some(None),
-            Some(None),
-            Ordering::AcqRel,
-        );
+        // Draining -> Free, which also bumps the generation: this is one of
+        // the two transitions that end a *used* incarnation (the other is
+        // the condemned `AwaitingRelease -> Free`). The bump lands before
+        // the `return_segment` below, so no reserver can take this id and
+        // begin publishing at the outgoing generation.
+        let freed = self.headers[id_idx].try_release_drained();
         debug_assert!(freed, "recycled a segment that was not Draining");
 
         self.return_segment(id.get());
@@ -686,8 +802,9 @@ impl Segments {
     }
 
     /// Reserve a segment from the free queue. Returns the id of a
-    /// segment in the Reserved state (statistics reset, generation
-    /// bumped), which must then be linked into a segment chain.
+    /// segment in the Reserved state (statistics reset), which must then
+    /// be linked into a segment chain. The generation it carries was set
+    /// by whichever transition ended the previous incarnation.
     pub(crate) fn reserve_free(&self) -> Option<NonZeroU32> {
         loop {
             match self.free_queue.steal() {
@@ -1219,13 +1336,13 @@ impl Segments {
 
     // ── Remove ───────────────────────────────────────────────────────
 
-    /// Remove a single item from a segment based on the segment id and offset.
-    /// May trigger merge compaction if the merge eviction policy is active and
-    /// the segment occupancy drops below the compact ratio.
+    /// Remove a single item from a segment, named by the `Location` it was
+    /// published at. May trigger merge compaction if the merge eviction policy
+    /// is active and the segment occupancy drops below the compact ratio.
     ///
-    /// `pin` is a remover pin (item 7f) taken by the caller on `seg_id`
-    /// BEFORE unlinking the item from the hashtable, so it brackets the
-    /// unlink (caller's side) and this decrement (here) as one span a
+    /// `pin` is a remover pin (item 7f) taken by the caller on the location's
+    /// segment BEFORE unlinking the item from the hashtable, so it brackets
+    /// the unlink (caller's side) and this decrement (here) as one span a
     /// concurrent drain must wait out. It is dropped immediately after the
     /// decrement below, before any `chain_lock` acquisition — a drainer
     /// waits for `active_removers == 0` WHILE HOLDING `chain_lock`
@@ -1233,14 +1350,33 @@ impl Segments {
     /// function's own empty-free path below), so holding the pin across
     /// that acquisition would deadlock (the same lock-order rule as item
     /// 7d's `WriterPin`).
+    ///
+    /// # Stale locations are skipped, not reported
+    ///
+    /// The location is validated through [`Self::resolve`] under that pin —
+    /// which freezes the generation, so the answer holds for the whole call.
+    /// A mismatch means the incarnation that published the item is gone: its
+    /// bytes now belong to a different incarnation (marking them dead would
+    /// destroy someone else's live item, and `remove_item_at`'s offset assert
+    /// could even trip) and its counters were reset wholesale on reuse, so the
+    /// decrement is not merely unnecessary but wrong. Both are skipped and
+    /// `Ok(())` is returned: "no longer yours" is not an error, and no caller
+    /// has anything left to do about it.
     pub(crate) fn remove_at(
         &self,
-        seg_id: NonZeroU32,
-        offset: usize,
+        location: Location,
         ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
         pin: RemoverPin,
     ) -> Result<(), SegmentsError> {
+        let Some((seg_id, offset)) = self.resolve(location) else {
+            // Stale incarnation — nothing of ours is left here. Drop the pin
+            // (the caller's unlink is already done and needs no bracket) and
+            // report success: there is nothing to remove.
+            drop(pin);
+            return Ok(());
+        };
+
         // Remove the item.
         {
             let segment = self.segment(seg_id)?;
@@ -1898,7 +2034,13 @@ impl Segments {
             item.check_magic();
 
             let item_size = item.size();
-            let old_loc = pack_location(src.id(), offset as u64);
+            // RECONSTRUCTION (see `pack_location`): rebuilds the location the
+            // item was PUBLISHED under, for the relink CAS below. The caller
+            // claimed `src` for drain before this scan, so its generation
+            // cannot advance underneath us and `src.generation()` is the
+            // publishing generation. A wrong tag here would fail every relink
+            // CAS and silently turn promotion into a no-op.
+            let old_loc = pack_location(src.id(), src.generation(), offset as u64);
             if item.is_deleted() {
                 offset += item_size;
                 continue;
@@ -1914,7 +2056,9 @@ impl Segments {
             if freq > 0 {
                 let write_offset = dst.write_offset() as usize;
                 if write_offset + item_size < seg_size {
-                    let new_loc = pack_location(dst.id(), write_offset as u64);
+                    // Fresh publish into the promotion destination, which this
+                    // pass owns (`Relinking`), so its generation is fixed too.
+                    let new_loc = pack_location(dst.id(), dst.generation(), write_offset as u64);
                     // NUMERIC RELOCATION GATE (see `Segment::copy_into` for
                     // the full argument): hold the item's seqlock writer
                     // lock across the byte copy AND the relink CAS so an
@@ -2012,7 +2156,9 @@ impl Segments {
 
                 let item_size = item.size();
                 if !item.is_deleted() {
-                    let loc = pack_location(segment.id(), offset as u64);
+                    // Reconstruction: the caller holds this segment's drain
+                    // claim, so its generation is the publishing one.
+                    let loc = pack_location(segment.id(), segment.generation(), offset as u64);
                     let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
                     if !deleted {
                         let mut hasher = hashtable.hash_builder().build_hasher();
@@ -2465,8 +2611,11 @@ mod spare_tests {
 
         // Reader B's stalled lookup: it has already resolved `k000000` to
         // (head, first-item offset) and has NOT yet called
-        // `acquire_item_at`. This is the location it will pin with.
-        let stalled_offset = magic_overhead;
+        // `acquire_item_at`. This is the location it will pin with — built
+        // HERE, before the drain, so it carries the incarnation tag a
+        // pre-drain lookup would have returned (#50).
+        let stalled_location =
+            crate::pack_location(head, cache.segments.generation(head), magic_overhead as u64);
 
         // Reader A holds a live pin via the Item's SegmentGuard.
         let a = cache.get(b"k000000").expect("head item must resolve");
@@ -2494,7 +2643,7 @@ mod spare_tests {
 
         // --- B resumes HERE, in the gap between A's decrement and A's
         // release CAS, and pins with its pre-drain location.
-        let pinned = cache.segments.acquire_item_at(head, stalled_offset);
+        let pinned = cache.segments.acquire_item_at(stalled_location);
         let b_pinned = pinned.is_some();
         eprintln!(
             "B's post-condemn pin: {} (ref_count now {})",
@@ -2613,6 +2762,13 @@ mod spare_tests {
         );
         let free_before = cache.segments.free();
 
+        // The location the acquire runs against, carrying the head's CURRENT
+        // incarnation tag (#50) — so the tag check inside `acquire_item_at`
+        // passes and the acquire really does reach the increment/re-check
+        // window this test is about.
+        let location =
+            crate::pack_location(head, cache.segments.generation(head), magic_overhead as u64);
+
         // Phase 0: the acquire has taken its transient pin and has not yet
         //   re-checked. A drain claims the segment here, so the re-check
         //   will see `Draining` and the acquire will back out.
@@ -2651,7 +2807,7 @@ mod spare_tests {
             }
         }));
 
-        let acquired = cache.segments.acquire_item_at(head, magic_overhead);
+        let acquired = cache.segments.acquire_item_at(location);
         drop(hook);
 
         assert!(
@@ -2715,6 +2871,117 @@ mod spare_tests {
     }
 }
 
+/// The generation counter must advance once per *segment lifecycle* — the
+/// unit the location tag (#50) is carved against — and not once per trip
+/// through the free queue. The two tests below pin the two halves of that:
+/// a segment handed back without ever being written into costs nothing,
+/// and a segment that was actually used costs exactly one.
+#[cfg(all(test, not(feature = "loom")))]
+mod generation_tests {
+    use super::*;
+    use crate::eviction::Policy;
+
+    const SEGMENT_SIZE: i32 = 4096;
+
+    /// A single-segment heap: with a non-Merge policy `spare_capacity` is
+    /// zero, so every return lands in the free queue and the one and only
+    /// id comes straight back out of `reserve_free`.
+    fn build_one_segment() -> Segments {
+        SegmentsBuilder::default()
+            .segment_size(SEGMENT_SIZE)
+            .heap_size(SEGMENT_SIZE as usize)
+            .eviction_policy(Policy::Fifo)
+            .build()
+            .expect("build segments")
+    }
+
+    // The chain-extension election loser (`ttl_bucket.rs`'s `try_expand`
+    // paths) reserves a segment, loses the seal CAS, and hands the segment
+    // straight back via `release_unused` — no fill, no seal, no drain, no
+    // recycle. Nothing was ever published into it, so no location can name
+    // it and no generation needs to be spent invalidating one. Under
+    // contention that round trip can repeat in microseconds, so charging it
+    // a generation would decouple the counter from segment lifecycles.
+    #[test]
+    fn election_loser_release_does_not_bump_generation() {
+        let segments = build_one_segment();
+
+        let id = segments
+            .reserve_free()
+            .expect("the free queue starts with the one segment");
+        let generation = segments.generation(id);
+
+        segments.release_unused(id);
+
+        let again = segments
+            .reserve_free()
+            .expect("the released segment must be reservable again");
+        assert_eq!(again, id, "a one-segment heap must hand back the same id");
+
+        assert_eq!(
+            segments.generation(again),
+            generation,
+            "reserve -> release_unused -> re-reserve must not consume a \
+             generation: the segment was never written into"
+        );
+    }
+
+    // The complement: a segment that was reserved, filled, sealed, drained
+    // and recycled has had locations published into it, so exactly one
+    // generation must be spent invalidating them. Measured at the same
+    // phase of consecutive lifecycles (before the reserve), so the
+    // assertion is about the lifecycle, not about which transition carries
+    // the bump.
+    #[test]
+    fn used_segment_recycle_bumps_generation() {
+        let segments = build_one_segment();
+        let seg = NonZeroU32::new(1).unwrap();
+
+        for cycle in 0..3u16 {
+            let before = segments.generation(seg);
+            assert_eq!(before, cycle, "one generation consumed per lifecycle");
+
+            let id = segments.reserve_free().expect("segment must be reservable");
+            assert_eq!(id, seg);
+
+            // Fill: a real space reservation plus the live-item accounting a
+            // published item would leave behind, so `recycle`'s reset has
+            // something to reset.
+            let header = segments.header(id);
+            header
+                .try_reserve_space(64, SEGMENT_SIZE)
+                .expect("segment must have room");
+            header.incr_live_items();
+            header.incr_live_bytes(64);
+
+            // Reserved -> Live (published as the write tail) -> Sealed.
+            header.set_state(State::Live);
+            header.set_state(State::Sealed);
+            assert_eq!(
+                segments.generation(id),
+                before,
+                "filling and sealing must not touch the generation"
+            );
+
+            // Sealed -> Draining, then Draining -> Free.
+            assert!(segments.claim_for_drain(id), "drain claim must win");
+            assert_eq!(
+                segments.generation(id),
+                before,
+                "claiming for drain must not touch the generation"
+            );
+            segments.recycle(id);
+
+            assert_eq!(
+                segments.generation(id),
+                before + 1,
+                "a full fill/seal/drain/recycle lifecycle must bump exactly once"
+            );
+            assert_eq!(segments.header(id).state(), State::Free);
+        }
+    }
+}
+
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
     use loom::sync::atomic::AtomicU32 as LoomAtomicU32;
@@ -2769,5 +3036,132 @@ mod loom_tests {
             assert_eq!(spare_count.load(Ordering::Relaxed), wins);
             assert!(spare_count.load(Ordering::Relaxed) <= CAPACITY);
         });
+    }
+}
+
+/// A `Location` addresses a segment in 18 bits, so a heap may hold at most
+/// `Location::MAX_SEGMENTS` segments (ids are 1-based). Exceeding that would
+/// truncate ids and alias distinct segments onto each other, so construction
+/// refuses it outright rather than deferring to a debug assertion.
+///
+/// The limit is one below the id field's maximum: reserving the top id makes
+/// `Location::GHOST` unreachable for real items (see
+/// `hashtable::tests::test_ghost_is_unreachable_by_construction`), and the
+/// last test here is what turns that reservation from a comment into a
+/// guarantee.
+#[cfg(all(test, not(feature = "loom")))]
+mod capacity_tests {
+    use super::*;
+
+    /// A small-but-legal segment size (comfortably above the item-header
+    /// minimum under every feature combination), so a heap of a given segment
+    /// COUNT costs as little memory as possible.
+    const TINY_SEGMENT: i32 = 24;
+
+    fn build_with_segments(count: usize) -> Result<Segments, SegmentsError> {
+        SegmentsBuilder::default()
+            .segment_size(TINY_SEGMENT)
+            .heap_size(TINY_SEGMENT as usize * count)
+            .build()
+    }
+
+    /// The user-visible number, stated once in absolute terms. The tests
+    /// around it are all written against `MAX_SEGMENTS`, so without this they
+    /// would follow a botched width change silently instead of failing.
+    #[test]
+    fn the_capacity_limit_is_the_documented_number() {
+        assert_eq!(
+            Location::MAX_SEGMENT_ID,
+            262_143,
+            "2^18 - 1 addressable ids"
+        );
+        assert_eq!(
+            Location::MAX_SEGMENTS,
+            262_142,
+            "one fewer than the field holds: the top id is reserved for GHOST"
+        );
+    }
+
+    #[test]
+    fn rejects_more_segments_than_the_id_field_holds() {
+        let over = Location::MAX_SEGMENTS as usize + 1;
+        let Err(err) = build_with_segments(over) else {
+            panic!("oversized heap must fail to build");
+        };
+        assert!(
+            matches!(
+                err,
+                SegmentsError::TooManySegments { segments, limit }
+                    if segments == over && limit == Location::MAX_SEGMENTS as usize
+            ),
+            "unexpected error: {err}"
+        );
+        // The message names both the limit and the lever.
+        let msg = err.to_string();
+        assert!(msg.contains(&Location::MAX_SEGMENTS.to_string()), "{msg}");
+        assert!(msg.contains("segment_size"), "{msg}");
+    }
+
+    /// The id field could hold one more segment than the limit allows. That
+    /// last id is REFUSED on purpose (it is the ghost sentinel's id), so this
+    /// is a boundary test, not an off-by-one.
+    #[test]
+    fn rejects_a_heap_needing_the_reserved_top_id() {
+        let at_field_max = Location::MAX_SEGMENT_ID as usize;
+        let Err(err) = build_with_segments(at_field_max) else {
+            panic!("a heap needing the reserved top id must fail to build");
+        };
+        assert!(
+            matches!(
+                err,
+                SegmentsError::TooManySegments { segments, limit }
+                    if segments == at_field_max && limit == Location::MAX_SEGMENTS as usize
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_heap_just_under_the_limit() {
+        // One below the limit still builds: the check is `>`, not `>=`, and a
+        // heap that fits must not be refused.
+        let segments = match build_with_segments(Location::MAX_SEGMENTS as usize - 1) {
+            Ok(s) => s,
+            Err(e) => panic!("must build: {e}"),
+        };
+        assert_eq!(segments.cap, Location::MAX_SEGMENTS - 1);
+    }
+
+    #[test]
+    fn accepts_a_heap_at_exactly_the_limit() {
+        let segments = match build_with_segments(Location::MAX_SEGMENTS as usize) {
+            Ok(s) => s,
+            Err(e) => panic!("must build: {e}"),
+        };
+        assert_eq!(segments.cap, Location::MAX_SEGMENTS);
+        // The largest id is exactly representable, tag and offset untouched.
+        let max_id = NonZeroU32::new(segments.cap).unwrap();
+        let loc = crate::pack_location(max_id, 0, 0);
+        assert_eq!(crate::unpack_location(loc), (Location::MAX_SEGMENTS, 0));
+    }
+
+    /// The ghost corner, closed by construction: on the LARGEST heap that can
+    /// be built, the most extreme location any item in it could publish — top
+    /// id, tag 63, last encodable offset — is still not the sentinel. There is
+    /// no configuration left in which a real location aliases `GHOST`.
+    #[test]
+    fn largest_buildable_heap_cannot_alias_the_ghost_sentinel() {
+        let segments = match build_with_segments(Location::MAX_SEGMENTS as usize) {
+            Ok(s) => s,
+            Err(e) => panic!("must build: {e}"),
+        };
+        let max_id = NonZeroU32::new(segments.cap).unwrap();
+        let max_offset = crate::hashtable::location::OFFSET_MASK << 3;
+        let max_tag = crate::hashtable::location::TAG_MASK as u16;
+        let loc = crate::pack_location(max_id, max_tag, max_offset);
+        assert!(
+            !loc.is_ghost(),
+            "the extreme location of the largest buildable heap aliased GHOST: {loc:?}"
+        );
     }
 }

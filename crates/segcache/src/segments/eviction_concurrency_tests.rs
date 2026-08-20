@@ -145,9 +145,17 @@ fn merge_halts_at_pinned_candidate_and_relocates_survivors() {
         "precondition: X's segment must be Sealed (readable, not the Live tail)"
     );
 
+    // `acquire_item_at` takes the whole location so it can refuse the pin for
+    // a stale incarnation; X's segment is live and unrecycled here, so its
+    // current generation IS the one its items were published under.
+    let x_location = crate::pack_location(
+        x_seg,
+        cache.segments.generation(x_seg),
+        magic_overhead as u64,
+    );
     let (raw_item_x, guard_x) = cache
         .segments
-        .acquire_item_at(x_seg, magic_overhead)
+        .acquire_item_at(x_location)
         .expect("X's segment must be readable and pinnable");
 
     // The pin is live: ref_count bumped.
@@ -792,8 +800,11 @@ fn reservers_vs_evictor_disjoint() {
                         // op, item-4/7b) so it is a REAL item, not an orphan —
                         // an unpublished reserved item would break the merge's
                         // clear() accounting if its segment were ever merged.
-                        let location =
-                            crate::pack_location(reserved.seg(), reserved.offset() as u64);
+                        let location = crate::pack_location(
+                            reserved.seg(),
+                            reserved.generation(),
+                            reserved.offset() as u64,
+                        );
                         let verifier = segments.verifier();
                         let _ = hashtable.insert(item.key(), location, &verifier);
                     }
@@ -981,7 +992,11 @@ fn concurrent_reservers_vs_drain_same_bucket() {
                         // publish, so the segment only becomes drainable once
                         // the item is a real, resolvable entry (H2).
                         let location =
-                            crate::pack_location(reserved.seg(), reserved.offset() as u64);
+                            crate::pack_location(
+                                reserved.seg(),
+                                reserved.generation(),
+                                reserved.offset() as u64,
+                            );
                         let verifier = segments.verifier();
                         let _ = hashtable.insert(item.key(), location, &verifier);
                     }

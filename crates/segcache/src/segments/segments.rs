@@ -327,6 +327,23 @@ impl Segments {
             super::AcquireOutcome::ReleaseCondemned => {
                 // Backing the pin out left a condemned segment with no
                 // reader remaining, and this caller won its release.
+                //
+                // Settle the accounting FIRST, exactly as the other two
+                // claimants of that CAS do (`recycle`/the last guard drop,
+                // and `condemn`'s race-fix recheck): the won CAS already
+                // flipped the word to `Free` with `ref_count` at zero and
+                // nothing can find the segment until the push below, so we
+                // are its sole owner here. Skipping it puts a segment on
+                // the free queue still carrying its whole dead charge and
+                // any unpinned-unlink live residue, leaving `ITEM_DEAD` /
+                // `ITEM_DEAD_BYTES` above the true dead occupancy — and
+                // `ITEM_CURRENT`/`ITEM_CURRENT_BYTES` above the true live
+                // count — until some later `try_reserve` happens to pick
+                // that segment up, which for an idle cache is never (issue
+                // #58 part 2). `reset_write_stats` is idempotent, so the
+                // reserve-time reset stays harmless.
+                header.reset_write_stats();
+
                 self.return_segment(seg_id.get());
 
                 #[cfg(feature = "metrics")]
@@ -639,10 +656,10 @@ impl Segments {
         // skipped those already-unlinked items, so `live_*`/`write_offset`
         // may be transiently over-counted (see the item 7f note on
         // `Segment::clear`). Resetting here keeps a Free segment reporting
-        // zero items (`items()`); `try_reserve` repeats the reset as the
-        // authoritative one, covering the condemned path (guard-drop free)
-        // that does not pass through here — which is also why
-        // `check_integrity` skips out-of-service segments.
+        // zero items (`items()`) and off the dead gauges; `try_reserve`
+        // repeats the reset (idempotently) when the segment is handed to its
+        // next tenant. The condemned path does not pass through here, so it
+        // resets at its own free sites instead — see `reset_write_stats`.
         self.headers[id_idx].reset_write_stats();
 
         let freed = self.headers[id_idx].cas_metadata(
@@ -863,6 +880,21 @@ impl Segments {
         self.claim_for_drain(id)
     }
 
+    /// Test-only shim exposing the private `s3fifo_promote_from` (the second
+    /// relocation site, alongside `Segment::copy_into`), so
+    /// `dead_accounting_tests` can drive exactly one promotion and inspect the
+    /// source's counters instead of inferring them from an eviction storm.
+    #[cfg(test)]
+    #[allow(dead_code)] // caller is cfg'd out under loom
+    pub(crate) fn s3fifo_promote_from_for_test(
+        &self,
+        src_id: NonZeroU32,
+        dst_id: NonZeroU32,
+        hashtable: &MultiChoiceHashtable,
+    ) {
+        self.s3fifo_promote_from(src_id, dst_id, hashtable);
+    }
+
     /// Test-only shim exposing the private `finalize_drained` (sweep the
     /// segment's remaining hashtable entries, then recycle or condemn it),
     /// the completion half of `claim_for_drain_for_test`. Lets a test park a
@@ -961,6 +993,14 @@ impl Segments {
         if self.headers[id_idx].ref_count_seqcst() == 0
             && self.headers[id_idx].try_release_condemned()
         {
+            // Settle the accounting before the segment becomes reachable
+            // again, exactly as `recycle` and the last guard drop do: the
+            // won CAS makes us its sole owner, and a segment must not sit on
+            // the free queue carrying live residue or dead occupancy (issue
+            // #58 part 2). Idempotent, so the reserve-time reset still runs
+            // harmlessly.
+            self.headers[id_idx].reset_write_stats();
+
             self.return_segment(id.get());
 
             #[cfg(feature = "metrics")]
@@ -1902,6 +1942,12 @@ impl Segments {
                     drop(vguard);
                     if relinked {
                         src.remove_item_at(offset);
+                        // A promotion is not a death: take back the dead
+                        // charge `remove_item_at` just put on the source
+                        // (see `Segment::copy_into`). Unconditional, like
+                        // every other header counter — only the global gauge
+                        // mirror below is `metrics`-gated.
+                        src.decr_dead_item(item_size as i32);
                         dst.incr_live_items();
                         dst.incr_live_bytes(item_size as i32);
                         dst.set_write_offset(write_offset as i32 + item_size as i32);
@@ -1911,14 +1957,17 @@ impl Segments {
                             ITEM_RELINK.increment();
                             ITEM_COMPACTED.increment();
                             // A promotion MOVES an item, it does not kill
-                            // one, so it must be gauge-NEUTRAL: the
-                            // `remove_item_at` above already decremented the
-                            // global item gauges, while the destination's
-                            // header bumps do not touch them. Re-add here,
+                            // one, so it must be gauge-NEUTRAL on BOTH
+                            // sides: the `remove_item_at` above decremented
+                            // the global live gauges and incremented the
+                            // global dead gauges, while the destination's
+                            // header bumps do not touch either. Undo here,
                             // per item, exactly as `Segment::copy_into`
                             // does.
                             ITEM_CURRENT.increment();
                             ITEM_CURRENT_BYTES.add(item_size as _);
+                            ITEM_DEAD.decrement();
+                            ITEM_DEAD_BYTES.sub(item_size as _);
                         }
                     }
                 }
@@ -2096,13 +2145,14 @@ impl Segments {
             let seg_end = seg_start + self.segment_size as usize;
             let header = &self.headers[idx];
             // Only in-service segments (Live/Sealed/Relinking) have a
-            // meaningful counted-vs-header comparison. A drained segment
-            // that left service via the condemned path (AwaitingRelease ->
-            // guard-drop free) can legitimately carry residual counters
-            // from unlinked-without-pin removals until `try_reserve` resets
-            // them (see `reset_write_stats`); counting it would report a
-            // false mismatch. Draining segments are mid-parse by their
-            // owner and equally transient.
+            // meaningful counted-vs-header comparison. A segment on its way
+            // out can legitimately carry residual counters from
+            // unlinked-without-pin removals — a `Draining` one is mid-parse
+            // by its owner, and an `AwaitingRelease` one is waiting on its
+            // last pin to drop — so counting either would report a false
+            // mismatch. The residue is settled by the `reset_write_stats`
+            // on whichever path actually frees the segment, so a `Free` one
+            // no longer carries it.
             match header.state() {
                 State::Live | State::Sealed | State::Relinking => {}
                 _ => continue,
@@ -2564,7 +2614,14 @@ mod spare_tests {
         // Phase 1: the acquire is parked between that failed re-check and
         //   its backout. The drain finishes: it observes the transient pin
         //   and condemns, deferring reclamation to "the last reader".
+
+        // Read inside the hook, at the instant the segment becomes
+        // AwaitingRelease: the dead charge the backout is then on the hook
+        // to settle.
+        let dead_at_condemn = Rc::new(std::cell::Cell::new(0i32));
+
         let hooked = Rc::clone(&cache);
+        let dead_probe = Rc::clone(&dead_at_condemn);
         let hook = acquire_hook::install(Box::new(move |phase| match phase {
             0 => {
                 assert!(
@@ -2585,6 +2642,7 @@ mod spare_tests {
                     State::AwaitingRelease,
                     "the drain handed reclamation to the last reader"
                 );
+                dead_probe.set(hooked.segments.header(head).dead_items());
             }
         }));
 
@@ -2611,6 +2669,43 @@ mod spare_tests {
             cache.segments.free(),
             free_before + 1,
             "the segment must return to the pool, not be stranded"
+        );
+
+        // The winning backout is the THIRD claimant of the AwaitingRelease
+        // -> Free CAS, alongside the last guard drop and the condemner's
+        // race-fix recheck, so it owes the same accounting settlement they
+        // do. A segment must never land on the free queue still carrying
+        // the dead weight of everything that died in it, nor the live-side
+        // residue of removals that unlinked without a remover pin: until
+        // some later `try_reserve` happens to pick that segment up,
+        // `ITEM_DEAD`/`ITEM_DEAD_BYTES` sit above the true dead occupancy
+        // and `ITEM_CURRENT`/`ITEM_CURRENT_BYTES` above the true live count
+        // (issue #58 part 2). For a cache that stops writing, "later" is
+        // never.
+        let freed = cache.segments.header(head);
+        // Non-vacuity: the drain really did kill items in this segment, so
+        // there was a charge to settle.
+        assert!(
+            dead_at_condemn.get() > 0,
+            "the drain must have charged the segment with dead space, or \
+             this probe proves nothing"
+        );
+        let initial_offset = if cfg!(feature = "integrity") {
+            core::mem::size_of::<u64>() as i32
+        } else {
+            0
+        };
+        assert_eq!(
+            (
+                freed.dead_items(),
+                freed.dead_bytes(),
+                freed.live_items(),
+                freed.live_bytes(),
+            ),
+            (0, 0, 0, initial_offset),
+            "(dead_items, dead_bytes, live_items, live_bytes) — the backout \
+             freed the segment without settling its accounting, so it reached \
+             the free queue still charged"
         );
     }
 }

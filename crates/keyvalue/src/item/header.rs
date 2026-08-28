@@ -191,6 +191,23 @@ impl ItemHeader {
         self.flags.load(Ordering::Relaxed) & DELETE_MASK != 0
     }
 
+    /// The raw flags byte, read atomically — for code that must hash or
+    /// copy header bytes while a concurrent `set_deleted` may be flipping
+    /// the delete bit (the CRC computations). A plain byte read of this
+    /// field would be the same data race the atomic accessors exist to
+    /// avoid.
+    #[cfg(feature = "integrity")]
+    #[inline]
+    pub(crate) fn flags_byte(&self) -> u8 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// Byte offset of the flags byte within the header, for the CRC
+    /// hashers that must splice an atomically-loaded flags byte into the
+    /// plain header prefix. Pinned by `field_offsets_are_the_packed_layout`.
+    #[cfg(feature = "integrity")]
+    pub(crate) const FLAGS_OFFSET: usize = 3;
+
     /// Mark or unmark the item deleted. `&self` and atomic by design:
     /// this is the one header mutation performed on a PUBLISHED item, so
     /// it must neither race flag readers non-atomically nor manufacture
@@ -275,6 +292,12 @@ mod tests {
             std::slice::from_raw_parts(&h as *const ItemHeader as *const u8, ITEM_HDR_SIZE)
         };
         let base = if cfg!(feature = "integrity") { 2 } else { 0 };
+        #[cfg(feature = "integrity")]
+        assert_eq!(
+            base + 1,
+            ItemHeader::FLAGS_OFFSET,
+            "FLAGS_OFFSET must track the flags byte's position"
+        );
         assert_eq!(bytes[base], 0xAB, "klen byte");
         assert_eq!(bytes[base + 1], NUMERIC_MASK | 0x15, "flags byte");
         assert_eq!(

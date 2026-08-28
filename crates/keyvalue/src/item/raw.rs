@@ -413,10 +413,10 @@ impl RawItem {
 
     /// Atomic view of the header CRC field.
     ///
-    /// The header is `repr(C, packed)`, so this goes through pointer
-    /// arithmetic (the CRC is the trailing 4 bytes of the header, at
-    /// item offset 8 — 4-aligned given 8-aligned item starts), never a
-    /// field reference.
+    /// Reached by pointer arithmetic rather than a field reference (the
+    /// CRC is the trailing 4 bytes of the header, at item offset 8 —
+    /// 4-aligned given 8-aligned item starts), because the word is
+    /// concurrently updated through `&self`.
     #[cfg(feature = "integrity")]
     #[inline]
     fn crc_word(&self) -> &core::sync::atomic::AtomicU32 {
@@ -468,6 +468,30 @@ impl RawItem {
         }
     }
 
+    /// Hash the header bytes before the CRC field, reading the flags
+    /// byte atomically: `set_deleted` flips the delete bit on a PUBLISHED
+    /// item, and a numeric writer's CRC recompute (reader pin + item
+    /// seqlock — which do not exclude a deleting remover) can race it. A
+    /// plain read of that one byte would be a data race; the rest of the
+    /// prefix is immutable after define.
+    #[cfg(feature = "integrity")]
+    fn hash_header_prefix(&self, hasher: &mut crc32fast::Hasher) {
+        let crc_field_offset = ITEM_HDR_SIZE - std::mem::size_of::<u32>();
+        unsafe {
+            hasher.update(std::slice::from_raw_parts(
+                self.data,
+                ItemHeader::FLAGS_OFFSET,
+            ));
+            hasher.update(&[self.header().flags_byte()]);
+            hasher.update(std::slice::from_raw_parts(
+                self.data.add(ItemHeader::FLAGS_OFFSET + 1),
+                crc_field_offset - ItemHeader::FLAGS_OFFSET - 1,
+            ));
+        }
+        // CRC field treated as zeros
+        hasher.update(&[0u8; 4]);
+    }
+
     /// Numeric CRC: hash up to the value slot from the buffer, then the
     /// value from a caller-supplied snapshot (an atomic load), so the
     /// computation never does a plain read of the concurrently-updated
@@ -478,11 +502,8 @@ impl RawItem {
         let crc_field_offset = ITEM_HDR_SIZE - crc_field_size;
 
         let mut hasher = crc32fast::Hasher::new();
+        self.hash_header_prefix(&mut hasher);
         unsafe {
-            // header before the CRC field
-            hasher.update(std::slice::from_raw_parts(self.data, crc_field_offset));
-            // CRC field treated as zeros
-            hasher.update(&[0u8; 4]);
             // optional + key + pad (immutable after define)
             let after_offset = crc_field_offset + crc_field_size;
             let value_offset = self.value_offset();
@@ -505,10 +526,8 @@ impl RawItem {
         let crc_field_offset = ITEM_HDR_SIZE - crc_field_size;
 
         let mut hasher = crc32fast::Hasher::new();
+        self.hash_header_prefix(&mut hasher);
         unsafe {
-            let before = std::slice::from_raw_parts(self.data, crc_field_offset);
-            hasher.update(before);
-            hasher.update(&[0u8; 4]);
             let after_offset = crc_field_offset + crc_field_size;
             if end > after_offset {
                 let after =

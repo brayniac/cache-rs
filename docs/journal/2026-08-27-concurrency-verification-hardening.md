@@ -111,18 +111,42 @@ the TSan reports:
   do not exclude a deleting remover). Evidence: TSan on the suite went
   from 9 reports (2 classes) to 6 reports (1 class — `init` vs stale
   verify only; `set_deleted` class gone), 156 tests green under TSan.
-- **2b (next) — pinned verify.** `SegmentsVerifier::verify` reads item
-  bytes with no pin and no tag check; a stale location can point into a
-  recycled segment mid-`define` (the remaining TSan class). Design:
-  verify resolves + reader-pins + tag-checks before any byte read, with a
-  three-way outcome (match / mismatch / unknown) so an unpinnable segment
-  retries — via the existing `SlotVerify::Changed`-style handling — rather
-  than manufacturing a false miss (the `pin_failure_tests` invariant).
-  Under pin + valid tag the compare is authoritative, which also retires
-  `verify_slot`'s slot-re-read disambiguation on that path. Perf gate:
-  same-machine interleaved A/B on get_hit/get_miss/set/incr.
-- **2c — TSan CI job** (issue #61), suppression-free once 2b lands, with
-  `halt_on_error=1` and the soak tests excluded.
+- **2b — make the race defined: PARKED (no-go for merge), branch
+  `racy-bytes` @ 03f3ff2, issue #91.** The pinned-verify design was
+  worked through first and set aside for its deadlock corner (an insert
+  holding its WriterPin verifying an old copy in a draining segment —
+  the #54/#56 rule) — then the racy-atomics design was fully built:
+  `keyvalue::racy_bytes` (word-granular relaxed-atomic helpers, masked
+  compares, merge-stores; mixed-size atomics avoided per the language
+  model with one documented residual), `define`/relocation-copy racy
+  prefixes, verify bounded to the item's own segment (also fixing a real
+  pre-existing ~330-byte out-of-bounds read past the heap on garbage
+  lengths). TSan 6 -> 0, all suites green, adversarially reviewed. But
+  same-path interleaved A/B — after five optimization rounds — settles
+  at set/1b +12-17% and get_hit/255b +19.5% (get_hit/1b +1.5%, incr
+  +3-5%): ~2.5ns define staging, ~3ns amortized eviction-scan verifies,
+  ~13ns scalar-vs-SIMD on long-key compares (atomic loads cannot
+  vectorize) — inherent to the design. By the 7f precedent (recover perf
+  before landing), parked. The recovery design — pinned verify with a
+  three-way outcome: plain SIMD compares under the pin, skip-don't-wait
+  for eviction scans, rollback-restart for insert's WriterPin-holding
+  scan — is specified in #91 and also retires #81's perf debt.
+  BENCH LESSON, hard-won: an apparent +15% persisted across three
+  optimization rounds until compile-time-cfg bisects showed every
+  component at ~zero — the offset was a build-path code-layout artifact.
+  Same-path builds or same-binary cfg toggles only; min-of-N does not
+  save you from a layout confound. Also surfaced: `crc32fast` is ~27% of
+  every set (keyvalue's `integrity` is non-optional for segcache) —
+  pre-existing, worth its own look.
+- **2c — TSan CI job** (issue #61, this PR): ubuntu nightly
+  `-Zbuild-std` job with `halt_on_error=1`, ONE suppression
+  (`race:SegmentsVerifier` — both known pairings, init and set_deleted,
+  carry that frame; removal tracked by #91), `--tests` (doctests don't
+  get the sanitizer ABI under -Zbuild-std), the two soaks and the
+  TSan-timing-sensitive cas_incr_stress skipped (all still run in the
+  normal matrix). Gate validated in both directions on this machine:
+  main's six known reports suppress to a green run (156 tests), and a
+  synthetic novel race (no verify frame) reddens it.
 ### Item 3 — Kani harness pack: not started
 ### Item 4 — fuzz modernization + lint hygiene: not started
 

@@ -72,7 +72,7 @@ pub(crate) enum AcquireOutcome {
 /// Phases:
 ///   0 — after the `ref_count` increment, before the state re-check
 ///   1 — after the re-check failed, before the backout
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 pub(crate) mod acquire_hook {
     use std::cell::RefCell;
 
@@ -185,10 +185,11 @@ pub(crate) struct SegmentHeader {
     _pad: [u8; 4],
 }
 
-// Loom atomics are larger than std atomics, so skip size check under loom.
-#[cfg(not(feature = "loom"))]
+// Model-checking atomics may be larger than std atomics, so the layout
+// asserts only apply to production builds.
+#[cfg(not(model_checking))]
 const _: () = assert!(std::mem::size_of::<SegmentHeader>() == 64);
-#[cfg(not(feature = "loom"))]
+#[cfg(not(model_checking))]
 const _: () = assert!(std::mem::align_of::<SegmentHeader>() == 64);
 
 impl SegmentHeader {
@@ -618,13 +619,13 @@ impl SegmentHeader {
         // shape, not this ordering requirement.
         self.ref_count.fetch_add(1, Ordering::SeqCst);
 
-        #[cfg(all(test, not(feature = "loom")))]
+        #[cfg(all(test, not(model_checking)))]
         acquire_hook::fire(0);
 
         // Re-check after the increment: a writer that observed
         // ref_count == 0 may have transitioned the state concurrently.
         if !self.metadata(Ordering::SeqCst).state.is_readable() {
-            #[cfg(all(test, not(feature = "loom")))]
+            #[cfg(all(test, not(model_checking)))]
             acquire_hook::fire(1);
 
             // Back out. The decrement must use the same SeqCst handoff as
@@ -1476,7 +1477,325 @@ mod loom_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+// Shuttle twins of the pin/drain models above, WITH the strong invariants
+// asserted. Shuttle executes sequentially consistently (every ordering is
+// treated as SeqCst), so the SC-total-order halves of the protocol
+// invariants — exactly the ones the loom module's NOTE documents as
+// unassertable there — are assertable here, and asserting them is this
+// module's entire purpose. The trade is symmetric: shuttle can never catch
+// an ordering that is too weak (a `Release` degraded to `Relaxed`), which
+// is what the loom suite covers. Keep both green; neither subsumes the
+// other. A failing model prints a schedule string to pass to
+// `shuttle::replay` for a deterministic reproduction.
+#[cfg(all(test, feature = "shuttle", not(feature = "loom")))]
+mod shuttle_tests {
+    use super::*;
+    use crate::segments::state::State;
+    use crate::sync::shuttle_iters;
+    use core::num::NonZeroU32;
+    use shuttle::thread;
+    use std::sync::Arc;
+
+    /// The tool premise, checked rather than assumed: shuttle forbids the
+    /// store-buffering outcome for SeqCst accesses. loom fails this exact
+    /// litmus (it cannot model the SC total order — the reason its models
+    /// assert only SC-independent halves). If this test ever fails,
+    /// shuttle's execution model has regressed and every strong assertion
+    /// below loses its foundation — treat that as disabling the module,
+    /// not as a bug in the models.
+    #[test]
+    fn shuttle_seqcst_store_buffering_forbidden() {
+        shuttle::check_random(
+            || {
+                let x = Arc::new(AtomicU32::new(0));
+                let y = Arc::new(AtomicU32::new(0));
+
+                let t1 = {
+                    let x = Arc::clone(&x);
+                    let y = Arc::clone(&y);
+                    thread::spawn(move || {
+                        x.store(1, Ordering::SeqCst);
+                        y.load(Ordering::SeqCst)
+                    })
+                };
+                let t2 = {
+                    let x = Arc::clone(&x);
+                    let y = Arc::clone(&y);
+                    thread::spawn(move || {
+                        y.store(1, Ordering::SeqCst);
+                        x.load(Ordering::SeqCst)
+                    })
+                };
+
+                let r1 = t1.join().unwrap();
+                let r2 = t2.join().unwrap();
+                assert!(
+                    !(r1 == 0 && r2 == 0),
+                    "store-buffering outcome observed under SeqCst"
+                );
+            },
+            shuttle_iters(50_000),
+        );
+    }
+
+    /// Readers vs a CAS-gated drain — the strong (Dekker) invariant: a
+    /// pinned reader NEVER coexists with a committed drain. The drain side
+    /// mirrors the recycle gate (claim Draining by CAS, re-check the reader
+    /// count, commit only on zero — `claim_for_drain` + `finalize_drained`);
+    /// the reader side is the two-phase `try_acquire_reader` (fetch_add,
+    /// then re-check the state). Under SC exactly one of the two rechecks
+    /// must observe the other side's first step, which is what makes the
+    /// assert sound. The revert on a raced-in pin is a model-only stand-in
+    /// (inherited from the loom twin): production CONDEMNS instead — there
+    /// is no `Draining -> Sealed` edge — and that branch is what
+    /// `shuttle_awaiting_release_exactly_one_free` covers. The revert is
+    /// strictly more permissive to readers than condemn, so it explores a
+    /// superset of reader-pin schedules against the commit gate.
+    #[test]
+    fn shuttle_readers_vs_cas_gated_drain_strong() {
+        shuttle::check_random(
+            || {
+                let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+                header.set_state(State::Sealed);
+                let committed = Arc::new(AtomicU32::new(0));
+
+                let readers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let h = Arc::clone(&header);
+                        let c = Arc::clone(&committed);
+                        thread::spawn(move || {
+                            if h.try_acquire_reader() == AcquireOutcome::Acquired {
+                                assert_eq!(
+                                    c.load(Ordering::SeqCst),
+                                    0,
+                                    "pinned reader observed a COMMITTED drain"
+                                );
+                                h.release_reader();
+                            }
+                        })
+                    })
+                    .collect();
+
+                let drainer = {
+                    let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
+                    thread::spawn(move || {
+                        if h.cas_metadata(
+                            State::Sealed,
+                            State::Draining,
+                            None,
+                            None,
+                            Ordering::SeqCst,
+                        ) {
+                            if h.ref_count_seqcst() != 0 {
+                                // a pin raced in: revert before touching bytes
+                                assert!(h.cas_metadata(
+                                    State::Draining,
+                                    State::Sealed,
+                                    None,
+                                    None,
+                                    Ordering::AcqRel,
+                                ));
+                            } else {
+                                c.store(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                };
+
+                for r in readers {
+                    r.join().unwrap();
+                }
+                drainer.join().unwrap();
+
+                assert_eq!(header.ref_count(), 0);
+            },
+            shuttle_iters(50_000),
+        );
+    }
+
+    /// The AwaitingRelease handoff with BOTH halves asserted: exactly one
+    /// of {evictor, last reader's guard drop} frees the condemned segment.
+    /// "At most once" is CAS uniqueness (loom covers it); "at least once"
+    /// — no leak — is the SC-dependent half of the decrement/condemn
+    /// Dekker pair that loom reports false violations for, asserted here.
+    #[test]
+    fn shuttle_awaiting_release_exactly_one_free() {
+        shuttle::check_random(
+            || {
+                let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+                // a drained segment with one outstanding pin
+                header.set_state(State::Draining);
+                header.ref_count.store(1, Ordering::SeqCst);
+                let freed = Arc::new(AtomicU32::new(0));
+
+                let evictor = {
+                    let h = Arc::clone(&header);
+                    let f = Arc::clone(&freed);
+                    thread::spawn(move || {
+                        // condemn (mirrors Segments::condemn)
+                        assert!(h.cas_condemn());
+                        // race fix: the pin may have dropped before the CAS
+                        if h.ref_count_seqcst() == 0 && h.try_release_condemned() {
+                            f.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                };
+
+                let reader = {
+                    let h = Arc::clone(&header);
+                    let f = Arc::clone(&freed);
+                    thread::spawn(move || {
+                        // mirrors SegmentGuard::drop
+                        let prev = h.release_reader_for_guard();
+                        if prev == 1 && h.try_release_condemned() {
+                            f.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                };
+
+                evictor.join().unwrap();
+                reader.join().unwrap();
+
+                assert_eq!(
+                    freed.load(Ordering::SeqCst),
+                    1,
+                    "exactly one side must free the condemned segment: \
+                     0 is the leak loom cannot rule out, 2 is a double-free"
+                );
+                assert_eq!(header.state(), State::Free);
+                assert_eq!(header.ref_count(), 0);
+            },
+            shuttle_iters(50_000),
+        );
+    }
+
+    /// Writers vs a drain claim, in production's actual shape (the loom
+    /// twin can only record a single discarded observation): the claimer
+    /// takes the `Live -> Draining` CAS and then WAITS for the write-pin
+    /// count to reach zero — `claim_for_drain` / `drain_chain`'s spin —
+    /// before committing (parsing segment bytes, in production). Strong
+    /// invariant, both directions of the H1 hazard: a writer holding a pin
+    /// never coexists with a committed drain.
+    #[test]
+    fn shuttle_writers_vs_cas_gated_drain_strong() {
+        shuttle::check_random(
+            || {
+                let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+                header.set_state(State::Live);
+                let committed = Arc::new(AtomicU32::new(0));
+
+                let writers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let h = Arc::clone(&header);
+                        let c = Arc::clone(&committed);
+                        thread::spawn(move || {
+                            if h.try_pin_writer() {
+                                assert_eq!(
+                                    c.load(Ordering::SeqCst),
+                                    0,
+                                    "writer held a pin while the drain had committed \
+                                     (claimer parsed bytes under a live writer)"
+                                );
+                                h.release_writer();
+                            }
+                        })
+                    })
+                    .collect();
+
+                let claimer = {
+                    let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
+                    thread::spawn(move || {
+                        if h.cas_metadata(
+                            State::Live,
+                            State::Draining,
+                            None,
+                            None,
+                            Ordering::SeqCst,
+                        ) {
+                            // the claimer half of the Dekker pair: wait out
+                            // in-flight pins before touching bytes
+                            while h.active_writers() != 0 {
+                                thread::yield_now();
+                            }
+                            c.store(1, Ordering::SeqCst);
+                        }
+                    })
+                };
+
+                for w in writers {
+                    w.join().unwrap();
+                }
+                claimer.join().unwrap();
+
+                assert_eq!(header.active_writers(), 0);
+            },
+            shuttle_iters(50_000),
+        );
+    }
+
+    /// Removers vs a drain claim — the same protocol as the writer model
+    /// (fetch_add + recheck vs CAS + wait), from `Sealed`, the state an
+    /// interior replace/delete pins. Strong invariant: a remover holding a
+    /// pin never coexists with a committed drain.
+    #[test]
+    fn shuttle_removers_vs_cas_gated_drain_strong() {
+        shuttle::check_random(
+            || {
+                let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+                header.set_state(State::Sealed);
+                let committed = Arc::new(AtomicU32::new(0));
+
+                let removers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let h = Arc::clone(&header);
+                        let c = Arc::clone(&committed);
+                        thread::spawn(move || {
+                            if h.try_pin_remover() {
+                                assert_eq!(
+                                    c.load(Ordering::SeqCst),
+                                    0,
+                                    "remover held a pin while the drain had committed"
+                                );
+                                h.release_remover();
+                            }
+                        })
+                    })
+                    .collect();
+
+                let claimer = {
+                    let h = Arc::clone(&header);
+                    let c = Arc::clone(&committed);
+                    thread::spawn(move || {
+                        if h.cas_metadata(
+                            State::Sealed,
+                            State::Draining,
+                            None,
+                            None,
+                            Ordering::SeqCst,
+                        ) {
+                            while h.active_removers() != 0 {
+                                thread::yield_now();
+                            }
+                            c.store(1, Ordering::SeqCst);
+                        }
+                    })
+                };
+
+                for r in removers {
+                    r.join().unwrap();
+                }
+                claimer.join().unwrap();
+
+                assert_eq!(header.active_removers(), 0);
+            },
+            shuttle_iters(50_000),
+        );
+    }
+}
+
+#[cfg(all(test, not(model_checking)))]
 mod tests {
     use super::*;
 

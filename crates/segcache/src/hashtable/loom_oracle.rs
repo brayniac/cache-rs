@@ -1,4 +1,9 @@
-//! Shared loom fixture: a stateful location -> key oracle.
+//! Shared model-checking fixture: a stateful location -> key oracle.
+//!
+//! Used by both model-checking suites — the loom models in `table.rs`
+//! (exhaustive, weak-memory-aware) and their shuttle twins (randomized,
+//! sequentially consistent). Everything here routes through `crate::sync`,
+//! so whichever backend is enabled instruments the oracle's atomics.
 //!
 //! # Why this exists
 //!
@@ -81,10 +86,12 @@ const OTHER_ID: u64 = 2;
 /// Where the subject key starts out.
 pub(crate) const SRC: usize = 0;
 /// An intermediate location, for models that need two successive drains.
+#[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
 pub(crate) const MID: usize = 1;
 /// Where a relocation moves the key to.
 pub(crate) const DST: usize = 2;
 /// Where a racing writer publishes a replacement copy of the key.
+#[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
 pub(crate) const NEW: usize = 3;
 
 /// Number of distinct storage locations the oracle models. Kept small on
@@ -94,6 +101,7 @@ pub(crate) const NUM_CELLS: usize = 4;
 /// How many incarnations of a cell a model may name. Two is enough for the
 /// hazard the tag exists for — one outgoing, one refilled — and the sweep in
 /// [`KeyOracle::drain_live_entries`] is linear in it.
+#[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
 pub(crate) const NUM_INCARNATIONS: u16 = 2;
 
 fn key_id(key: &[u8]) -> u64 {
@@ -159,6 +167,7 @@ impl KeyOracle {
 
     /// The item at `cell` was freed and the space released: the location now
     /// holds nothing. Models removal (`remove` + segment decrement).
+    #[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
     pub(crate) fn vacate(&self, cell: usize) {
         self.cells[cell].store(0, Ordering::Release);
     }
@@ -209,6 +218,7 @@ impl KeyOracle {
     /// Returns whether step 1's sweep is what unlinked the outgoing entry —
     /// `false` means somebody else got there first, which is a legal race
     /// outcome, not a failure.
+    #[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
     pub(crate) fn recycle_and_refill(
         &self,
         ht: &MultiChoiceHashtable,
@@ -240,6 +250,7 @@ impl KeyOracle {
     /// Counting this way keeps the fixture out of `table.rs`'s private
     /// internals — the alternative is a hand-rolled bucket scan, which is
     /// what the `AlwaysVerifier` models copy-paste today.
+    #[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
     pub(crate) fn drain_live_entries(ht: &MultiChoiceHashtable) -> usize {
         let mut live = 0;
         for cell in 0..NUM_CELLS {

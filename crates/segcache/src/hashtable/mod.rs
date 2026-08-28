@@ -15,7 +15,7 @@ pub(crate) mod traits;
 /// Shared loom fixture. Test-only, and only under the `loom` feature —
 /// see the module docs for why the slot protocol needs a stateful verifier
 /// rather than `AlwaysVerifier`.
-#[cfg(all(test, feature = "loom"))]
+#[cfg(all(test, model_checking))]
 pub(crate) mod loom_oracle;
 
 pub use location::Location;

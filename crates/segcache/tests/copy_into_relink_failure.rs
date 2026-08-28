@@ -35,7 +35,7 @@
     feature = "fault-injection",
     feature = "debug",
     feature = "metrics",
-    not(feature = "loom")
+    not(model_checking)
 ))]
 
 use segcache::{Policy, Segcache};

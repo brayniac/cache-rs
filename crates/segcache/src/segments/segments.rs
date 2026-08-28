@@ -266,19 +266,19 @@ impl Segments {
 
     /// Returns the number of segments available to normal writes (free
     /// queue only, excluding the held-back spare).
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     pub(crate) fn free_only(&self) -> usize {
         self.free_queue.len()
     }
 
     /// Target number of segments held back in the spare queue.
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     pub(crate) fn spare_capacity(&self) -> u32 {
         self.spare_capacity
     }
 
     /// Current spare-queue depth.
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     pub(crate) fn spare_count(&self) -> u32 {
         self.spare_count.load(Ordering::Relaxed)
     }
@@ -2321,7 +2321,7 @@ impl Segments {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod spare_tests {
     use super::*;
     use crate::eviction::Policy;
@@ -2876,7 +2876,7 @@ mod spare_tests {
 /// through the free queue. The two tests below pin the two halves of that:
 /// a segment handed back without ever being written into costs nothing,
 /// and a segment that was actually used costs exactly one.
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod generation_tests {
     use super::*;
     use crate::eviction::Policy;
@@ -3049,7 +3049,7 @@ mod loom_tests {
 /// `hashtable::tests::test_ghost_is_unreachable_by_construction`), and the
 /// last test here is what turns that reservation from a comment into a
 /// guarantee.
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod capacity_tests {
     use super::*;
 

@@ -48,23 +48,23 @@ mod metrics;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod pin_failure_tests;
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod numeric_concurrency_tests;
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod numeric_relocation_tests;
 
 // Deterministic coverage of `get_pinned`'s revalidation retry (#65). Needs the
 // `fault-injection` knob: the race is a two-thread interleaving that a test
 // can only reach by luck, so the hooks stand in for the racing writer at the
 // exact two points that matter. CI runs it via the fault-injection step.
-#[cfg(all(test, feature = "fault-injection", not(feature = "loom")))]
+#[cfg(all(test, feature = "fault-injection", not(model_checking)))]
 mod revalidation_tests;
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod incarnation_tests;
 
 // publicly exported items from submodules

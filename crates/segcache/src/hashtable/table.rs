@@ -91,7 +91,7 @@ impl MultiChoiceHashtable {
     /// serializes them and shrinks the explored interleaving space, so
     /// multi-key loom models must assert their keys map to distinct
     /// stripes.
-    const NUM_STRIPES: usize = if cfg!(feature = "loom") { 16 } else { 1024 };
+    const NUM_STRIPES: usize = if cfg!(model_checking) { 16 } else { 1024 };
 
     /// Create a new hashtable with two-choice hashing (default).
     ///
@@ -258,7 +258,7 @@ impl MultiChoiceHashtable {
     // =========================================================================
 
     /// Find slots with matching tags using SIMD (AVX2).
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(feature = "loom")))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(model_checking)))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::x86_64::*;
@@ -304,7 +304,7 @@ impl MultiChoiceHashtable {
     }
 
     /// Find slots with matching tags using NEON (ARM64).
-    #[cfg(all(target_arch = "aarch64", not(feature = "loom")))]
+    #[cfg(all(target_arch = "aarch64", not(model_checking)))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::aarch64::*;
@@ -401,7 +401,7 @@ impl MultiChoiceHashtable {
 
     /// Scalar fallback for finding tag matches.
     #[cfg(any(
-        feature = "loom",
+        model_checking,
         not(any(
             all(target_arch = "x86_64", target_feature = "avx2"),
             target_arch = "aarch64"
@@ -1493,7 +1493,7 @@ impl Hashtable for MultiChoiceHashtable {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod tests {
     use super::*;
 
@@ -1948,7 +1948,7 @@ mod tests {
 ///
 /// Each test drives one read entry point and fails in milliseconds instead
 /// of racing for a ~1-in-2,400 interleaving.
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod stale_location_tests {
     use super::*;
     use crate::sync::AtomicU64;
@@ -3459,5 +3459,148 @@ mod loom_tests {
                 "the entry must still resolve once the writer has settled"
             );
         });
+    }
+}
+
+// Shuttle twins of two slot-protocol models: randomized schedules under
+// sequential consistency, complementary to the exhaustive loom suite above
+// (see the note on `segments/header.rs`'s shuttle module for the full
+// division of labor). The slot protocol's invariants are SC-independent —
+// loom already verifies them exhaustively within its preemption bound —
+// so these twins buy randomized depth BEYOND that bound and prove the
+// shuttle wiring against the production hashtable, cheap insurance both.
+// A failing model prints a schedule string for `shuttle::replay`.
+#[cfg(all(test, feature = "shuttle", not(feature = "loom")))]
+mod shuttle_tests {
+    use super::*;
+    use crate::hashtable::loom_oracle::{KeyOracle, DST, KEY, SRC};
+    use crate::hashtable::traits::Hashtable;
+    use crate::sync::shuttle_iters;
+    use shuttle::thread;
+    use std::sync::Arc;
+
+    /// See `loom_tests::AlwaysVerifier` for what this stub can and cannot
+    /// model; the fresh-key model below is about mutex-serialized entry
+    /// creation, where key identity plays no part.
+    struct AlwaysVerifier;
+
+    impl KeyVerifier for AlwaysVerifier {
+        fn verify(&self, _key: &[u8], _location: Location, _allow_deleted: bool) -> bool {
+            true
+        }
+    }
+
+    /// Randomized twin of `loom_lookup_survives_relocation_and_recycle`:
+    /// a merge drain relocates the key and recycles its old location while
+    /// a reader races the lookup. The key is live at every instant, so the
+    /// read must find it in every schedule — this is the verify-ABA
+    /// false-absent shape that reproduced at ~1 in 2,400 stress runs and
+    /// that both model checkers catch in well under a second.
+    #[test]
+    fn shuttle_lookup_never_false_absent_under_relocation() {
+        shuttle::check_random(
+            || {
+                let ht = Arc::new(MultiChoiceHashtable::new(7));
+                let oracle = Arc::new(KeyOracle::new());
+
+                oracle.place(SRC, KEY);
+                ht.insert(KEY, KeyOracle::location(SRC), &*oracle)
+                    .expect("seed insert");
+
+                let reader = {
+                    let ht = Arc::clone(&ht);
+                    let oracle = Arc::clone(&oracle);
+                    thread::spawn(move || ht.lookup(KEY, &*oracle).is_some())
+                };
+
+                let drain = {
+                    let ht = Arc::clone(&ht);
+                    let oracle = Arc::clone(&oracle);
+                    thread::spawn(move || oracle.drain_relocate(&ht, SRC, DST))
+                };
+
+                let found = reader.join().unwrap();
+                let relinked = drain.join().unwrap();
+
+                assert!(
+                    found,
+                    "FALSE ABSENT: a relocation + recycle racing the key comparison \
+                     must not turn a live key into a miss (STALE-LOCATION INVARIANT)"
+                );
+                assert!(
+                    relinked,
+                    "the relink CAS must land: only a reader's frequency bump can \
+                     lose it the slot word, and that must cost a retry, not the \
+                     relocation"
+                );
+                assert_eq!(
+                    ht.lookup_no_freq_update(KEY, &*oracle).map(|(loc, _)| loc),
+                    Some(KeyOracle::location(DST)),
+                    "the settled entry must be published at the relocation target"
+                );
+            },
+            shuttle_iters(20_000),
+        );
+    }
+
+    /// Randomized twin of `loom_fresh_key_insert_single_entry`: two racing
+    /// first inserts of one key must resolve to exactly one creator and one
+    /// live entry (the stripe lock serializes entry creation).
+    #[test]
+    fn shuttle_fresh_key_insert_single_entry() {
+        shuttle::check_random(
+            || {
+                let ht = Arc::new(MultiChoiceHashtable::new(7));
+                let verifier = Arc::new(AlwaysVerifier);
+
+                let ht1 = Arc::clone(&ht);
+                let v1 = Arc::clone(&verifier);
+                let t1 = thread::spawn(move || ht1.insert(b"key", Location::new(1), &*v1));
+
+                let ht2 = Arc::clone(&ht);
+                let v2 = Arc::clone(&verifier);
+                let t2 = thread::spawn(move || ht2.insert(b"key", Location::new(2), &*v2));
+
+                let r1 = t1.join().unwrap();
+                let r2 = t2.join().unwrap();
+
+                assert!(r1.is_ok() && r2.is_ok());
+                assert_eq!(
+                    [&r1, &r2].iter().filter(|r| matches!(r, Ok(None))).count(),
+                    1,
+                    "exactly one racer creates; the other must replace"
+                );
+
+                // Count live same-tag entries across the key's candidate
+                // buckets, deduping coincident bucket indices — same scan as
+                // the loom twin.
+                let hash = ht.hash_key(b"key");
+                let tag = MultiChoiceHashtable::tag_from_hash(hash);
+                let buckets = ht.bucket_indices(hash);
+                let mut scanned: Vec<usize> = Vec::new();
+                let mut live = 0;
+                for &bucket_index in &buckets[..ht.num_choices as usize] {
+                    if scanned.contains(&bucket_index) {
+                        continue;
+                    }
+                    scanned.push(bucket_index);
+                    let bucket = ht.bucket(bucket_index);
+                    for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+                        let packed = bucket.items[slot_index].load(Ordering::Acquire);
+                        if packed != 0
+                            && !Hashbucket::is_ghost(packed)
+                            && Hashbucket::tag(packed) == tag
+                        {
+                            live += 1;
+                        }
+                    }
+                }
+                assert_eq!(
+                    live, 1,
+                    "fresh-key race must resolve to exactly one live entry"
+                );
+            },
+            shuttle_iters(20_000),
+        );
     }
 }

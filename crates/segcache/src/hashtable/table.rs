@@ -505,10 +505,23 @@ impl MultiChoiceHashtable {
         // did not go through the slot — and the "unchanged slot" conclusion
         // is unsound. Debug builds only, and only on the already-cold
         // failure path.
+        //
+        // The invariant's proof brackets [first slot load, re-read] — it
+        // says nothing about bytes read AFTER the re-read, and this
+        // re-verify runs after it. In that tail window the entry can be
+        // legitimately unlinked, the segment recycled, and this very key
+        // re-defined at the same offset — the re-verify would then return
+        // `true` on a healthy system. So the assert only fires when a
+        // THIRD slot load still equals `packed`: slot-unchanged across
+        // the whole window extends clauses (a)/(b) over both verifies,
+        // and the benign recycle case changes the slot word and skips
+        // the assert (the same accepted ABA residual as the rest of this
+        // file).
         #[cfg(debug_assertions)]
         if outcome == SlotVerify::DifferentKey {
             debug_assert!(
-                !verifier.verify(key, location, allow_deleted),
+                !(verifier.verify(key, location, allow_deleted)
+                    && bucket.items[slot_index].load(Ordering::Acquire) == packed),
                 "STALE-LOCATION INVARIANT violated: slot word unchanged across two \
                  verifies that disagree, so an unchanged slot no longer proves the \
                  compared bytes were this entry's"

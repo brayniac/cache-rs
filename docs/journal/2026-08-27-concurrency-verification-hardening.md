@@ -111,18 +111,37 @@ the TSan reports:
   do not exclude a deleting remover). Evidence: TSan on the suite went
   from 9 reports (2 classes) to 6 reports (1 class — `init` vs stale
   verify only; `set_deleted` class gone), 156 tests green under TSan.
-- **2b (next) — pinned verify.** `SegmentsVerifier::verify` reads item
-  bytes with no pin and no tag check; a stale location can point into a
-  recycled segment mid-`define` (the remaining TSan class). Design:
-  verify resolves + reader-pins + tag-checks before any byte read, with a
-  three-way outcome (match / mismatch / unknown) so an unpinnable segment
-  retries — via the existing `SlotVerify::Changed`-style handling — rather
-  than manufacturing a false miss (the `pin_failure_tests` invariant).
-  Under pin + valid tag the compare is authoritative, which also retires
-  `verify_slot`'s slot-re-read disambiguation on that path. Perf gate:
-  same-machine interleaved A/B on get_hit/get_miss/set/incr.
-- **2c — TSan CI job** (issue #61), suppression-free once 2b lands, with
-  `halt_on_error=1` and the soak tests excluded.
+- **2b — racy accesses made defined** (branch `racy-bytes`). The
+  pinned-verify design was worked through first and REJECTED: verify
+  under a transient reader pin needs a three-way outcome, and the
+  "unpinnable" case has a genuine deadlock corner — an insert holding its
+  `WriterPin` while verifying an old copy in a segment whose drain is
+  waiting on `active_writers` (the #54/#56 rule: a WriterPin holder must
+  never wait on a segment it cannot pin), with the race-free fallbacks
+  either corrupting a tag-collided neighbor slot or re-opening the #46
+  duplicate. The chosen design changes no protocol: make the race
+  DEFINED. `keyvalue::racy_bytes` provides relaxed-atomic, word-granular
+  helpers (masked compares, read-merge-write edge words — mixed-size
+  conflicting atomics are unsupported by the language model, so
+  everything is `AtomicU64`-sized); `define`, both relocation copies, and
+  `SegmentsVerifier::verify` route through them. The unpinned verify
+  stays advisory exactly as before — slot re-read and pinned
+  revalidation remain the authority. One documented mixed-size residual:
+  `set_deleted`'s byte RMW vs verify's word load (verify races both
+  `set_deleted` and `define`, which never race each other, so no single
+  size fits all three). Bonus fixes from the adversarial review: a real
+  pre-existing out-of-bounds (garbage `klen`/`olen` at a stale offset
+  near the heap end could read ~330 bytes past the mmap — verify is now
+  bounded to the item's own segment before any key-byte load), a
+  pre-existing spurious-panic hole in `verify_slot`'s DifferentKey debug
+  assert (its proof brackets [first load, re-read] but the re-verify ran
+  after; now gated on a third slot read), and the `Segments::segment`
+  SAFETY comment now states the real contract (exclusive mutator, not
+  exclusive access). Evidence: TSan 6 reports -> ZERO (156 tests green
+  under TSan); loom 32/32; shuttle 7/7; full gate clean. Perf gate:
+  interleaved A/B min-of-N vs main on set/get_hit/incr.
+- **2c — TSan CI job** (issue #61), suppression-free (2b got TSan to
+  zero), with `halt_on_error=1` and the soak tests excluded.
 ### Item 3 — Kani harness pack: not started
 ### Item 4 — fuzz modernization + lint hygiene: not started
 

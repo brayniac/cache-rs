@@ -605,9 +605,15 @@ impl Segments {
             let seg_start = self.segment_size as usize * idx;
 
             // SAFETY: idx is in bounds; per the state-ownership contract above,
-            // the region [seg_start, seg_start + seg_size) is exclusively owned
-            // by this caller for the view's lifetime. The mmap base pointer is
-            // stable for the life of `self` (the allocation is never resized).
+            // the region [seg_start, seg_start + seg_size) has this caller as
+            // its exclusive MUTATOR for the view's lifetime. It is NOT
+            // exclusively accessed: unpinned racy readers (the hashtable's
+            // `verify`, via relaxed-atomic loads — see `keyvalue::racy_bytes`)
+            // may examine any byte of the heap at any time, which is why every
+            // write to bytes such a reader can race goes through the
+            // racy-atomic helpers rather than plain stores. The mmap base
+            // pointer is stable for the life of `self` (the allocation is
+            // never resized).
             let seg_data = unsafe {
                 std::slice::from_raw_parts_mut(
                     (self.data.as_ptr() as *mut u8).add(seg_start),
@@ -2075,10 +2081,18 @@ impl Segments {
                     // orphaned (write_offset not advanced) and the item stays in
                     // src to be evicted — same outcome as before, minus the
                     // torn-read window.
+                    // Racy-atomic, not memcpy — same reason as copy_into's
+                    // copy: a stale location into the destination's previous
+                    // incarnation can have an unpinned verify racing these
+                    // bytes.
                     let d = unsafe {
                         let s = src.data_ptr().add(offset);
                         let d = dst.data_ptr().add(write_offset);
-                        std::ptr::copy_nonoverlapping(s, d, item_size);
+                        // Racy prefix atomically, remainder plain — see
+                        // Segment::copy_into's twin of this split.
+                        let racy = item.racy_prefix_len().min(item_size);
+                        keyvalue::racy_bytes::racy_copy_words(s, d, racy);
+                        std::ptr::copy_nonoverlapping(s.add(racy), d.add(racy), item_size - racy);
                         d
                     };
                     if let Some(guard) = &vguard {

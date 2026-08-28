@@ -449,8 +449,20 @@ impl<'a> Segment<'a> {
             // reader that observes new_loc (Acquire) always sees the copied bytes.
             // On CAS failure the bytes are orphaned at dst (write_offset is not
             // advanced, nothing points here), and we abort the copy.
+            //
+            // Racy-atomic, not memcpy: a stale location into the
+            // DESTINATION segment's previous incarnation can have an
+            // unpinned verify examining these bytes mid-copy (advisory,
+            // revalidated under a pin — but the access must be defined).
             unsafe {
-                std::ptr::copy_nonoverlapping(src, dst, item_size);
+                // Racy-atomic for the header+key prefix words (the bytes a
+                // stale unpinned verify can be loading), plain vectorized
+                // copy for the rest — publication ordering for pinned
+                // readers of the destination comes from the Release CAS
+                // below either way.
+                let racy = item.racy_prefix_len().min(item_size);
+                keyvalue::racy_bytes::racy_copy_words(src, dst, racy);
+                std::ptr::copy_nonoverlapping(src.add(racy), dst.add(racy), item_size - racy);
             }
             if let Some(guard) = &vguard {
                 guard.stamp_relocated_copy(&RawItem::from_ptr(dst));

@@ -112,6 +112,10 @@ impl<'a> SegmentsVerifier<'a> {
 }
 
 impl KeyVerifier for SegmentsVerifier<'_> {
+    // inline is measured, not cargo-cult: the racy rewrite grew this body
+    // past LLVM's default threshold and the resulting outlined call showed
+    // up as ~3% of set-bench samples.
+    #[inline]
     fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
         let (seg_id, offset) = unpack_location(location);
 
@@ -119,16 +123,38 @@ impl KeyVerifier for SegmentsVerifier<'_> {
             return false;
         }
 
-        let byte_offset = self.segment_size * (seg_id as usize - 1) + offset;
-
-        if byte_offset + keyvalue::ITEM_HDR_SIZE > self.data.len() {
+        // Bound the item to ITS OWN segment, not merely the heap: `offset`
+        // comes from an untrusted (possibly stale) location word, and a
+        // genuine item never crosses a segment boundary, so any extent
+        // that would is a structural "different key" — clamping here
+        // removes the whole read-into-a-neighbor class instead of relying
+        // on the neighbor's bytes being racy-safe to read.
+        if offset + keyvalue::ITEM_HDR_SIZE > self.segment_size {
             return false;
         }
+        let byte_offset = self.segment_size * (seg_id as usize - 1) + offset;
+        debug_assert!(byte_offset + keyvalue::ITEM_HDR_SIZE <= self.data.len());
 
-        // SAFETY: We verified the offset is within the data buffer.
-        // The data buffer is the segment heap and items are written with valid headers.
+        // SAFETY: the header extent was bounds-checked above, and
+        // `verify_key_racy` bounds the key extent itself (the length
+        // fields may be garbage — see below).
+        //
+        // RACY BY DESIGN: this runs with no pin and no incarnation-tag
+        // check, so the location can be stale and the bytes can be
+        // mid-rewrite by a writer defining a new item into recycled
+        // space. The comparison is therefore done with relaxed-atomic
+        // loads (`RawItem::verify_key_racy`) against a writer that uses
+        // relaxed-atomic stores (`RawItem::define`), which makes the race
+        // DEFINED rather than absent: the answer is advisory — a `false`
+        // is disambiguated by the caller's slot re-read (`verify_slot`),
+        // and a `true` is only ever acted on after the pinned, tag-checked
+        // revalidation (`acquire_item_at` + fresh lookup). The
+        // `bytes_available` bound (clamped to the segment end) closes the
+        // garbage-length hazard: a stale offset near the end of a segment
+        // with garbage `klen`/`olen` must produce `false`, not a read
+        // past the segment or the heap.
         let item = RawItem::from_ptr(unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) });
-        item.key() == key
+        item.verify_key_racy(key, self.segment_size - offset)
     }
 
     #[inline]

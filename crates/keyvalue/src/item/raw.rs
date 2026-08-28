@@ -50,11 +50,6 @@ impl RawItem {
         unsafe { &*(self.data as *const ItemHeader) }
     }
 
-    /// Get a mutable pointer to the item's header.
-    fn header_mut(&mut self) -> *mut ItemHeader {
-        self.data as *mut ItemHeader
-    }
-
     /// Returns the key length.
     #[inline]
     pub fn klen(&self) -> u8 {
@@ -194,63 +189,187 @@ impl RawItem {
     }
 
     /// Write key, value, and optional data into the item buffer.
+    ///
+    /// # Racy readers
+    ///
+    /// The buffer is reserved-but-unpublished, so no reader can *resolve*
+    /// this item yet — but an unpinned verify holding a STALE location
+    /// into this segment's previous incarnation can be examining exactly
+    /// these bytes while they are written (segcache's read paths treat
+    /// such a verify as advisory and revalidate under a pin). Every store
+    /// here therefore goes through the relaxed-atomic
+    /// [`crate::racy_bytes`] helpers: the racing reader still sees
+    /// garbage, but the race is defined and TSan-clean. The header is
+    /// staged on the stack and stored as bytes, which also avoids ever
+    /// materializing a `&mut ItemHeader` over memory a racy reader may be
+    /// loading from.
+    #[inline]
     pub fn define(&mut self, key: &[u8], value: Value, optional: &[u8]) {
+        use crate::racy_bytes::{racy_copy_words, racy_store_bytes};
+
+        // Maximum racy prefix: header + max olen (63) + max klen (255),
+        // rounded to the containing word.
+        const MAX_PREFIX: usize = (ITEM_HDR_SIZE + 63 + 255).next_multiple_of(8);
+
+        // Stage the entire racy prefix privately, then publish it with
+        // one full-word atomic copy — no per-call edge merging on the hot
+        // path, and never a `&mut ItemHeader` over memory a racy reader
+        // may be loading from. MaybeUninit, initialized exactly on
+        // [0, prefix) below: zeroing the whole MAX_PREFIX array is a
+        // ~20ns memset that dominated small-item defines.
+        let mut buf = core::mem::MaybeUninit::<[u8; MAX_PREFIX]>::uninit();
+        let bp = buf.as_mut_ptr() as *mut u8;
+
+        let mut hdr: ItemHeader = unsafe { std::mem::zeroed() };
+        hdr.init();
+        hdr.set_olen(optional.len() as u8);
+        hdr.set_klen(key.len() as u8);
+        match value {
+            Value::Bytes(v) => {
+                hdr.set_numeric(false);
+                hdr.set_vlen(v.len() as u32);
+            }
+            Value::U64(_) => {
+                hdr.set_numeric(true);
+                hdr.set_vlen(8);
+            }
+        }
+        let key_off = ITEM_HDR_SIZE + optional.len();
+        let key_end = key_off + key.len();
+        let prefix = key_end.next_multiple_of(8);
+
+        let bytes_head = unsafe {
+            // Constant-length: compiles to inline moves, not a memcpy call.
+            std::ptr::copy_nonoverlapping(
+                &hdr as *const ItemHeader as *const u8,
+                bp,
+                ITEM_HDR_SIZE,
+            );
+            if !optional.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    optional.as_ptr(),
+                    bp.add(ITEM_HDR_SIZE),
+                    optional.len(),
+                );
+            }
+            // Short keys take a byte loop: a runtime-length memcpy is a
+            // libcall that costs more than the iterations on this hot
+            // path. Long keys amortize the call.
+            if key.len() <= 16 {
+                for (j, &b) in key.iter().enumerate() {
+                    *bp.add(key_off + j) = b;
+                }
+            } else {
+                std::ptr::copy_nonoverlapping(key.as_ptr(), bp.add(key_off), key.len());
+            }
+            // The word tail past key_end — at most 7 bytes: a Bytes
+            // value's first bytes (they share the key's last word; the
+            // rest takes the plain vectorizable copy below), then zeros
+            // for a numeric item's alignment pad and/or short-item
+            // padding (deterministic — the CRC covers a numeric pad).
+            // Byte loops for the same libcall reason as the key above.
+            let tail = prefix - key_end;
+            let head = match value {
+                Value::Bytes(v) => {
+                    let head = tail.min(v.len());
+                    for (j, &b) in v[..head].iter().enumerate() {
+                        *bp.add(key_end + j) = b;
+                    }
+                    head
+                }
+                Value::U64(_) => 0,
+            };
+            for j in head..tail {
+                *bp.add(key_end + j) = 0;
+            }
+            head
+        };
+
         unsafe {
-            (*self.header_mut()).init();
-            (*self.header_mut()).set_olen(optional.len() as u8);
-            (*self.header_mut()).set_klen(key.len() as u8);
+            racy_copy_words(bp, self.data, prefix);
 
-            // Copy optional data
-            std::ptr::copy_nonoverlapping(
-                optional.as_ptr(),
-                self.data.add(self.optional_offset()),
-                optional.len(),
-            );
-
-            // Copy key
-            std::ptr::copy_nonoverlapping(
-                key.as_ptr(),
-                self.data.add(self.key_offset()),
-                key.len(),
-            );
-
-            // Copy value
             match value {
                 Value::Bytes(v) => {
-                    (*self.header_mut()).set_numeric(false);
-                    (*self.header_mut()).set_vlen(v.len() as u32);
                     std::ptr::copy_nonoverlapping(
-                        v.as_ptr(),
-                        self.data.add(self.value_offset()),
-                        v.len(),
+                        v.as_ptr().add(bytes_head),
+                        self.data.add(key_end + bytes_head),
+                        v.len() - bytes_head,
                     );
                 }
                 Value::U64(v) => {
-                    (*self.header_mut()).set_numeric(true);
-                    (*self.header_mut()).set_vlen(8);
-
-                    // Zero the derived alignment pad between the key and
-                    // the value slot (deterministic bytes for the CRC).
-                    let pad = numeric_value_pad(key.len(), optional.len());
-                    if pad > 0 {
-                        std::ptr::write_bytes(self.data.add(self.key_offset() + key.len()), 0, pad);
-                    }
-
-                    // The item is not yet published, so plain-vs-atomic
-                    // ordering is moot; use atomic stores for uniformity
-                    // with the seqlock protocol. Native-endian.
+                    // Already atomic — the seqlock words. Native-endian.
                     self.value_word().store(v, Ordering::Relaxed);
                     self.version_word().store(0, Ordering::Relaxed);
                 }
             }
 
-            // Compute and store the CRC32.
+            // Compute and store the CRC32 (plain reads of bytes this
+            // thread just wrote; the store is the racy-visible one — a
+            // single edge-merged word inside the prefix).
             #[cfg(feature = "integrity")]
             {
                 let crc = self.compute_crc();
-                (*self.header_mut()).set_crc32(crc);
+                racy_store_bytes(
+                    crc.to_ne_bytes().as_ptr(),
+                    self.data.add(ITEM_HDR_SIZE - 4),
+                    4,
+                );
             }
         }
+    }
+
+    /// Race-tolerant key comparison for the UNPINNED verify path.
+    ///
+    /// Reads the header length fields and the key bytes with relaxed
+    /// atomics ([`crate::racy_bytes`]), so it may legally race a
+    /// concurrent `define` into recycled space — the caller's protocol
+    /// must treat the answer as advisory (segcache re-reads the slot on
+    /// `false` and revalidates under a pin on `true`).
+    ///
+    /// `bytes_available` bounds the read: it is the number of valid bytes
+    /// from this item's start to the end of the underlying allocation.
+    /// Because the lengths themselves are read from possibly-garbage
+    /// bytes, the key extent is checked against it before any key byte is
+    /// loaded — a garbage `klen`/`olen` near the end of the heap must
+    /// produce `false`, not an out-of-bounds read.
+    #[inline]
+    pub fn verify_key_racy(&self, key: &[u8], bytes_available: usize) -> bool {
+        use crate::racy_bytes::{racy_eq, racy_load_word};
+
+        // One atomic load of the item's first word covers both length
+        // fields; shift-extract (memory byte i sits at bits 8i on LE, at
+        // bits 8*(7-i) on BE) rather than `to_ne_bytes` indexing, which
+        // spills the word to the stack.
+        let head = unsafe { racy_load_word(self.data) };
+        #[cfg(target_endian = "little")]
+        let byte_at = |i: usize| (head >> (8 * i)) as u8;
+        #[cfg(not(target_endian = "little"))]
+        let byte_at = |i: usize| (head >> (8 * (7 - i))) as u8;
+        let klen = byte_at(Self::KLEN_OFFSET);
+        let olen = byte_at(ItemHeader::FLAGS_OFFSET) & ItemHeader::OLEN_BITS;
+        if klen as usize != key.len() {
+            return false;
+        }
+        let key_offset = ITEM_HDR_SIZE + olen as usize;
+        if key_offset + key.len() > bytes_available {
+            return false;
+        }
+        unsafe { racy_eq(self.data.add(key_offset), key) }
+    }
+
+    /// Byte offset of `klen` within the item, mirroring
+    /// [`ItemHeader::FLAGS_OFFSET`]. Pinned by the header layout test.
+    const KLEN_OFFSET: usize = ItemHeader::FLAGS_OFFSET - 1;
+
+    /// Length of this item's RACY PREFIX: the containing words of the
+    /// header + key extent, `round8(key_offset + klen)` — the only bytes
+    /// an unpinned verify ever loads (see the `racy_bytes` module doc).
+    /// Writers must use the racy-atomic helpers inside this prefix and
+    /// may use plain copies beyond it. Reads the header with plain loads,
+    /// so the caller must own the item (a reserved item's single writer,
+    /// or a drain holding the source claim).
+    pub fn racy_prefix_len(&self) -> usize {
+        (self.key_offset() + self.klen() as usize).next_multiple_of(8)
     }
 
     /// Wrapping in-place addition on a numeric value, returning the new

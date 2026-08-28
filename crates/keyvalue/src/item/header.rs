@@ -202,11 +202,15 @@ impl ItemHeader {
         self.flags.load(Ordering::Relaxed)
     }
 
-    /// Byte offset of the flags byte within the header, for the CRC
+    /// Byte offset of the flags byte within the header — for the CRC
     /// hashers that must splice an atomically-loaded flags byte into the
-    /// plain header prefix. Pinned by `field_offsets_are_the_packed_layout`.
-    #[cfg(feature = "integrity")]
-    pub(crate) const FLAGS_OFFSET: usize = 3;
+    /// plain header prefix, and for the racy verify path's atomic field
+    /// loads. Pinned by `field_offsets_are_the_packed_layout`.
+    pub(crate) const FLAGS_OFFSET: usize = if cfg!(feature = "integrity") { 3 } else { 1 };
+
+    /// The `olen` bits within the flags byte, for the racy verify path's
+    /// decode of an atomically-loaded flags byte.
+    pub(crate) const OLEN_BITS: u8 = OLEN_MASK;
 
     /// Mark or unmark the item deleted. `&self` and atomic by design:
     /// this is the one header mutation performed on a PUBLISHED item, so
@@ -292,7 +296,6 @@ mod tests {
             std::slice::from_raw_parts(&h as *const ItemHeader as *const u8, ITEM_HDR_SIZE)
         };
         let base = if cfg!(feature = "integrity") { 2 } else { 0 };
-        #[cfg(feature = "integrity")]
         assert_eq!(
             base + 1,
             ItemHeader::FLAGS_OFFSET,

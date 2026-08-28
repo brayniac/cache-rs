@@ -7,6 +7,7 @@
 
 pub mod item;
 pub mod numeric;
+pub mod racy_bytes;
 pub mod tiny;
 mod value;
 

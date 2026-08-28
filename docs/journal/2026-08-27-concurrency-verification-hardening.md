@@ -93,7 +93,36 @@ Each item lands as its own PR with adversarial review before merge.
   step 3). Separate PR if pursued; the per-primitive models above are the
   high-value core.
 
-### Item 2 — verify byte-read / TSan gate: not started
+### Item 2 — verify byte-read / TSan gate: in progress
+
+Decomposed into three slices after tracing the two distinct race pairs in
+the TSan reports:
+
+- **2a (this PR) — atomic flags byte.** `set_deleted` tombstones a
+  PUBLISHED item, and readers decode `olen`/`is_numeric` out of the same
+  byte (`FLAGS: [is_numeric:1][is_deleted:1][olen:6]`), so the plain RMW
+  raced every get's key decode. The flags byte is now `AtomicU8`
+  (`set_deleted` = Relaxed `fetch_or` via `&self`; flag readers = Relaxed
+  loads; define-time setters stay plain via `get_mut`). `packed` had to go
+  (`AtomicU8` carries a `repr(align)` marker packed rejects) — replaced by
+  `repr(C)` with all-align-1 fields, layout pinned by the size asserts and
+  a byte-offset test. The CRC hashers also splice in an atomically-loaded
+  flags byte (incr's CRC recompute runs under reader pin + seqlock, which
+  do not exclude a deleting remover). Evidence: TSan on the suite went
+  from 9 reports (2 classes) to 6 reports (1 class — `init` vs stale
+  verify only; `set_deleted` class gone), 156 tests green under TSan.
+- **2b (next) — pinned verify.** `SegmentsVerifier::verify` reads item
+  bytes with no pin and no tag check; a stale location can point into a
+  recycled segment mid-`define` (the remaining TSan class). Design:
+  verify resolves + reader-pins + tag-checks before any byte read, with a
+  three-way outcome (match / mismatch / unknown) so an unpinnable segment
+  retries — via the existing `SlotVerify::Changed`-style handling — rather
+  than manufacturing a false miss (the `pin_failure_tests` invariant).
+  Under pin + valid tag the compare is authoritative, which also retires
+  `verify_slot`'s slot-re-read disambiguation on that path. Perf gate:
+  same-machine interleaved A/B on get_hit/get_miss/set/incr.
+- **2c — TSan CI job** (issue #61), suppression-free once 2b lands, with
+  `halt_on_error=1` and the soak tests excluded.
 ### Item 3 — Kani harness pack: not started
 ### Item 4 — fuzz modernization + lint hygiene: not started
 

@@ -183,8 +183,14 @@ impl RawItem {
         self.header().is_deleted()
     }
 
+    /// Mark or unmark the item deleted.
+    ///
+    /// Runs on a PUBLISHED item (delete's tombstone), so it goes through
+    /// the header's atomic flag — never a `&mut ItemHeader` over memory
+    /// that concurrent readers alias. Kept `&mut self` for the caller-side
+    /// signal that this mutates the item.
     pub fn set_deleted(&mut self, deleted: bool) {
-        unsafe { (*self.header_mut()).set_deleted(deleted) }
+        self.header().set_deleted(deleted)
     }
 
     /// Write key, value, and optional data into the item buffer.

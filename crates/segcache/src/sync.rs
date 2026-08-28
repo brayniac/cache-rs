@@ -35,8 +35,12 @@ pub use shuttle::sync::Mutex;
 /// spike failed in tens of schedules).
 #[cfg(all(test, feature = "shuttle", not(feature = "loom")))]
 pub(crate) fn shuttle_iters(default: usize) -> usize {
-    std::env::var("SHUTTLE_ITERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var("SHUTTLE_ITERS") {
+        Ok(v) => v
+            .parse()
+            // A set-but-malformed override must fail loudly: falling back
+            // silently would report a "deeper soak" that never ran.
+            .unwrap_or_else(|_| panic!("SHUTTLE_ITERS must be a number, got {v:?}")),
+        Err(_) => default,
+    }
 }

@@ -1,3 +1,8 @@
+// Model-checking backends replace the lib's sync primitives, which panic
+// outside their runner — compile this std-thread suite out rather than
+// relying on the model jobs' name filters to skip it.
+#![cfg(not(model_checking))]
+
 use segcache::*;
 use std::time::Duration;
 

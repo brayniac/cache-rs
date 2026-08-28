@@ -1540,11 +1540,17 @@ mod shuttle_tests {
 
     /// Readers vs a CAS-gated drain — the strong (Dekker) invariant: a
     /// pinned reader NEVER coexists with a committed drain. The drain side
-    /// mirrors the merge-source gate (claim Draining by CAS, re-check the
-    /// reader count, revert if a pin raced in, else commit); the reader
-    /// side is the two-phase `try_acquire_reader` (fetch_add, then re-check
-    /// the state). Under SC exactly one of the two rechecks must observe
-    /// the other side's first step, which is what makes the assert sound.
+    /// mirrors the recycle gate (claim Draining by CAS, re-check the reader
+    /// count, commit only on zero — `claim_for_drain` + `finalize_drained`);
+    /// the reader side is the two-phase `try_acquire_reader` (fetch_add,
+    /// then re-check the state). Under SC exactly one of the two rechecks
+    /// must observe the other side's first step, which is what makes the
+    /// assert sound. The revert on a raced-in pin is a model-only stand-in
+    /// (inherited from the loom twin): production CONDEMNS instead — there
+    /// is no `Draining -> Sealed` edge — and that branch is what
+    /// `shuttle_awaiting_release_exactly_one_free` covers. The revert is
+    /// strictly more permissive to readers than condemn, so it explores a
+    /// superset of reader-pin schedules against the commit gate.
     #[test]
     fn shuttle_readers_vs_cas_gated_drain_strong() {
         shuttle::check_random(

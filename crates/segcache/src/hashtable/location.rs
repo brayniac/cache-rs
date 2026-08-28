@@ -246,3 +246,16 @@ mod tests {
         assert_ne!(a, c);
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn tag_reads_middle_field() {
+        let raw: u64 = kani::any();
+        kani::assume(raw <= Location::MAX_RAW);
+        let loc = Location::new(raw);
+        assert_eq!(loc.tag() as u64, (raw >> TAG_SHIFT) & TAG_MASK);
+    }
+}

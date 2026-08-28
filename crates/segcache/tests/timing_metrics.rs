@@ -25,7 +25,7 @@
 //! else in the process touches these counters while it runs. Same rule as
 //! `tests/item_gauges.rs` and `tests/item_dead_gauges.rs`.
 
-#![cfg(all(feature = "metrics", not(feature = "loom")))]
+#![cfg(all(feature = "metrics", not(model_checking)))]
 
 use segcache::{Policy, Segcache};
 use std::time::Duration;

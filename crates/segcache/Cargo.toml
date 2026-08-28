@@ -24,6 +24,19 @@ metrics = ["metriken"]
 # enables loom concurrency model checking for the hashtable
 loom = ["dep:loom"]
 
+# enables shuttle randomized concurrency testing. Complementary to loom:
+# loom models weak memory orderings but cannot model the SeqCst total
+# order (so the Dekker/store-buffering-shaped invariants are unassertable
+# under it); shuttle executes sequentially consistently (treating every
+# ordering as SeqCst), so it CAN assert those invariants — but can never
+# catch an ordering that is too weak. Keep both suites green. `loom` wins
+# if both features are enabled (e.g. under --all-features). Run with:
+#   cargo test -p segcache --features shuttle -- shuttle_
+# (the filter matters: like loom's, the model tests panic if their sync
+# primitives are used outside the model runner, and the std-thread suites
+# are compiled out under this feature)
+shuttle = ["dep:shuttle"]
+
 # enables the test-only fault-injection knob (`segcache::fault`) that forces
 # `Segment::copy_into`'s relink CAS to lose, so its `RelinkFailure` abort path
 # can be exercised. Deliberately NOT default and NOT implied by `debug`:
@@ -57,6 +70,7 @@ memmap2 = { workspace = true }
 thiserror = { workspace = true }
 
 loom = { version = "0.7", features = ["checkpoint"], optional = true }
+shuttle = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

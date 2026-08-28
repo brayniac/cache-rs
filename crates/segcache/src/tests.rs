@@ -1330,7 +1330,7 @@ fn expiration() {
 // Uses `Segments::free_only`, which (like the rest of the Task-1 spare
 // accessors) is only compiled outside the `loom` feature.
 #[test]
-#[cfg(not(feature = "loom"))]
+#[cfg(not(model_checking))]
 fn evict_expires_before_merging() {
     // Fixed-width key + fixed value so every insert consumes exactly the
     // same number of bytes. `keyvalue::item_size` is the same size
@@ -1454,7 +1454,7 @@ fn evict_expires_before_merging() {
 // Uses the Task-1 spare accessors (`free`, `free_only`, `spare_count`),
 // which are compiled only outside the `loom` feature.
 #[test]
-#[cfg(not(feature = "loom"))]
+#[cfg(not(model_checking))]
 fn merge_evict_copies_survivors_into_spare() {
     const ITEMS_PER_SEGMENT: usize = 64;
     const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
@@ -1621,7 +1621,7 @@ fn merge_evict_copies_survivors_into_spare() {
 //   (c) drain both source segments (Free, nothing leaked);
 //   (d) leave the untouched Live tail segment alone.
 #[test]
-#[cfg(not(feature = "loom"))]
+#[cfg(not(model_checking))]
 fn merge_compact_combines_under_full_segments_into_spare() {
     const ITEMS_PER_SEGMENT: usize = 12;
     const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits

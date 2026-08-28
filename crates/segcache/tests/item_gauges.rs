@@ -23,7 +23,7 @@
 //! else in the process can touch the gauges while it runs. Do not add a
 //! second test to this file — add another file instead.
 
-#![cfg(all(feature = "metrics", not(feature = "loom")))]
+#![cfg(all(feature = "metrics", not(model_checking)))]
 
 use segcache::{Policy, Segcache};
 use std::time::Duration;

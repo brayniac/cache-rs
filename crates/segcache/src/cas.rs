@@ -100,7 +100,7 @@ impl fmt::Display for CasToken {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod tests {
     use super::*;
 

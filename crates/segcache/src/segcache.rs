@@ -62,10 +62,10 @@ pub(crate) mod revalidation_fault {
 
     /// Uninstalls both hooks when dropped, so a panicking test cannot leak one
     /// into whatever else runs on this thread.
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     pub(crate) struct HookGuard(());
 
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     impl Drop for HookGuard {
         fn drop(&mut self) {
             AFTER_LOOKUP.with(|h| *h.borrow_mut() = None);
@@ -73,13 +73,13 @@ pub(crate) mod revalidation_fault {
         }
     }
 
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     pub(crate) fn on_after_lookup(f: impl Fn() + 'static) -> HookGuard {
         AFTER_LOOKUP.with(|h| *h.borrow_mut() = Some(Rc::new(f)));
         HookGuard(())
     }
 
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     pub(crate) fn on_before_revalidate(f: impl Fn() + 'static) -> HookGuard {
         BEFORE_REVALIDATE.with(|h| *h.borrow_mut() = Some(Rc::new(f)));
         HookGuard(())
@@ -119,7 +119,7 @@ pub(crate) mod revalidation_fault {
 ///
 /// Thread-local, like the fault hooks it is used with: the `get` under test
 /// runs on the thread that installed them.
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 pub(crate) mod stale_incarnation_charges {
     use std::cell::Cell;
 
@@ -465,7 +465,7 @@ impl Segcache {
         attempts: &mut usize,
     ) -> Option<Location> {
         if self.segments.resolve(location).is_none() {
-            #[cfg(all(test, not(feature = "loom")))]
+            #[cfg(all(test, not(model_checking)))]
             stale_incarnation_charges::record();
             *attempts += 1;
             if *attempts >= REVALIDATE_RETRIES {
@@ -1787,7 +1787,7 @@ impl Segcache {
     /// incarnation is already gone — is not constructible through them without
     /// a real race. This hook plants that state directly so `replace_at`'s
     /// incarnation gate can be tested deterministically.
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     pub(crate) fn replace_at_for_test(
         &self,
         key: &[u8],

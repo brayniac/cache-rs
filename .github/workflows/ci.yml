@@ -66,6 +66,17 @@ jobs:
       - name: Test with loom
         run: cargo test -p segcache --features loom -- loom
 
+      # Shuttle is the complement of loom: randomized schedules under
+      # sequential consistency, which lets the models assert the
+      # SC-total-order (Dekker) invariants loom structurally cannot — a
+      # pinned reader/writer/remover never coexists with a committed drain,
+      # and the condemned-segment handoff neither leaks nor double-frees.
+      # Loom stays the only check on ordering STRENGTH (shuttle treats every
+      # ordering as SeqCst). The name filter matters: model-backend sync
+      # primitives panic outside their runner.
+      - name: Test with shuttle
+        run: cargo test -p segcache --features shuttle -- shuttle_
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15

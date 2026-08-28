@@ -42,7 +42,7 @@ impl Drop for WriterPin {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod tests {
     use super::*;
     use crate::segments::state::{Metadata, State};

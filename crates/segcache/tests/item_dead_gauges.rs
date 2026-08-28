@@ -29,7 +29,7 @@
 //! touch the gauges while it runs. Do not add a second test to this file — add
 //! another file instead (same rule as `tests/item_gauges.rs`).
 
-#![cfg(all(feature = "metrics", not(feature = "loom")))]
+#![cfg(all(feature = "metrics", not(model_checking)))]
 
 use segcache::{Item, Policy, Segcache};
 use std::time::Duration;

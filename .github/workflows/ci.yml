@@ -77,6 +77,50 @@ jobs:
       - name: Test with shuttle
         run: cargo test -p segcache --features shuttle -- shuttle_
 
+  # ThreadSanitizer over the concurrent test suite. TSan models atomics
+  # correctly (no reports from the freq counters, seqlock, or pin
+  # protocols — all expressed through atomics) and flags exactly the
+  # non-atomic racing accesses; the issue #61 spike found it surfaces in
+  # one ordinary 16s run what the stress tests need thousands of runs to
+  # hit once. One suppression is loaded (tsan-suppressions.txt): the
+  # accepted unpinned-verify byte race, tracked for removal in issue #91.
+  # halt_on_error makes any OTHER report fail the job.
+  #
+  # Skips: full_cache_long* are single-threaded throughput soaks with zero
+  # concurrency value under a race detector (they dominate the runtime
+  # ~20x); cas_incr_stress_exact_accounting assumes eviction-pressure
+  # timing that TSan's slowdown distorts (it runs in the normal matrix
+  # above). --tests skips doctests, whose rustdoc invocations don't get
+  # the sanitizer ABI flags under -Zbuild-std.
+  tsan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-Zsanitizer=thread"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tsan-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-tsan-
+
+      - name: Test under ThreadSanitizer
+        env:
+          TSAN_OPTIONS: "halt_on_error=1 suppressions=${{ github.workspace }}/tsan-suppressions.txt"
+        run: >
+          cargo +nightly test -p segcache -Zbuild-std
+          --target x86_64-unknown-linux-gnu --features debug --tests --
+          --skip full_cache_long --skip cas_incr_stress_exact_accounting
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15

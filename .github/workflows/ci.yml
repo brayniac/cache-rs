@@ -42,6 +42,17 @@ jobs:
       - name: Test with debug feature
         run: cargo test -p segcache --features debug
 
+      # keyvalue's three feature shapes each carry distinct behavior:
+      # default (numeric-seqlock: locked in-place updates, 6-byte header),
+      # integrity (CRC/magic + the seqlock — the shape the CRC-coherence
+      # concurrency tests exercise), and no-default-features (lock-free
+      # numerics). The workspace run above covers only the default shape.
+      - name: Test keyvalue (integrity)
+        run: cargo test -p keyvalue --features integrity
+
+      - name: Test keyvalue (no default features)
+        run: cargo test -p keyvalue --no-default-features
+
       # `tests/copy_into_relink_failure.rs` covers `Segment::copy_into`'s
       # `RelinkFailure` abort path, which no workload can reach (the relink CAS
       # can only lose to an unpinned unlink landing in a few tens of
@@ -125,7 +136,13 @@ jobs:
             cargo kani setup
           fi
 
-      - name: Verify keyvalue harnesses
+      # Both header layouts: default (6-byte header — what segcache ships)
+      # and integrity (12-byte). The proofs are layout-generic; running
+      # both keeps each shipping layout's arithmetic actually proven.
+      - name: Verify keyvalue harnesses (default layout)
+        run: cargo kani -p keyvalue
+
+      - name: Verify keyvalue harnesses (integrity layout)
         run: cargo kani -p keyvalue --features integrity
 
       - name: Verify segcache harnesses

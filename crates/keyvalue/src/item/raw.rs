@@ -7,9 +7,12 @@
 //! `[ItemHeader][optional][key][pad][value: u64][version: u64]`, where the
 //! derived pad brings the value to an 8-byte boundary. Both words are
 //! accessed atomically, and in-place updates may race each other AND
-//! readers: without the `integrity` feature the value RMW is lock-free;
-//! with `integrity` the version word doubles as a per-item seqlock writer
-//! lock so the value and the item CRC change as one unit. The version also
+//! readers: without the `numeric-seqlock` feature the value RMW is
+//! lock-free; with it (the default) the version word doubles as a
+//! per-item seqlock writer lock — which is also what lets an engine's
+//! cas publish path exclude in-place writers — and under `integrity`
+//! the value and the item CRC additionally change as one unit under
+//! that lock. The version also
 //! feeds CAS-token construction: every in-place update bumps it by two, so
 //! tokens observe increments (matching memcached, where incr/decr assign a
 //! fresh cas unique).
@@ -103,9 +106,12 @@ impl RawItem {
     /// update can never be observed torn. Updates are word-atomic, so
     /// the value load itself cannot tear; the odd-check and version
     /// re-check are load-bearing for `integrity` builds, where they keep
-    /// this read ordered against a writer's paired value+CRC update. In
-    /// non-`integrity` builds writers never publish an odd version and a
-    /// version change merely causes a harmless retry. Note that loom
+    /// this read ordered against a writer's paired value+CRC update.
+    /// Under `numeric-seqlock` without `integrity`, locked writers still
+    /// publish odd (write-in-progress) versions and this reader spins
+    /// through them; only in no-default-features builds (lock-free
+    /// fetch-op writers) is the version always even, and a version
+    /// change merely causes a harmless retry. Note that loom
     /// cannot verify seqlock orderings (no SC total order in its model,
     /// and these atomics are conjured from raw buffer pointers, which
     /// loom's types cannot model) — the protocol shape is pinned by
@@ -270,8 +276,8 @@ impl RawItem {
     /// what lets an engine's cas publish path exclude in-place writers
     /// via [`Self::lock_numeric_version`]; under `integrity` the locked
     /// update additionally recomputes the stored CRC, so value + CRC
-    /// change as one unit and [`Self::check_integrity`] stays exact
-    /// under concurrency.
+    /// change as one unit and `check_integrity` stays exact under
+    /// concurrency.
     pub fn fetch_wrapping_add(&self, rhs: u64) -> Result<u64, NotNumericError> {
         #[cfg(feature = "numeric-seqlock")]
         return self.locked_numeric_update(|v| v.wrapping_add(rhs));

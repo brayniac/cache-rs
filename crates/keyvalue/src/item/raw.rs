@@ -7,9 +7,12 @@
 //! `[ItemHeader][optional][key][pad][value: u64][version: u64]`, where the
 //! derived pad brings the value to an 8-byte boundary. Both words are
 //! accessed atomically, and in-place updates may race each other AND
-//! readers: without the `integrity` feature the value RMW is lock-free;
-//! with `integrity` the version word doubles as a per-item seqlock writer
-//! lock so the value and the item CRC change as one unit. The version also
+//! readers: without the `numeric-seqlock` feature the value RMW is
+//! lock-free; with it (the default) the version word doubles as a
+//! per-item seqlock writer lock — which is also what lets an engine's
+//! cas publish path exclude in-place writers — and under `integrity`
+//! the value and the item CRC additionally change as one unit under
+//! that lock. The version also
 //! feeds CAS-token construction: every in-place update bumps it by two, so
 //! tokens observe increments (matching memcached, where incr/decr assign a
 //! fresh cas unique).
@@ -103,9 +106,12 @@ impl RawItem {
     /// update can never be observed torn. Updates are word-atomic, so
     /// the value load itself cannot tear; the odd-check and version
     /// re-check are load-bearing for `integrity` builds, where they keep
-    /// this read ordered against a writer's paired value+CRC update. In
-    /// non-`integrity` builds writers never publish an odd version and a
-    /// version change merely causes a harmless retry. Note that loom
+    /// this read ordered against a writer's paired value+CRC update.
+    /// Under `numeric-seqlock` without `integrity`, locked writers still
+    /// publish odd (write-in-progress) versions and this reader spins
+    /// through them; only in no-default-features builds (lock-free
+    /// fetch-op writers) is the version always even, and a version
+    /// change merely causes a harmless retry. Note that loom
     /// cannot verify seqlock orderings (no SC total order in its model,
     /// and these atomics are conjured from raw buffer pointers, which
     /// loom's types cannot model) — the protocol shape is pinned by
@@ -263,20 +269,20 @@ impl RawItem {
     /// externally) and no update is lost. Every update also bumps the
     /// item's version by exactly two, staling outstanding CAS tokens.
     ///
-    /// Without the `integrity` feature the update is lock-free: the
-    /// value word RMW is a native atomic (wrapping is `fetch_add`'s
-    /// overflow behavior on `AtomicU64`). With `integrity`, the update
-    /// additionally recomputes the stored CRC, and value + CRC must
-    /// change as one unit; the version word then acts as a per-item
-    /// writer lock (odd = write in progress), which keeps
-    /// [`Self::check_integrity`] exact under concurrency — it never
-    /// misreports a healthy racing update as corruption and always
-    /// detects real value corruption.
+    /// Without the `numeric-seqlock` feature the update is lock-free:
+    /// the value word RMW is a native atomic (wrapping is `fetch_add`'s
+    /// overflow behavior on `AtomicU64`). With it, the version word acts
+    /// as a per-item writer lock (odd = write in progress), which is
+    /// what lets an engine's cas publish path exclude in-place writers
+    /// via [`Self::lock_numeric_version`]; under `integrity` the locked
+    /// update additionally recomputes the stored CRC, so value + CRC
+    /// change as one unit and `check_integrity` stays exact under
+    /// concurrency.
     pub fn fetch_wrapping_add(&self, rhs: u64) -> Result<u64, NotNumericError> {
-        #[cfg(feature = "integrity")]
+        #[cfg(feature = "numeric-seqlock")]
         return self.locked_numeric_update(|v| v.wrapping_add(rhs));
 
-        #[cfg(not(feature = "integrity"))]
+        #[cfg(not(feature = "numeric-seqlock"))]
         {
             let (value_word, version_word) = self.numeric_words()?;
             // Wait-free: wrapping on overflow is fetch_add's native
@@ -295,10 +301,10 @@ impl RawItem {
     /// new value. See [`Self::fetch_wrapping_add`] for the concurrency
     /// contract.
     pub fn fetch_saturating_sub(&self, rhs: u64) -> Result<u64, NotNumericError> {
-        #[cfg(feature = "integrity")]
+        #[cfg(feature = "numeric-seqlock")]
         return self.locked_numeric_update(|v| v.saturating_sub(rhs));
 
-        #[cfg(not(feature = "integrity"))]
+        #[cfg(not(feature = "numeric-seqlock"))]
         {
             let (value_word, version_word) = self.numeric_words()?;
             // Lock-free CAS loop: saturation has no native fetch_ op.
@@ -313,7 +319,7 @@ impl RawItem {
     }
 
     /// Both numeric atomic words, or `NotNumericError`.
-    #[cfg(not(feature = "integrity"))]
+    #[cfg(not(feature = "numeric-seqlock"))]
     #[inline]
     fn numeric_words(&self) -> Result<(&AtomicU64, &AtomicU64), NotNumericError> {
         if !self.header().is_numeric() {
@@ -323,12 +329,14 @@ impl RawItem {
         Ok(unsafe { (self.value_word(), self.version_word()) })
     }
 
-    /// Serialized numeric update for `integrity` builds: value and CRC
-    /// are two separate words that must change together, so concurrent
-    /// writers take a per-item spin lock on the version word (CAS the
-    /// even version to odd). This is the classic seqlock writer side —
-    /// readers already treat an odd version as write-in-progress — and
-    /// it doubles as the mutual exclusion that makes the RMW atomic.
+    /// Serialized numeric update for `numeric-seqlock` builds:
+    /// concurrent writers take a per-item spin lock on the version word
+    /// (CAS the even version to odd). This is the classic seqlock writer
+    /// side — readers already treat an odd version as write-in-progress
+    /// — and it doubles as the mutual exclusion that makes the RMW
+    /// atomic and lets cas publishes exclude in-place writers. Under
+    /// `integrity` the update also rewrites the CRC, so value and CRC
+    /// (two separate words) change together.
     ///
     /// Ordering: the successful lock CAS is `Acquire`, pairing with the
     /// previous writer's `Release` unlock, so this writer observes the
@@ -342,7 +350,7 @@ impl RawItem {
     /// store is `Release`: any reader whose `Acquire` load of the
     /// version returns the new even value is guaranteed to observe the
     /// matching value and CRC.
-    #[cfg(feature = "integrity")]
+    #[cfg(feature = "numeric-seqlock")]
     fn locked_numeric_update(&self, op: impl Fn(u64) -> u64) -> Result<u64, NotNumericError> {
         Ok(self.lock_numeric_version()?.update(op))
     }
@@ -352,7 +360,7 @@ impl RawItem {
     ///
     /// While the returned guard is alive, every in-place numeric writer
     /// (`fetch_wrapping_add`/`fetch_saturating_sub`, which serialize on
-    /// the same version word in `integrity` builds) is excluded, and the
+    /// the same version word under `numeric-seqlock`) is excluded, and the
     /// version reported by [`NumericVersionGuard::version`] — the even
     /// value observed at lock time — cannot advance. This lets a caller
     /// atomically pair "the version is still V" with a publish action of
@@ -372,11 +380,11 @@ impl RawItem {
     /// value/version pair. Hold it only across short, lock-free sections
     /// (readers and writers spin while it is held).
     ///
-    /// Only meaningful under `integrity` (where numeric writers take
-    /// the version-word lock); without that feature writers are
+    /// Only meaningful under `numeric-seqlock` (where numeric writers
+    /// take the version-word lock); without that feature writers are
     /// lock-free fetch-ops that would ignore this gate, so the API is
     /// not offered.
-    #[cfg(feature = "integrity")]
+    #[cfg(feature = "numeric-seqlock")]
     pub fn lock_numeric_version(&self) -> Result<NumericVersionGuard<'_>, NotNumericError> {
         if !self.header().is_numeric() {
             return Err(NotNumericError);
@@ -585,13 +593,13 @@ impl RawItem {
 ///   unlocks two above the observed version;
 /// - dropping it without an update restores the same even version
 ///   (nothing changed).
-#[cfg(feature = "integrity")]
+#[cfg(feature = "numeric-seqlock")]
 pub struct NumericVersionGuard<'a> {
     raw: &'a RawItem,
     version: u64,
 }
 
-#[cfg(feature = "integrity")]
+#[cfg(feature = "numeric-seqlock")]
 impl NumericVersionGuard<'_> {
     /// The item's seqlock version observed when the lock was taken —
     /// always even, and frozen while this guard is alive.
@@ -628,8 +636,9 @@ impl NumericVersionGuard<'_> {
     }
 
     /// Apply `op` to the value under this lock, consuming the guard.
-    /// Stores the new value and its CRC as one seqlocked unit, then
-    /// unlocks at `version() + 2`. Returns the new value.
+    /// Stores the new value (and, under `integrity`, its CRC — one
+    /// seqlocked unit), then unlocks at `version() + 2`. Returns the
+    /// new value.
     ///
     /// Any validation performed between taking the lock and calling this
     /// is atomic with the update with respect to every other party that
@@ -648,8 +657,11 @@ impl NumericVersionGuard<'_> {
 
         let new = op(value_word.load(Ordering::Relaxed));
         value_word.store(new, Ordering::Relaxed);
-        let crc = self.raw.compute_crc_numeric(new);
-        self.raw.crc_word().store(crc, Ordering::Relaxed);
+        #[cfg(feature = "integrity")]
+        {
+            let crc = self.raw.compute_crc_numeric(new);
+            self.raw.crc_word().store(crc, Ordering::Relaxed);
+        }
 
         // Unlock: back to even, two above the pre-update version. The
         // guard's Drop (which would restore the OLD version) must not
@@ -660,7 +672,7 @@ impl NumericVersionGuard<'_> {
     }
 }
 
-#[cfg(feature = "integrity")]
+#[cfg(feature = "numeric-seqlock")]
 impl Drop for NumericVersionGuard<'_> {
     fn drop(&mut self) {
         // Unlock by restoring the pre-lock even version (no update was

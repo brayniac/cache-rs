@@ -1,6 +1,6 @@
 [package]
 name = "segcache"
-version = "0.4.4"
+version = "0.4.5"
 description = "Segment-structured cache storage engine with eager TTL expiration"
 authors = ["Brian Martin <brian@pelikan.io>"]
 
@@ -57,11 +57,14 @@ ahash = { workspace = true }
 clocksource = { workspace = true }
 crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
-# keyvalue's `integrity` is REQUIRED (not merely defaulted): the cas
-# publish path serializes on the numeric item's seqlock writer lock
+# keyvalue's `numeric-seqlock` is REQUIRED (not merely defaulted): the
+# cas publish path serializes on the numeric item's seqlock writer lock
 # (`lock_numeric_version`), which only excludes numeric writers when they
-# take that lock — i.e. under keyvalue/integrity.
-keyvalue = { workspace = true, features = ["integrity"] }
+# take that lock. It deliberately does NOT pull keyvalue/integrity — the
+# CRC half of the old bundled feature cost a whole-item hash on every
+# insert (~27% of set time) in builds that never check a CRC; segcache's
+# own `integrity` feature turns it on.
+keyvalue = { workspace = true, features = ["numeric-seqlock"] }
 log = { workspace = true }
 metriken = { workspace = true, optional = true }
 rand = { workspace = true, features = ["sys_rng"] }
@@ -74,6 +77,10 @@ shuttle = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# For layout-proof integration-test sizing (item_size): features unify
+# with the lib's own requirement, so the tests always see the layout the
+# build under test uses.
+keyvalue = { workspace = true }
 
 # `--cfg kani` is set by the Kani driver when verifying the #[kani::proof]
 # harnesses; declare it so normal builds don't flag the cfg as unexpected.

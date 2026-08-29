@@ -175,6 +175,46 @@ jobs:
           --target x86_64-unknown-linux-gnu --features debug --tests --
           --skip full_cache_long --skip cas_incr_stress_exact_accounting
 
+  # Differential fuzz smoke: 60s of libFuzzer over the public API with a
+  # HashMap model oracle (fuzz_targets/segcache.rs) — asserts hits match
+  # the model (value + type + no resurrection after delete), numeric ops
+  # agree exactly, and check_integrity()/item-count bounds at end of
+  # input. A smoke run is a regression tripwire, not a search campaign;
+  # longer local runs use the same target.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_FUZZ_VERSION: "0.13.2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: ${{ runner.os }}-cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}
+
+      # Deliberately NOT --locked: the pinned lockfile drags in crates
+      # old enough to no longer compile on current nightly
+      # (proc-macro-error's reserved-attribute breakage took down the
+      # first run of this job); a fresh resolution stays buildable, and
+      # the version itself is still pinned via the cache key above.
+      - name: Install cargo-fuzz
+        run: >
+          command -v cargo-fuzz >/dev/null ||
+          cargo install "cargo-fuzz@$CARGO_FUZZ_VERSION"
+
+      # -max_len matters: at libFuzzer's 4096-byte default, a maximal
+      # input cannot fill the fuzz cache's heap and eviction never runs
+      # (found in review — the "forces eviction" claim was false).
+      - name: Fuzz smoke (60s, model oracle)
+        working-directory: crates/segcache/fuzz
+        run: >
+          cargo +nightly fuzz run segcache --
+          -max_total_time=60 -max_len=65536 -rss_limit_mb=4096
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -196,6 +236,13 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Default features too: --all-features turns loom ON, which compiles
+      # every #[cfg(all(test, not(model_checking)))] module OUT — the
+      # whole std-thread test tier was invisible to the line above (the
+      # CI gap flagged in the July hardening notes).
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Format
         run: cargo fmt --all --check

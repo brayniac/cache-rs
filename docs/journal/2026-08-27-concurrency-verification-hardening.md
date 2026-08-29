@@ -1,7 +1,7 @@
 ---
-status: open
+status: shipped
 opened: 2026-08-27
-updated: 2026-08-27
+updated: 2026-08-29
 ---
 
 # Concurrency verification hardening: shuttle, TSan decision, Kani, fuzz
@@ -178,21 +178,83 @@ leaf-function proofs, deliberately. Verification cost: sub-second per
 harness. Bite-checked (offset-shift alias, tier-4 clamp removal, link
 shift skew — each fails its proof). CI: a `kani` job with a pinned
 version behind a cache.
-### Item 4 — fuzz modernization + lint hygiene: not started
+### Item 4 — fuzz modernization + lint hygiene (this PR)
+
+- The libFuzzer target had been DEAD since the concurrency rewrite: it
+  built with `hash_power(5)`, below the hashtable's `power >= 7` assert,
+  so every input panicked in the builder — a working demonstration of
+  why fuzzing must live in CI. Rewritten as a DIFFERENTIAL target: every
+  op mirrors into a `HashMap` model and asserts the directional contract
+  eviction allows — the model is a superset (misses always legal); hits
+  must match on value, type, and liveness (a hit after delete is a
+  resurrection; a wrong value is the aliasing class the concurrency work
+  kept finding, as a single-threaded oracle); numeric ops that succeed
+  must agree exactly; `check_integrity()` + an item-count superset bound
+  sweep each input. TTLs are zero-or->=1h so lazy expiry cannot blur the
+  assertions mid-run.
+- Bite-checked both directions of the oracle: an ack-without-unlink
+  delete and an off-by-one `wrapping_add` are each caught within seconds
+  of fuzzing.
+- Adversarial review (which independently re-ran the oracle body over
+  ~4.3M structured ops) found the first version's two real defects:
+  `check_integrity()`'s Result was silently dropped (the claimed
+  per-input integrity sweep asserted nothing), and eviction was
+  UNREACHABLE at libFuzzer's default 4096-byte max_len against a 64KB
+  heap — the "forces eviction" claim was false and every
+  eviction/NoFreeSegments path was dead code in the smoke. Fixed:
+  integrity asserted, heap shrunk to 4 segments with `-max_len=65536`,
+  and the input's first byte now selects Random/Merge/S3-FIFO so the
+  relocation machinery (the hardened class) runs under the oracle.
+  Soaks clean under the final settings (~1.5M execs light-load, ~1M
+  eviction-heavy across all three policies).
+- CI: a 60s fuzz smoke job (regression tripwire, not a search campaign;
+  pinned cargo-fuzz behind a version-keyed cache) and the missing
+  default-features clippy line (under `--all-features`, loom compiles
+  the whole std-thread test tier OUT of the lint — the CI gap flagged in
+  the July hardening notes, now closed).
 
 ## Outcome
 
-Open — item 1 implemented, PR pending. Validation for item 1:
-`cargo test -p segcache --features debug` 158 passed; loom suite 32/32;
-shuttle suite 7/7; `cargo test --workspace` green;
-`cargo clippy --all-targets --all-features -- -D warnings`,
-`--features shuttle`, `--features loom`, and default-features all clean;
-`cargo fmt --all --check` clean.
+Shipped. Four PRs merged plus one deliberate park:
+
+- **#89** — shuttle backend + five strong-invariant models (the
+  SC-dependent pin/drain halves, asserted for the first time), all
+  bite-checked; CI runs ~290k schedules in ~4s.
+- **#90** — atomic flags byte (delete's tombstone raced every get's
+  `olen` decode); TSan 9 -> 6 reports.
+- **branch `racy-bytes`, PARKED, issue #91** — full defined-race
+  implementation reached TSan-zero but regressed set +12-17% /
+  long-key get +19.5% (inherent, attributed); pinned-verify is the
+  specified recovery. Also surfaced a real pre-existing ~330-byte
+  out-of-bounds verify read (fixed on the branch, ships with #91's fix).
+- **#92** — TSan CI gate, one tracked suppression, validated in both
+  directions; ~2min per PR.
+- **#93** — 13 Kani proofs over the bit-packing substrate (bite-checked;
+  the erratic-SAT `mix_version` proof reworked to a solver-trivial
+  inverse certificate + bounded sanity layer); kani CI job ~1.5min warm.
+- **this PR** — differential-oracle fuzz target (the old one had been
+  dead since the rewrite), oracle bite-checked both directions, 60s CI
+  smoke, and the default-features clippy gap closed.
+
+CI now carries five verification axes per PR: 3-OS tests, loom
+(exhaustive weak-memory), shuttle (randomized SC), TSan (data races),
+Kani (sequential proofs), plus the fuzz oracle — each validated by
+breaking something it must catch.
 
 ## Deferred or Reopen Items
 
-- Issue #62 step 3 (shuttle over the full drain/reserve/publish protocol).
-- Items 2–4 above, in order.
+- **#91** — pinned verify: remove the TSan suppression, retire the racy
+  verify's formal UB, and recover #81's get-path perf (the parked
+  `racy-bytes` branch holds the OOB fix and the full attribution data).
+- **#62 step 3** — shuttle over the full drain/reserve/publish protocol
+  (route `chain_lock`/eviction `Mutex` through `crate::sync`,
+  model-aware `Backoff`).
+- `crc32fast` is ~27% of every set under the always-on keyvalue
+  `integrity` feature (profiling find, pre-existing) — worth its own
+  look.
+- Open test-reliability issues #73 (coarse-clock flake) and #76
+  (unreproduced merge-churn flake) — shuttle replay seeds (#89) are the
+  tool for #76's class.
 
 ## Appendix: Skills Invoked
 

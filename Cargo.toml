@@ -22,7 +22,7 @@ crossbeam-deque = "0.8.6"
 crossbeam-utils = "0.8.21"
 criterion = "0.8.2"
 datatier = { path = "crates/datatier", version = "0.1.1" }
-keyvalue = { path = "crates/keyvalue", version = "0.3.1" }
+keyvalue = { path = "crates/keyvalue", version = "0.4.0" }
 segcache = { path = "crates/segcache", version = "0.4.4" }
 log = "0.4.29"
 memmap2 = "0.9.10"

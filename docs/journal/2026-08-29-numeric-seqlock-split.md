@@ -1,5 +1,5 @@
 ---
-status: open
+status: shipped
 opened: 2026-08-29
 updated: 2026-08-29
 ---
@@ -73,7 +73,30 @@ numeric updates go from lock-free to seqlocked by default), segcache
 
 ## Outcome
 
-Open — implementation complete, validation and bench gate in flight.
+Shipped (PR pending merge at close; evidence complete). Same-path
+interleaved A/B min-of-N vs main — after a false start where the branch
+side accidentally measured a STALE binary left in target/ by the parked
+racy-bytes work (the dep change gives this branch a different artifact
+hash; binaries must be taken from the exact path `cargo bench --no-run`
+prints, never by name):
+
+| bench | main | branch | delta |
+|---|---|---|---|
+| set/1b/1b | 57.3ns | 41.7ns | -27.3% |
+| set/1b/64b | 63.2ns | 45.4ns | -28.2% |
+| set/255b/16384b | 2299ns | 484ns | -78.9% |
+| incr/hot_counter | 76.5ns | 57.9ns | -24.3% |
+| get_hit/1b | 40.4ns | 41.1ns | ~noise |
+| get_hit/255b | 85.5ns | 83.6ns | ~noise |
+
+The ~27% profiling prediction recovered exactly on small sets; large
+values were dominated by hashing the value itself. Full matrix green:
+workspace default (the 6-byte-header layout's first CI exposure — it
+caught one layout-hand-tuned test, rewritten layout-proof), debug 158,
+keyvalue x3 shapes, loom 32, shuttle 7, Kani 2+2+11, clippy both lanes,
+fmt. Adversarial review verified all three feature shapes sound and
+found the verification-surface gaps (keyvalue integrity tests had lost
+their CI lane; default-layout kani run; stale docs) — all fixed.
 
 ## Deferred or Reopen Items
 

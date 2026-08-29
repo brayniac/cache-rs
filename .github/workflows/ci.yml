@@ -185,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      CARGO_FUZZ_VERSION: "0.13.1"
+      CARGO_FUZZ_VERSION: "0.13.2"
     steps:
       - uses: actions/checkout@v4
 
@@ -196,10 +196,15 @@ jobs:
           path: ~/.cargo/bin/cargo-fuzz
           key: ${{ runner.os }}-cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}
 
+      # Deliberately NOT --locked: the pinned lockfile drags in crates
+      # old enough to no longer compile on current nightly
+      # (proc-macro-error's reserved-attribute breakage took down the
+      # first run of this job); a fresh resolution stays buildable, and
+      # the version itself is still pinned via the cache key above.
       - name: Install cargo-fuzz
         run: >
           command -v cargo-fuzz >/dev/null ||
-          cargo install --locked "cargo-fuzz@$CARGO_FUZZ_VERSION"
+          cargo install "cargo-fuzz@$CARGO_FUZZ_VERSION"
 
       # -max_len matters: at libFuzzer's 4096-byte default, a maximal
       # input cannot fill the fuzz cache's heap and eviction never runs

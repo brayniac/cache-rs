@@ -30,10 +30,17 @@ use libfuzzer_sys::fuzz_target;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use segcache::{Segcache, Value};
+use segcache::{Policy, Segcache, Value};
 
 const SEG_SIZE: i32 = 4096;
-const HEAP_SIZE: usize = 16 * 4096; // 16 segments — small enough to force eviction
+// Four segments: with libFuzzer inputs capped at -max_len=65536 (set in
+// CI and the local runs), a dense input can store ~170KB into this 16KB
+// heap, so eviction and the NoFreeSegments/retry paths are genuinely
+// exercised — at 16 segments under the default 4096-byte max_len they
+// were dead code (an input could store ~13KB into a 64KB heap and never
+// evict once). Four rather than fewer so Merge's held-back spare and
+// S3-FIFO's admission/main split aren't degenerate.
+const HEAP_SIZE: usize = 4 * 4096;
 const HASH_POWER: u8 = 7; // the minimum the hashtable accepts
 
 #[derive(Clone, PartialEq, Debug)]
@@ -114,15 +121,33 @@ fn check_hit(model: &HashMap<Vec<u8>, MVal>, key: &[u8], value: Value) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // The first byte selects the eviction policy, so the relocation
+    // machinery (merge's copy_into, S3-FIFO's promote — the code the
+    // concurrency hardening kept finding bugs in) runs under the oracle,
+    // not just Random's whole-segment drops.
+    let mut input = Input { data, pos: 0 };
+    let policy = match input.u8() {
+        None => return,
+        Some(b) => match b % 3 {
+            0 => Policy::Random,
+            1 => Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 2,
+            },
+            _ => Policy::S3Fifo {
+                admission_ratio: 0.25,
+            },
+        },
+    };
     let cache = Segcache::builder()
         .segment_size(SEG_SIZE)
         .heap_size(HEAP_SIZE)
         .hash_power(HASH_POWER)
+        .eviction(policy)
         .build()
         .expect("failed to create cache");
     let mut model: HashMap<Vec<u8>, MVal> = HashMap::new();
-
-    let mut input = Input { data, pos: 0 };
 
     while let Some(op) = input.u8() {
         match op % 10 {
@@ -247,7 +272,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // End-of-input sweep: internal invariants and the superset bound.
-    cache.check_integrity();
+    cache.check_integrity().expect("integrity check failed");
     assert!(
         cache.items() <= model.len(),
         "cache holds {} items but the model (a superset) holds {}",

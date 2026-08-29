@@ -184,6 +184,8 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      CARGO_FUZZ_VERSION: "0.13.1"
     steps:
       - uses: actions/checkout@v4
 
@@ -192,14 +194,21 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-fuzz
-          key: ${{ runner.os }}-cargo-fuzz-bin
+          key: ${{ runner.os }}-cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}
 
       - name: Install cargo-fuzz
-        run: command -v cargo-fuzz >/dev/null || cargo install --locked cargo-fuzz
+        run: >
+          command -v cargo-fuzz >/dev/null ||
+          cargo install --locked "cargo-fuzz@$CARGO_FUZZ_VERSION"
 
+      # -max_len matters: at libFuzzer's 4096-byte default, a maximal
+      # input cannot fill the fuzz cache's heap and eviction never runs
+      # (found in review — the "forces eviction" claim was false).
       - name: Fuzz smoke (60s, model oracle)
         working-directory: crates/segcache/fuzz
-        run: cargo +nightly fuzz run segcache -- -max_total_time=60 -rss_limit_mb=4096
+        run: >
+          cargo +nightly fuzz run segcache --
+          -max_total_time=60 -max_len=65536 -rss_limit_mb=4096
 
   lint:
     runs-on: ubuntu-latest

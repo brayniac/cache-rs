@@ -194,11 +194,24 @@ version behind a cache.
   assertions mid-run.
 - Bite-checked both directions of the oracle: an ack-without-unlink
   delete and an off-by-one `wrapping_add` are each caught within seconds
-  of fuzzing; restored target runs ~375k execs/90s clean.
-- CI: a 60s fuzz smoke job (regression tripwire, not a search campaign)
-  and the missing default-features clippy line (under `--all-features`,
-  loom compiles the whole std-thread test tier OUT of the lint — the CI
-  gap flagged in the July hardening notes, now closed).
+  of fuzzing.
+- Adversarial review (which independently re-ran the oracle body over
+  ~4.3M structured ops) found the first version's two real defects:
+  `check_integrity()`'s Result was silently dropped (the claimed
+  per-input integrity sweep asserted nothing), and eviction was
+  UNREACHABLE at libFuzzer's default 4096-byte max_len against a 64KB
+  heap — the "forces eviction" claim was false and every
+  eviction/NoFreeSegments path was dead code in the smoke. Fixed:
+  integrity asserted, heap shrunk to 4 segments with `-max_len=65536`,
+  and the input's first byte now selects Random/Merge/S3-FIFO so the
+  relocation machinery (the hardened class) runs under the oracle.
+  Soaks clean under the final settings (~1.5M execs light-load, ~1M
+  eviction-heavy across all three policies).
+- CI: a 60s fuzz smoke job (regression tripwire, not a search campaign;
+  pinned cargo-fuzz behind a version-keyed cache) and the missing
+  default-features clippy line (under `--all-features`, loom compiles
+  the whole std-thread test tier OUT of the lint — the CI gap flagged in
+  the July hardening notes, now closed).
 
 ## Outcome
 

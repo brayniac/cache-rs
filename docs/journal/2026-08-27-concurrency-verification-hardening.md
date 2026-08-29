@@ -147,7 +147,37 @@ the TSan reports:
   normal matrix). Gate validated in both directions on this machine:
   main's six known reports suppress to a green run (156 tests), and a
   synthetic novel race (no verify frame) reddens it.
-### Item 3 — Kani harness pack: not started
+### Item 3 — Kani harness pack (this PR)
+
+Thirteen `#[kani::proof]` harnesses over the sequential bit-packing
+substrate the concurrency protocols rest on — exhaustive symbolic proofs
+where the unit tests were hand-picked cases and doc comments were English
+arguments:
+
+- `pack_location`/`unpack_location`/`Location::tag`: roundtrip over every
+  valid (id, generation, 8-aligned offset), injectivity up to the tag
+  projection (two live items can never share a location word — the #79
+  silent-wrap class made unreachable), and GHOST unreachability
+  (previously argued in `MAX_SEGMENTS`' doc comment).
+- `Metadata::pack`/`unpack`: roundtrip and injectivity over every valid
+  (state, links, tag); `State::from_u8` roundtrip.
+- `CasToken`: roundtrip; `mix_version` version-injectivity (the "odd
+  constant, bijective" comment as a machine-checked fact — what makes CAS
+  tokens observe every in-place increment).
+- TTL `bucket_index`: always `< TOTAL_BUCKETS` for every i32 — the bound
+  `get_bucket`'s `get_unchecked` rested on via SAFETY comment — plus
+  monotonicity. The tier arithmetic was extracted from the `&self` method
+  into a pure function to make the obligation a fact about one integer
+  (structure over discipline).
+- keyvalue `numeric_value_pad`/`item_size`: pad < 8, value-slot
+  8-alignment, size covers-and-aligns, for every klen/olen/vlen.
+
+Scope honesty: Kani explores no thread interleavings (loom/shuttle/TSan
+own that axis) and cannot instantiate the mmap-backed engine — these are
+leaf-function proofs, deliberately. Verification cost: sub-second per
+harness. Bite-checked (offset-shift alias, tier-4 clamp removal, link
+shift skew — each fails its proof). CI: a `kani` job with a pinned
+version behind a cache.
 ### Item 4 — fuzz modernization + lint hygiene: not started
 
 ## Outcome

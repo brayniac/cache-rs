@@ -77,6 +77,60 @@ jobs:
       - name: Test with shuttle
         run: cargo test -p segcache --features shuttle -- shuttle_
 
+  # Kani bounded model checking over the sequential bit-packing substrate
+  # the concurrency protocols rest on: location packing (roundtrip,
+  # injectivity, GHOST unreachability — the #79 silent-wrap class),
+  # segment-state metadata packing, CAS token construction and the
+  # mix_version injectivity claim, TTL bucket index bounds (what
+  # get_bucket's get_unchecked rests on), and keyvalue's item size/pad
+  # arithmetic. These are exhaustive symbolic proofs over the full input
+  # domains — the unit tests keep their hand-picked cases as living
+  # documentation; the proofs make them total. Kani explores no thread
+  # interleavings: loom/shuttle/TSan cover that axis.
+  # Hand-rolled install rather than model-checking/kani-github-action:
+  # the action pins an old Kani and compiles kani-verifier from source on
+  # every run; installing a pinned current version behind a cache keyed on
+  # that version makes warm runs cheap and upgrades deliberate.
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      KANI_VERSION: "0.67.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: ${{ runner.os }}-kani-${{ env.KANI_VERSION }}
+
+      # The guard is FUNCTIONAL, not just presence: `cargo kani setup`
+      # installs a pinned nightly under ~/.rustup and symlinks
+      # ~/.kani/kani-<ver>/toolchain to it. The cache restores ~/.kani but
+      # not ~/.rustup, so on a warm run the symlink dangles while
+      # `cargo kani --version` still works — checking the toolchain's
+      # rustc through the symlink is what makes warm runs re-heal.
+      - name: Install Kani
+        run: |
+          if ! command -v cargo-kani >/dev/null \
+             || [ "$(cargo kani --version | awk '{print $2}')" != "$KANI_VERSION" ]; then
+            cargo install --version "$KANI_VERSION" --locked kani-verifier
+          fi
+          if ! [ -x "$HOME/.kani/kani-$KANI_VERSION/toolchain/bin/rustc" ]; then
+            cargo kani setup
+          fi
+
+      - name: Verify keyvalue harnesses
+        run: cargo kani -p keyvalue --features integrity
+
+      - name: Verify segcache harnesses
+        run: cargo kani -p segcache
+
   # ThreadSanitizer over the concurrent test suite. TSan models atomics
   # correctly (no reports from the freq counters, seqlock, or pin
   # protocols — all expressed through atomics) and flags exactly the

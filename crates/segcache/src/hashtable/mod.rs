@@ -383,3 +383,62 @@ mod tests {
         };
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use crate::hashtable::location::{tag_for_generation, TAG_MASK};
+
+    /// A valid packing input: an issuable segment id, any generation, and
+    /// an 8-aligned offset the builder-enforced segment ceiling admits.
+    fn any_valid_packing() -> (NonZeroU32, u16, u64) {
+        let id: u32 = kani::any();
+        kani::assume(id >= 1 && id <= Location::MAX_SEGMENTS);
+        let generation: u16 = kani::any();
+        let offset: u64 = kani::any();
+        kani::assume(offset < Location::MAX_SEGMENT_BYTES as u64);
+        kani::assume(offset % 8 == 0);
+        (NonZeroU32::new(id).unwrap(), generation, offset)
+    }
+
+    /// Every valid (id, generation, offset) survives the pack/unpack/tag
+    /// roundtrip exactly. This is the #79 bug class made unreachable: a
+    /// silent offset-field wrap would fail the offset equality here.
+    #[kani::proof]
+    fn pack_location_roundtrip() {
+        let (id, generation, offset) = any_valid_packing();
+        let loc = pack_location(id, generation, offset);
+        let (id2, offset2) = unpack_location(loc);
+        assert_eq!(id2, id.get());
+        assert_eq!(offset2 as u64, offset);
+        assert_eq!(loc.tag(), tag_for_generation(generation));
+    }
+
+    /// No valid packing can alias the GHOST sentinel — the property
+    /// `Location::MAX_SEGMENTS`' doc comment argues in English (the only
+    /// packing equal to GHOST needs the never-issued top id).
+    #[kani::proof]
+    fn pack_location_never_ghost() {
+        let (id, generation, offset) = any_valid_packing();
+        assert!(!pack_location(id, generation, offset).is_ghost());
+    }
+
+    /// Packing is injective up to the tag projection: equal packed words
+    /// imply equal id, equal offset, and generations whose low `TAG_MASK`
+    /// bits agree. Combined with the layout invariant that two
+    /// simultaneously-live items occupy distinct (id, offset), no two live
+    /// items can share a location word. The generations-mod-64 residue is
+    /// NOT a two-live-items case but the documented stale-entry window: a
+    /// location published exactly 64 incarnations ago validates falsely
+    /// (the accepted 6-bit-tag trade, `location.rs` "Why 6 bits" /
+    /// docs/superpowers/specs/2026-08-19-generation-tagged-locations).
+    #[kani::proof]
+    fn pack_location_injective() {
+        let (id_a, gen_a, off_a) = any_valid_packing();
+        let (id_b, gen_b, off_b) = any_valid_packing();
+        kani::assume(pack_location(id_a, gen_a, off_a) == pack_location(id_b, gen_b, off_b));
+        assert_eq!(id_a, id_b);
+        assert_eq!(off_a, off_b);
+        assert_eq!(gen_a as u64 & TAG_MASK, gen_b as u64 & TAG_MASK);
+    }
+}

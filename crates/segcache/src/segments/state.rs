@@ -325,3 +325,50 @@ mod tests {
         assert_eq!(m.pack() & 0xFFFF_FFFF_FFFF, 0);
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    fn any_metadata() -> Metadata {
+        let state_raw: u8 = kani::any();
+        kani::assume(state_raw <= State::AwaitingRelease as u8);
+        let next: u32 = kani::any();
+        kani::assume(next <= Metadata::LINK_MASK as u32);
+        let prev: u32 = kani::any();
+        kani::assume(prev <= Metadata::LINK_MASK as u32);
+        Metadata {
+            next: NonZeroU32::new(next),
+            prev: NonZeroU32::new(prev),
+            state: State::from_u8(state_raw),
+            tag: kani::any(),
+        }
+    }
+
+    /// Every valid metadata survives the pack/unpack roundtrip — the
+    /// hand-picked-case unit test made total.
+    #[kani::proof]
+    fn metadata_roundtrip() {
+        let m = any_metadata();
+        assert_eq!(Metadata::unpack(m.pack()), m);
+    }
+
+    /// Packing is injective over valid metadata: no two distinct
+    /// (state, links, tag) tuples share a packed word, so a CAS on the
+    /// metadata word can never confuse two states.
+    #[kani::proof]
+    fn metadata_injective() {
+        let a = any_metadata();
+        let b = any_metadata();
+        kani::assume(a.pack() == b.pack());
+        assert_eq!(a, b);
+    }
+
+    /// `from_u8` roundtrips every valid discriminant.
+    #[kani::proof]
+    fn state_from_u8_roundtrip() {
+        let v: u8 = kani::any();
+        kani::assume(v <= State::AwaitingRelease as u8);
+        assert_eq!(State::from_u8(v) as u8, v);
+    }
+}

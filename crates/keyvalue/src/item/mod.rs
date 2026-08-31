@@ -45,7 +45,6 @@ fn item_size_for(klen: usize, olen: usize, extra: usize, vlen: usize) -> usize {
 }
 
 pub use header::{ItemHeader, ITEM_HDR_SIZE};
-#[cfg(feature = "numeric-seqlock")]
 pub use raw::NumericVersionGuard;
 pub use raw::RawItem;
 

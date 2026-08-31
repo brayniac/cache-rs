@@ -57,14 +57,13 @@ ahash = { workspace = true }
 clocksource = { workspace = true }
 crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
-# keyvalue's `numeric-seqlock` is REQUIRED (not merely defaulted): the
-# cas publish path serializes on the numeric item's seqlock writer lock
-# (`lock_numeric_version`), which only excludes numeric writers when they
-# take that lock. It deliberately does NOT pull keyvalue/integrity — the
-# CRC half of the old bundled feature cost a whole-item hash on every
-# insert (~27% of set time) in builds that never check a CRC; segcache's
-# own `integrity` feature turns it on.
-keyvalue = { workspace = true, features = ["numeric-seqlock"] }
+# Deliberately does NOT pull keyvalue/integrity — the CRC half of the
+# once-bundled feature cost a whole-item hash on every insert (~27% of
+# set time) in builds that never check a CRC; segcache's own `integrity`
+# feature turns it on. The numeric seqlock discipline the cas publish
+# path relies on (`lock_numeric_version`) is unconditional in keyvalue,
+# not a feature — it cannot be built out.
+keyvalue = { workspace = true }
 log = { workspace = true }
 metriken = { workspace = true, optional = true }
 rand = { workspace = true, features = ["sys_rng"] }

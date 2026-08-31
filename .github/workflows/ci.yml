@@ -42,16 +42,13 @@ jobs:
       - name: Test with debug feature
         run: cargo test -p segcache --features debug
 
-      # keyvalue's three feature shapes each carry distinct behavior:
-      # default (numeric-seqlock: locked in-place updates, 6-byte header),
-      # integrity (CRC/magic + the seqlock — the shape the CRC-coherence
-      # concurrency tests exercise), and no-default-features (lock-free
-      # numerics). The workspace run above covers only the default shape.
+      # keyvalue's two shapes carry distinct behavior: default (6-byte
+      # header, no CRC — the numeric seqlock is unconditional, not a
+      # feature) and integrity (CRC/magic — the shape the CRC-coherence
+      # concurrency tests exercise). The workspace run above covers only
+      # the default shape.
       - name: Test keyvalue (integrity)
         run: cargo test -p keyvalue --features integrity
-
-      - name: Test keyvalue (no default features)
-        run: cargo test -p keyvalue --no-default-features
 
       # `tests/copy_into_relink_failure.rs` covers `Segment::copy_into`'s
       # `RelinkFailure` abort path, which no workload can reach (the relink CAS

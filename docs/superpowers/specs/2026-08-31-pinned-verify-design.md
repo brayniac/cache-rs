@@ -79,9 +79,20 @@ pub(crate) enum Lookup<T> {
 }
 ```
 
-- `lookup`, `lookup_no_freq_update` → `Lookup<(Location, u8, V::Pin)>`
+```rust
+pub(crate) struct Hit<P> {
+    location: Location,
+    freq: u8,
+    slot: SlotRef,   // for the same-slot freshness compare
+    pin: P,
+}
+```
+
+- `lookup`, `lookup_no_freq_update` → `Lookup<Hit<V::Pin>>`
 - `lookup_slot` → `Lookup<(Location, SlotRef)>` — **pin dropped inside**
 - `insert` → `Result<Insert, ()>` where `Insert` gains an `Unknown(Location)` variant
+
+The `SlotRef` on the get family is new and load-bearing: without it there is no same-slot compare. `search_bucket_for_get` already computes `bucket_index`/`slot_index`, and the existing `lookup_slot`/`search_bucket_no_freq_slot` pair is the precedent for carrying them out.
 
 No waiting or skipping decision is made inside the hashtable. Whether to spin, roll back, or give up is always visible at the caller that holds the pins, which is what keeps the #54 argument local enough to check by reading one function.
 
@@ -93,25 +104,34 @@ This is not an optimization. Insert calls `lookup_slot` and then runs `try_pin_r
 
 The invariant this leaves, stated once: **a verify pin is never held across a lock acquisition or a wait.** `get` is the only path that retains one, and it retains it into `Item`, which is what `Item` is for.
 
+### The pinned compare answers aliasing, not freshness
+
+The pin settles *which item these bytes are*. It says nothing about whether the entry is **still published** — and that is a separate fact the read path needs.
+
+The gap is not theoretical, because **nothing on the read path consults the tombstone**: `verify` discards `_allow_deleted`, and `get_pinned` never checks `is_deleted`. The hashtable unlink is the *only* mechanism making a delete visible to a reader. So a reader that loads the slot word, is descheduled, and resumes after a `delete` has completed will pin (the segment is `Live`/`Sealed`; delete does not drain it), match the tag, compare the key equal (delete flips one header bit), and hand back the deleted item. Linearizable, since the reader's interval spans the delete — but the staleness window is bounded by **thread scheduling**, not by protocol.
+
+Making the tombstone load-bearing is the structural answer and is tracked separately as #97; it needs `delete` reordered to tombstone before it unlinks, and it covers deletes only — `replace` cannot be tombstoned without producing false misses on live keys during every overwrite. So it does not remove the need for what follows.
+
+### Freshness: the same-slot location compare (#81 step 2)
+
+After a `Match`, re-load **the same slot word** — via a `SlotRef` carried out of the scan — and compare **the location field only** (a concurrent frequency bump changes the packed word and would otherwise cause spurious mismatches).
+
+This is exact for "still published", by the same CAS-in-place argument the old STALE-LOCATION block rested on: unlinks CAS the slot to `0` in place (`try_unlink_in_bucket`, `table.rs:1008`), and relocations and replaces go through `cas_location`/`cas_location_at` on the slot holding the entry. No path moves a live entry between slots without CASing that slot, so a delete, relocation, or replace landing in the window is detected. Combined with the pinned compare — the slot maps *some* key to `location`, the bytes at `location` are *our* key, and item locations are unique within a pinned incarnation — the entry is our key's entry.
+
+Cost: one `Acquire` load of a cache line already resident from the scan. That is the whole price of not moving `get`'s linearization point, and it is why #81 names this the default and step (1) alone "a weaker intermediate" needing an explicit decision about what `get` promises.
+
 ### What `get_pinned` becomes
 
 ```
-probe -> Match(raw, guard) -> lazy TTL check -> Item::new(raw, cas, guard)
+probe -> Match(raw, guard, slot) -> same-slot location compare
+      -> lazy TTL check -> Item::new(raw, cas, guard)
 ```
 
-The revalidation lookup (`segcache.rs:296`) and `follow_republished` (`segcache.rs:357`) both disappear. Release builds pay one probe and one pin where they paid two probes and one pin. Only the pin-failure arm of the retry loop survives, and `REVALIDATE_RETRIES` keeps its exact present meaning: a bound on how many segment recycles one `get` will absorb.
+On mismatch, fall through to **exactly today's code**: full `lookup_no_freq_update` + `follow_republished` + `REVALIDATE_RETRIES`. Only the hot path changes. The full re-probe stops being the *default* cost of a hit and becomes the cold fallback, which is where the win comes from — #81 measures the revalidation at roughly 25-35% of a hit, and the expensive part of it is the hash, the bucket probe and the SIMD scan, not the exactness.
 
-Debug builds keep the deleted check as an assertion:
+Keeping the fallback is not conservatism; it is what keeps `follow_republished`, the `before_revalidate` fault-injection hook, `revalidation_tests`, and #68's loom bound alive and meaningful rather than deleted. A design that removes the fast path's *need* for them must not remove the path they test.
 
-```rust
-#[cfg(debug_assertions)]
-debug_assert_eq!(
-    self.hashtable.lookup_no_freq_update(key, &verifier).location(), Some(location),
-    "pinned verify claimed authority but a fresh lookup disagrees"
-);
-```
-
-This is the idiom already used at `table.rs:508`, where the STALE-LOCATION invariant is written as a checked precondition rather than only tested for its visible failure. Every model-checking and fuzzing suite in the tree runs debug, so the tripwire is live wherever it can fire.
+No debug assertion stands in for any of this. An earlier revision of this spec proposed `debug_assert_eq!(fresh_lookup(key), Some(location))` in place of the re-probe. That is not an invariant — `revalidation_tests::budget_absorbs_republication_inside_the_revalidation_window` manufactures its violation fifteen times on purpose — and asserting the absence of an outcome the old code deliberately *handled* is the inverse of the `table.rs:508` idiom, not an instance of it.
 
 ### Insert's `Unknown` → rollback-restart
 
@@ -139,7 +159,8 @@ That is load-bearing rather than incidental: a `Draining` segment is not readabl
 - `SegmentsVerifier`: `&Segments` instead of `&[u8]`; `prefetch` keeps its current unpinned form (a prefetch of an arbitrary in-range address reads nothing).
 - `Hashtable`: `Lookup<T>` on `lookup`, `lookup_no_freq_update`, `lookup_slot`, `contains`, `get_frequency`; `Insert::Unknown` on `insert`.
 - `table.rs`: sticky-`Unknown` scans; delete `verify_slot`'s re-read, `classify_failed_verify`, `SlotVerify`.
-- `segcache.rs`: `get_pinned` loses the re-probe and `follow_republished`; `relookup_after_pin_failure` becomes triage-and-wait; insert's `Unknown` rollback arm; `Unknown` routed into the existing snooze on `delete`/`cas`/`numeric_update`/`try_into_numeric`.
+- `segcache.rs`: `get_pinned` gains the same-slot compare and keeps the re-probe as its cold fallback; `relookup_after_pin_failure` becomes triage-and-wait; insert's `Unknown` rollback arm; `Unknown` routed into the existing snooze on `delete`/`cas`/`numeric_update`/`try_into_numeric`.
+- `cas` (`segcache.rs:1259`) carries the same revalidation shape as `get_pinned`, with its own `RESERVE_RETRIES` budget and an `Exists` failure rather than a miss. It gets the same treatment — pinned verify, same-slot compare, existing re-probe as fallback — and its stake is different enough to call out: a stale location there mints a bad CAS token, which is a correctness question rather than a staleness one.
 - `loom_oracle.rs`: `KeyOracle` gains the three-way return **and the ability to produce `Unknown`**, so the new arms are modeled rather than merely written.
 - Shuttle models and the fuzz differential oracle updated for the new outcome.
 - Delete the `SegmentsVerifier::verify` TSan suppression.
@@ -148,12 +169,19 @@ That is load-bearing rather than incidental: a `Draining` segment is not readabl
 
 - The `racy-bytes` branch's `keyvalue::racy_bytes` module. Its OOB fix is subsumed by the pin argument here.
 - #85 (TtlBucket tail striping), #74, #80 — unrelated.
+- **#97** — making the tombstone load-bearing on the read path, and the `delete` tombstone/unlink reorder it needs. Split out during design review: independent of this change, and it covers deletes only, so it does not substitute for the same-slot compare.
 
 **One PR.** The trait change moves every `Hashtable` signature at once; a split would land a half-converted trait with both verify shapes live, which is precisely the state where the STALE-LOCATION invariant is neither maintained nor retired.
 
 ## 4. Testing
 
-- **Existing suites unchanged in intent**: workspace, segcache `debug` (158), loom (32), shuttle (7), Kani, fuzz smoke, `fault-injection` targets. The revalidation and pin-failure tests (`revalidation_tests`, `pin_failure_tests`, `incarnation_tests`) assert policy that survives this change and must keep passing without weakening — in particular `budget_absorbs_recycled_incarnations_without_a_false_absent`, which is the test that pins `REVALIDATE_RETRIES`' meaning.
+Retaining the re-probe as the fallback is what makes this section honest. Every test below exercises a path that still exists.
+
+- **Must pass UNMODIFIED** — these cover the fallback, and modifying them to accommodate the change would be the change marking its own homework:
+  - all four `revalidation_tests` (`get_converges_instead_of_re_racing_the_lookup`, `budget_absorbs_republication_inside_the_revalidation_window`, `bounded_giveup_when_every_revalidation_loses`, `budget_absorbs_recycled_incarnations_without_a_false_absent`), together with the `after_lookup`/`before_revalidate` fault-injection hooks they drive and CI's dedicated `--features fault-injection --lib revalidation_tests` lane (`ci.yml:71`);
+  - #68's loom lookup-count bound `loom_revalidation_retry_survives_republication` (`table.rs:3372`). Per #81: **if the bound trips, the fast path is doing an extra lookup and the change is wrong.**
+- **Existing suites otherwise unchanged in intent**: workspace, segcache `debug` (158), loom (32), shuttle (7), Kani, fuzz smoke, `pin_failure_tests`, `incarnation_tests`.
+- **New**: a deterministic test that a delete landing in the pin window is caught by the same-slot compare, **proven red by neutering the compare**. Without the red proof this test asserts nothing — the fallback would produce the same answer anyway.
 - **New**: a loom/shuttle model in which a candidate slot's segment is unpinnable, asserting (a) `get` does not report a false absent, (b) `insert` rolls back rather than duplicating, (c) no execution wedges.
 - **New**: a test that a scan seeing `Unknown` on one candidate and `Match` on another returns the match.
 - **The gate that decides the issue is closed**: TSan job green with the suppression *deleted*.

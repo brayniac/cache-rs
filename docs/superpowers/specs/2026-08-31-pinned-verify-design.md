@@ -253,13 +253,21 @@ fresh reservation, so a tight rollback/restart loop against a drain that has
 not moved yet consumes the free pool in milliseconds and turns a transient
 drain into `NoFreeSegments`.
 
-`Segcache::insert` therefore carries a `Backoff` declared OUTSIDE the
+`Segcache::insert` therefore carried a `Backoff` declared OUTSIDE the
 `'operation` loop. The per-attempt `backoff` cannot serve (it is reset every
 iteration), and spinning in place instead of rolling back is the deadlock the
-loop exists to avoid. `pin_failure_tests::
-same_key_insert_completes_when_parked_drain_progresses` is what catches this:
-it waits to observe three restarts' worth of consumed segments before it lets
-the parked drain finish, and a loop with no backoff exhausts all 64 first.
+loop exists to avoid.
+
+**SUPERSEDED by #100.** The backoff did not actually fix this — `Backoff::snooze`
+saturates to a bare `yield_now`, so the burn continued at roughly one
+reservation per yield, and a parked drain still emptied a 64-segment pool
+(measured: 61 of 61 in 500 ms). The real answer was that the wait belongs AFTER
+the rollback, not instead of it: once `rollback_reservation` has released the
+`WriterPin`, the thread holds nothing and blocks nobody, which is exactly the
+position every other write path is in when it snoozes on `Unknown`. `insert`
+now waits there (`Segcache::wait_out_unverifiable`) until the candidate becomes
+readable or its incarnation goes stale, and the `Unknown` policy is uniform
+across all five write paths: *release what you hold, then wait.*
 
 ### 6.3 The `after_lookup` fault hook moved into the verifier
 

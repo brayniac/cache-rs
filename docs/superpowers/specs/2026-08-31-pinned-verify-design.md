@@ -425,9 +425,27 @@ a second, path-specific rule at the end of a change this size, unmodeled and
 with its own soundness argument to write, is how the next bug gets in. It
 wants its own issue, its own loom model, and its own gate.
 
-**The decision this gate exists to force.** §5: "Committing the number before
-the work starts is what keeps the merge decision from being made by whoever is
-tired at the end." The number was committed, the number was missed on two
-lines, and the cause is understood and has a known fix. Merging on the read
-win versus holding for the remover-pin fold is a call for the maintainer, not
-a rationalization to be written here.
+**The decision this gate exists to force — and how it went.** §5: "Committing
+the number before the work starts is what keeps the merge decision from being
+made by whoever is tired at the end." The number was committed and the number
+was missed on two lines.
+
+**Decision (bmartin, 2026-09-04): the miss is ACCEPTED, for correctness.** The
+bar above is left standing as a miss rather than revised to fit the result — a
+pre-committed number that gets rewritten after the fact stops being one, and a
+future reader deserves to see that this change cost ~5.5 ns on the small-value
+replace path rather than that it happened to meet whatever bar was recorded
+last.
+
+What the acceptance rests on:
+
+- the regression buys the removal of a **formally-UB read** and a **real
+  out-of-bounds read**, both live on `main`. Those 5.5 ns were previously
+  obtained by comparing key bytes with no synchronization at all;
+- it is bounded and confined — two of six gate lines, one cause, and every
+  path that does not verify measured neutral;
+- the same change is a large NET win on everything else the gate measures:
+  -12.6% and -31.0% on the reads, -43.6% on `incr`;
+- the recovery is identified and tracked, not hoped for:
+  **pelikan-io/cache-rs#99** carries the remover-pin fold, its soundness
+  sketch, the loom model it needs, and this gate as its bar.

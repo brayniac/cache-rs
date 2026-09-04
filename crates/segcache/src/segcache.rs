@@ -151,6 +151,16 @@ pub struct Segcache {
     pub(crate) hashtable: MultiChoiceHashtable,
     pub(crate) segments: Segments,
     pub(crate) ttl_buckets: TtlBuckets,
+    /// Test-only tally of how many times `insert` has parked waiting for a
+    /// candidate slot it could not verify (see the `Lookup::Unknown` arm).
+    ///
+    /// PER-CACHE and shared, unlike the thread-local `stale_incarnation_charges`.
+    /// Both properties are load-bearing: the parked-drain tests observe the
+    /// waiting writer FROM ANOTHER THREAD — being blocked is the very thing
+    /// they detect — and a process-global counter would let two tests running
+    /// concurrently satisfy each other's waits and pass vacuously.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) insert_drain_waits: std::sync::atomic::AtomicUsize,
 }
 
 // Compile-time guard: Segcache must be Send + Sync so Arc<Segcache> can be
@@ -602,15 +612,6 @@ impl Segcache {
         // when publishing would deadlock against a drain of the reservation's
         // own segment — see the replace arm's pin-failure handler below.
         //
-        // Backs off ACROSS restarts, not within one: each restart burns a
-        // fresh reservation, so a tight rollback/restart loop against a drain
-        // that has not moved yet consumes the free pool in milliseconds and
-        // turns a transient drain into `NoFreeSegments`. The per-attempt
-        // `backoff` below cannot serve — it is reset every iteration — and
-        // spinning in place instead of rolling back is precisely the deadlock
-        // this loop exists to avoid (the drain may be waiting on the WriterPin
-        // inside our own reservation).
-        let restart_backoff = Backoff::new();
         'operation: loop {
             // `Value` is a borrowed enum without `Copy`; re-borrow it for this
             // attempt so a restart can consume it again.
@@ -670,9 +671,9 @@ impl Segcache {
                     // Treating `Unknown` as absent is the failure to avoid:
                     // insert would take the fresh-key arm below and publish a
                     // DUPLICATE entry for a key that already has one (#46).
-                    Lookup::Unknown(_location) => {
+                    Lookup::Unknown(location) => {
                         self.rollback_reservation(reserved, new_location);
-                        restart_backoff.snooze();
+                        self.wait_out_unverifiable(location);
                         continue 'operation;
                     }
                     Lookup::Found((old_location, slot)) => {
@@ -786,9 +787,9 @@ impl Segcache {
                             // above, for the same reason: the upsert could not
                             // establish whether the key already has an entry,
                             // and publishing on a guess duplicates it.
-                            Ok(Insert::Unknown(_location)) => {
+                            Ok(Insert::Unknown(location)) => {
                                 self.rollback_reservation(reserved, new_location);
-                                restart_backoff.snooze();
+                                self.wait_out_unverifiable(location);
                                 continue 'operation;
                             }
                             Ok(Insert::Created) => {
@@ -829,6 +830,58 @@ impl Segcache {
             // Defensive fallback for the "invalid old location" break above.
             self.rollback_reservation(reserved, new_location);
             return Err(SegcacheError::HashTableInsertEx);
+        }
+    }
+
+    /// A candidate slot named a location this thread could not verify, and its
+    /// reservation has just been rolled back — so it now holds NOTHING. Wait
+    /// for the blocker to clear before reserving again.
+    ///
+    /// # Why the wait goes here and not one line earlier
+    ///
+    /// `insert` cannot wait while it is BLOCKED: it holds the `WriterPin`
+    /// inside its reservation, and the drain that owns the unverifiable
+    /// candidate may be waiting on exactly that pin, so spinning in place
+    /// wedges both threads (#54). Rolling back is the only safe move.
+    ///
+    /// But rolling back and IMMEDIATELY re-reserving is what #100 was: every
+    /// restart burns a fresh reservation, a 64-segment cache empties in ~4 ms
+    /// of that, and a transient drain comes out as `NoFreeSegments` — an error,
+    /// for a set that should merely have been slow. `Backoff::snooze` does not
+    /// fix it either; it saturates to a bare `yield_now`, so the burn continues
+    /// at roughly one reservation per yield.
+    ///
+    /// After `rollback_reservation` the thread is in precisely the position
+    /// `delete`, `cas`, `numeric_update` and `try_into_numeric` are in when
+    /// they snooze on `Unknown`: holding nothing, blocking nobody. So it waits
+    /// the way they do, and the `Unknown` policy becomes uniform across every
+    /// write path — *release what you hold, then wait.*
+    ///
+    /// # Termination
+    ///
+    /// Exits on either of the two ways an `Unknown` can resolve, and both are
+    /// bounded by the drain, which is bounded straight-line work:
+    ///
+    /// - **the segment becomes readable again** — the pin probe succeeds, so a
+    ///   fresh lookup can now verify the candidate;
+    /// - **the location goes stale** — `resolve` says `None`, the incarnation
+    ///   is gone, and there is nothing left to wait for: a fresh lookup will
+    ///   resolve the key at its new location or report it absent.
+    ///
+    /// `resolve` is checked first because it is the cheaper question and the
+    /// one that needs no pin.
+    #[cold]
+    #[inline(never)]
+    fn wait_out_unverifiable(&self, location: Location) {
+        #[cfg(all(test, not(model_checking)))]
+        self.insert_drain_waits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let backoff = Backoff::new();
+        while self.segments.resolve(location).is_some()
+            && self.segments.acquire_item_at(location).is_none()
+        {
+            backoff.snooze();
         }
     }
 

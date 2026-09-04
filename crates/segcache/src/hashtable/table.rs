@@ -108,10 +108,12 @@ pub struct MultiChoiceHashtable {
     /// LOCK: insert-stripe — leaf; the critical section is bucket-word CASes
     /// and verifier calls, and it is never held across another lock or a WAIT.
     /// Since #91 a verifier call takes a reader pin — a `fetch_add` plus a
-    /// state check, released before it returns — which keeps the section
-    /// wait-free: nothing ever blocks on a reader count (an evictor that finds
-    /// one condemns the segment to `AwaitingRelease` rather than waiting), so
-    /// no cycle can form through a pin taken here.
+    /// state check, released before `try_replace_existing` returns — and that
+    /// keeps the section wait-free rather than breaking it: NOTHING EVER WAITS
+    /// ON A READER COUNT (a drain waits on `active_writers`/`active_removers`,
+    /// and condemns to `AwaitingRelease` when it finds readers), so a pin taken
+    /// here cannot be an edge in any wait-for graph and no cycle can form
+    /// through it.
     insert_locks: Box<[CachePadded<Mutex<()>>]>,
 }
 
@@ -992,21 +994,33 @@ impl MultiChoiceHashtable {
     /// Same miss/hit semantics as `lookup_no_freq_update`: only live
     /// (non-ghost) entries are returned.
     ///
-    /// # The pin is dropped inside, structurally
+    /// # The pin is dropped inside
     ///
-    /// This is not an optimization. `lookup_slot` is used only by write paths,
-    /// and every one of them goes on to `try_pin_remover` -> `cas_location_at`
-    /// -> `remove_at`, where `remove_at` can take a bucket `chain_lock`.
-    /// Holding a verify pin across that acquisition is the same lock-order
-    /// hazard the WriterPin rule already states in `segcache.rs`. Rather than
-    /// add a second rule someone has to remember, the pin is released here so
-    /// the hazardous state cannot be written: the returned `Location` is
-    /// unpinned, and insert re-validates the incarnation under its own remover
-    /// pin in `remove_at`.
+    /// `lookup_slot` is used only by write paths, and none of them has any use
+    /// for the pinned item: they go on to `try_pin_remover` ->
+    /// `cas_location_at` -> `remove_at`, and `remove_at` re-validates the
+    /// incarnation under the REMOVER pin, which is the pin that actually
+    /// matters there (a drain waits out removers before sweeping; it does not
+    /// wait out readers). Releasing the verify pin here keeps its lifetime as
+    /// short as the compare it guarded.
     ///
-    /// The invariant that leaves, stated once: **a verify pin is never held
-    /// across a lock acquisition or a wait.** `get` is the only path that
-    /// retains one, and it retains it into an `Item`.
+    /// # What the real safety property is
+    ///
+    /// It is tempting to state this as "a verify pin is never held across a
+    /// lock acquisition or a wait" — and #91's design did. That is FALSE as a
+    /// blanket rule: `Segcache::numeric_update` deliberately retains its verify
+    /// pin across `RawItem::lock_numeric_version`, because the pin is what
+    /// keeps `raw` valid while the seqlock is held.
+    ///
+    /// The property that actually holds, and the one the pinning verifier's
+    /// safety rests on: **nothing ever waits on a reader count.** A drain waits
+    /// on `active_writers` and `active_removers` (`claim_for_drain`); when it
+    /// finds readers it CONDEMNS the segment to `AwaitingRelease` and walks
+    /// away (`finalize_drained`). So a reader pin can never be an edge in a
+    /// wait-for graph, and holding one — across the insert stripe lock, across
+    /// the item seqlock, into an `Item` — cannot close a cycle. The rules that
+    /// ARE about lock order (`WriterPin` vs a bucket `chain_lock`) concern the
+    /// pins that are waited on, and are unchanged.
     pub(crate) fn lookup_slot<V: KeyVerifier>(
         &self,
         key: &[u8],
@@ -1018,6 +1032,18 @@ impl MultiChoiceHashtable {
             Lookup::Absent => Lookup::Absent,
             Lookup::Unknown(location) => Lookup::Unknown(location),
         }
+    }
+
+    /// The key's 12-bit tag and candidate bucket indices.
+    ///
+    /// Test-only. The deterministic pin/collision tests need to build a
+    /// GENUINE tag collision — two distinct keys whose probes land on the same
+    /// slot — and searching for one through the public API would be slow and
+    /// would silently stop finding collisions if the hash or the tag width
+    /// changed.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) fn probe_for_test(&self, key: &[u8]) -> (u16, [usize; MAX_CHOICES as usize]) {
+        self.probe(key)
     }
 
     /// Does `slot` still publish `location`?

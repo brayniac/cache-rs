@@ -94,9 +94,11 @@ fn join_within(name: &str, rx: mpsc::Receiver<()>, handle: std::thread::JoinHand
 /// relocation publishing a pre-increment copy) can break the sequence. A
 /// genuine eviction of the counter surfaces as `NotFound` (the entry is
 /// unlinked first), which the thread handles by reseeding — it can never be
-/// confused with a lost ack. The counter's frequency is bumped on every
-/// incr lookup and preserved across relinks, so prune retains it and
-/// evictions stay rare-to-absent.
+/// confused with a lost ack. The counter's frequency is bumped once per incr
+/// (it was three times before #91 collapsed `numeric_update`'s three probes
+/// into one) and preserved across relinks, so prune retains it and evictions
+/// stay rare-to-absent — the 8-bit ASFC counter saturates either way at these
+/// rates.
 ///
 /// A relocation-published ODD version word instead wedges the next incr /
 /// get in an unbounded seqlock spin — caught by the watchdog.

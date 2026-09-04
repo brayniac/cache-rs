@@ -288,7 +288,135 @@ hazard, and it is what produces `Unknown`.
 frequency, and `get_frequency` covers the one query that wants it. Carrying it
 would have earned a `#[allow(dead_code)]` for nothing, so it is not there.
 
-### 6.6 The write paths collapsed from three probes to one
+### 6.6 The stated pin invariant was wrong, and §2 is where it came from
+
+§2 states: "**a verify pin is never held across a lock acquisition or a wait.**
+`get` is the only path that retains one, and it retains it into `Item`." The
+adversarial review before the PR falsified that in one grep, and the
+implementation is what made it false: §6.7's write-path collapse has
+`numeric_update` retain its VERIFY pin across `RawItem::lock_numeric_version`,
+because the pin is now what keeps `raw` valid while the seqlock is held. Before
+the collapse that pin came from a separate `acquire_item_at` and the sentence
+was true.
+
+Rather than restore the sentence by re-pinning, the code now states the
+property that actually holds — and it is a stronger one:
+
+> **Nothing ever waits on a reader count.** `claim_for_drain` waits on
+> `active_writers` and `active_removers`; when `finalize_drained` finds readers
+> it condemns the segment to `AwaitingRelease` and walks away. So a reader pin
+> can never be an edge in a wait-for graph, and holding one — across the insert
+> stripe lock, across the item seqlock, into an `Item` — cannot close a cycle.
+
+The lock-order rules that DO bite (`WriterPin` vs a bucket `chain_lock`) are
+about the pins that are waited on, and are untouched. `lookup_slot` still drops
+its pin, but for the honest reason: its callers have no use for the item, and a
+pin should not outlive the compare it guarded.
+
+This matters beyond the wording. §2 justified `lookup_slot` dropping the pin as
+closing a *lock-order hazard*; it is not one, and a future reader who believes
+it will draw the wrong conclusion about what is and is not safe to hold.
+
+### 6.7 A miss can now wait out an unrelated segment's drain
+
+Not a bug, and not anticipated by §2. `Unknown` is sticky, and a scan reports it
+for any tag-matching candidate it could not verify — including a **different
+key's** entry that happens to share the 12-bit tag (~1 in 4096 per examined
+slot). If that foreign entry's segment is `Draining`, a lookup for a key that is
+*genuinely absent* returns `Unknown` instead of `Absent`, and the caller waits
+out the drain before answering.
+
+Pre-#91 the unpinned compare answered `DifferentKey` immediately and the miss
+returned at once. The new behaviour is *correct* — an unverifiable candidate
+cannot be ruled out as this key's — and bounded by the drain, but it is a
+latency cliff on the miss path that did not exist before, and it lands in the
+uncharged/unbounded transient arm of `triage_unknown_location`. §2 argues that
+arm only from the key's OWN entry.
+
+### 6.8 #68's loom bound was modified, contrary to §4
+
+§4 lists `loom_revalidation_retry_survives_republication` under "**Must pass
+UNMODIFIED**". It did not. Its bound was relaxed from
+`lookups <= CHAIN.len() + 1` to `lookups <= CHAIN.len() + resolves`, where
+`resolves` counts from-scratch resolves, because an oracle `Unknown` legitimately
+costs one and the pre-#91 loop had no such outcome. The mismatch-must-not-cost-a-resolve
+property — the actual #65/#68 content — is preserved and is arguably stated more
+directly than before.
+
+What is honestly weaker: the model's reader is still a transcription of the
+two-probe loop and has no `slot_publishes`, so the bound no longer tests the
+claim §4 attaches to it ("if the bound trips, the fast path is doing an extra
+lookup"). The fast path's lookup-count win is evidenced by §7's benchmarks
+instead.
+
+### 6.11 What the pre-PR adversarial review found
+
+Four adversarial subagents were run against the diff before merge, one per risk
+cluster. Three findings were real and are fixed in this change; the rest of each
+cluster was verified safe. Recorded here because two of the three were caused by
+this change and would otherwise read as pre-existing.
+
+**(a) `delete` could unlink an entry and then report NOT_FOUND.** Found
+independently by three of the four agents, which is how a real one usually
+announces itself. The post-unlink re-check ("an acked delete NEVER leaves the
+key reachable") was translated from `Option::is_none()` to
+`matches!(.., Lookup::Absent)`, which silently reclassifies the new third arm:
+`Unknown` makes the conjunction false AFTER `remove` has already succeeded, so
+the loop retried, and the next iteration found the key absent — because this
+very call had removed it — and returned `false`. Metrics were skipped too.
+
+Keeping `Unknown` as a retry is right (it proves nothing about reachability);
+what was wrong was re-deriving the ANSWER from a later iteration. `delete` now
+carries an `unlinked` flag set the moment the unlink lands, and every exit
+returns it. Regression test:
+`pin_failure_tests::acked_delete_is_not_lost_when_the_recheck_cannot_verify`,
+red before the fix, and deterministic — it builds the three conditions rather
+than racing for them (victim in a `Relinking` segment: readable, so the lookup
+resolves it, but refusing remover pins; a tag-colliding sibling parked in
+`Draining`, so the re-check cannot verify it).
+
+**(b) An unsound `debug_assert` in `Segments::recycle`, made reachable.** One
+agent reproduced a genuine suite flake (1 run in 14 on this branch, 0 in 12 on
+`main`): `assertion failed: freed a segment pinned by readers`, which then
+poisons the TTL bucket's mutex and cascades.
+
+The assertion was always unsound. `try_acquire_reader` loads the state, THEN
+increments, THEN re-checks — so a reader that started before the drain claim can
+land its increment after the caller's SeqCst `ref_count == 0` load and back out a
+moment later. `ref_count` is legitimately, transiently non-zero there. The
+caller's SeqCst load is the Dekker half that means something; a later plain
+re-read of a value the protocol allows to flicker is not a check. #91 made it
+reachable by taking a pin per tag-matching candidate on every scan instead of
+only at four already-resolved call sites. The assert is gone, replaced by the
+precondition stated as a contract.
+
+**(c) `numeric_update`'s `NotNumeric` escaped the freshness check.** Caused by
+§6.9's collapse: deleting the pre-lock revalidation left `lock_numeric_version`'s
+`Err` returning through `?` before `slot_publishes` is consulted. A
+`wrapping_add` that pins a key's old BYTES item while a racing
+`try_into_numeric` converts and republishes it then reports `NotNumeric` for a
+key that is numeric — breaking exactly the composition this API documents.
+`main` retried and succeeded. The error arm now consults freshness first and
+retries a superseded item. No test: both outcomes are linearizable, so the race
+cannot be distinguished by observation, only by which behaviour we choose — and
+the choice is to match `main`.
+
+**Verified safe** (recorded so a reviewer knows these were examined, not
+skipped): `slot_publishes`'s location-only compare against ABA, ghost and
+empty-slot aliasing, and against any path that moves a live entry between slots
+without CASing the one it left; the sticky-`Unknown` fold against both false
+absents and `Unknown` shadowing a reachable `Match`; `search_bucket`'s
+equivalence to the four scans it replaced, including `allow_deleted`; the
+striped insert lock still being a leaf now that its critical section pins;
+`get_pinned`'s pin discipline and budget parity across all three
+`continue 'resolve` paths; `cas`/`try_into_numeric` guard lifetimes across every
+early return; the two new `debug_assert`s being unreachable and non-false-positive
+(`RawItem::size` and `keyvalue::item_size` are character-for-character the same
+arithmetic); `SlotRef`'s narrowing and its new bound assert; and that no eviction
+or merge path reaches a verifier — the claim §2 rests on, since a `Draining`
+segment is unreadable and merge would otherwise copy nothing.
+
+### 6.9 The write paths collapsed from three probes to one
 
 §5 predicted where the write-path budget would go — "insert's `lookup_slot`
 now takes a reader pin per tag-matching candidate ... the first thing to
@@ -322,7 +450,17 @@ Two consequences worth stating rather than leaving to be discovered:
   before the pin, with a comment conceding it was "a semantic filter, not a
   safety mechanism" because it raced a recycle. It no longer does.
 
-### 6.7 `SlotRef` shrank to 8 bytes
+**Scope beyond §3, stated plainly.** §3 puts the same-slot compare on
+`get_pinned` and `cas` only, and says `numeric_update`/`try_into_numeric`
+merely "gain the `Unknown` arm routed into the snooze they already have". Both
+got the full collapse instead. §3 also says `cas` keeps "the existing re-probe
+as fallback"; it does not — the same-slot compare replaced it outright, which
+is behaviourally what `main` did (`cas` never had `get`'s converging fallback,
+only a bounded retry) but is not what the sentence promises. And
+`numeric_update` lost its pre-lock revalidation entirely. That last one had a
+consequence the review caught — see §6.11(c).
+
+### 6.10 `SlotRef` shrank to 8 bytes
 
 A `SlotRef` now rides inside every `Hit`, and a lookup returns by value
 through several frames. Three naturally-sized fields (`usize`, `usize`,

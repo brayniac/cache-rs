@@ -1444,14 +1444,22 @@ impl Segcache {
     pub fn delete(&self, key: &[u8]) -> bool {
         let verifier = self.verifier();
         let backoff = Backoff::new();
+        // Set the moment this call unlinks an entry for `key`. From then on the
+        // ack is OWED, even if the loop goes round again — and it can, because
+        // the post-unlink re-check below is allowed to answer "could not look"
+        // rather than "confirmed gone". Re-deriving the answer from a later
+        // iteration instead loses it: the key is absent by then precisely
+        // BECAUSE this call removed it, and `delete` would report NOT_FOUND for
+        // a key it had just deleted.
+        let mut unlinked = false;
         loop {
             // Look up the item to get its location
-            // The verify pin the lookup took is dropped with `hit`, before the
-            // remover pin below: a verify pin is never held across a lock
-            // acquisition, and `remove_at` can take a bucket `chain_lock`.
+            // The verify pin the lookup took is dropped with `hit`: this path
+            // wants the location, not the bytes, and the pin that matters below
+            // is the REMOVER pin, which is the one a drain waits out.
             let location = match self.hashtable.lookup_no_freq_update(key, &verifier) {
                 Lookup::Found(hit) => hit.location,
-                Lookup::Absent => return false,
+                Lookup::Absent => return unlinked,
                 // Unbounded retry, as at the refused remover pin below: a
                 // draining segment does not mean the key is gone, and an acked
                 // `false` for a live key is a lost delete.
@@ -1479,7 +1487,7 @@ impl Segcache {
             // stale hashtable entry is left for expire()/eviction pressure to
             // sweep.
             if self.remaining_ttl(seg_id).is_err() {
-                return false;
+                return unlinked;
             }
 
             // Pin the item's segment BEFORE unlinking it (item 7f): the pin
@@ -1556,22 +1564,34 @@ impl Segcache {
             let Some(pin) = self.segments.try_pin_remover(seg_id) else {
                 if self.segments.generation(seg_id) == observed_gen
                     && self.hashtable.remove(key, location)
-                    && matches!(
-                        self.hashtable.lookup_no_freq_update(key, &verifier),
-                        Lookup::Absent
-                    )
                 {
+                    // The unlink LANDED. Record it before asking whether the
+                    // key is gone, because that question has three answers and
+                    // only one of them is "yes".
+                    unlinked = true;
                     #[cfg(feature = "metrics")]
                     {
                         HASH_REMOVE.increment();
                         ITEM_DELETE.increment();
                     }
-                    return true;
+                    // Defense (2): an acked delete must NEVER leave the key
+                    // reachable. `Absent` is the only answer that proves that.
+                    // `Unknown` means a candidate slot could not be verified —
+                    // a 12-bit-tag-colliding entry in a segment a drain owns —
+                    // and proves nothing, so it retries rather than acking. The
+                    // ack itself is not lost by that: `unlinked` carries it.
+                    if matches!(
+                        self.hashtable.lookup_no_freq_update(key, &verifier),
+                        Lookup::Absent
+                    ) {
+                        return true;
+                    }
                 }
                 // The entry moved (a merge republished it elsewhere), was
-                // removed concurrently, or the key still resolves after the
-                // unlink — retry from the lookup, which resolves the fresh
-                // location or reports the key gone.
+                // removed concurrently, or the key still resolves — or could
+                // not be shown not to — after the unlink. Retry from the
+                // lookup, which resolves the fresh location or reports the key
+                // gone.
                 backoff.snooze();
                 continue;
             };
@@ -1579,7 +1599,7 @@ impl Segcache {
             // Remove from hashtable
             if !self.hashtable.remove(key, location) {
                 drop(pin);
-                return false;
+                return unlinked;
             }
 
             #[cfg(feature = "metrics")]
@@ -1791,9 +1811,30 @@ impl Segcache {
             // the lookup above found it in. A full re-probe would answer the
             // same question by re-hashing the key and rescanning its buckets,
             // and would take a pin of its own to do it.
-            let vguard = raw
-                .lock_numeric_version()
-                .map_err(|_| SegcacheError::NotNumeric)?;
+            let vguard = match raw.lock_numeric_version() {
+                Ok(vguard) => vguard,
+                // NOT-NUMERIC IS ALSO A FRESHNESS QUESTION. `raw` is a real
+                // item of this incarnation (the pin and the tag say so), but it
+                // may have been SUPERSEDED — a racing `try_into_numeric` can
+                // have converted this key and published the numeric copy
+                // elsewhere, leaving the bytes we pinned as the old
+                // non-numeric value. Returning `NotNumeric` on that would be a
+                // spurious error for a key that is numeric right now, and it
+                // would break the `try_into_numeric` + `wrapping_add`
+                // composition this API documents.
+                //
+                // Before the write-path collapse a full re-probe ran BEFORE
+                // this lock and caught it; the freshness check now lives after
+                // it, so this arm has to consult it too rather than escaping
+                // through `?`.
+                Err(_) => {
+                    if self.hashtable.slot_publishes(hit.slot, hit.location) {
+                        // Still published, and genuinely not numeric.
+                        return Err(SegcacheError::NotNumeric);
+                    }
+                    continue;
+                }
+            };
             if !self.hashtable.slot_publishes(hit.slot, hit.location) {
                 drop(vguard);
                 continue;

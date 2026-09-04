@@ -793,18 +793,34 @@ impl Segments {
 
     // ── Free queue ───────────────────────────────────────────────────
 
-    /// Return a drained segment to the free queue. The segment must be in
-    /// the Draining state with no readers pinning it. The `Draining ->
-    /// Free` transition bumps the generation (a used incarnation is
-    /// ending); the write statistics are reset here and again at reserve
-    /// time.
+    /// Return a drained segment to the free queue. The `Draining -> Free`
+    /// transition bumps the generation (a used incarnation is ending); the
+    /// write statistics are reset here and again at reserve time.
+    ///
+    /// # Precondition, and why it is not asserted here
+    ///
+    /// The caller must hold the `Draining` claim AND have observed
+    /// `ref_count_seqcst() == 0` — that SeqCst load is the reader half of the
+    /// Dekker pair in `SegmentHeader::try_acquire_reader`, and it is the check
+    /// that means anything. Both production callers do exactly that
+    /// immediately before calling (`finalize_drained`, and `TtlBucket`'s
+    /// expiry).
+    ///
+    /// A `debug_assert` re-reading `ref_count` here used to stand in for that
+    /// precondition. It was UNSOUND, and #91 made it reachable often enough to
+    /// flake the suite. `try_acquire_reader` loads the state, THEN increments,
+    /// and only then re-checks — so a reader that started before the drain
+    /// claim can land its increment after the caller's SeqCst load and back
+    /// out a moment later. `ref_count` is legitimately, transiently non-zero
+    /// there, and the reader never obtains a usable guard (its re-check sees
+    /// the non-readable state, and the incarnation tag under the pin catches
+    /// the recycled case regardless). Re-reading a value the protocol allows
+    /// to flicker is not a check; it just panics the drainer and poisons the
+    /// TTL bucket's mutex. #91 turned a rare race into a frequent one by
+    /// taking a pin per tag-matching candidate on every scan rather than only
+    /// at four already-resolved call sites.
     pub(crate) fn recycle(&self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
-        debug_assert_eq!(
-            self.headers[id_idx].ref_count(),
-            0,
-            "freed a segment pinned by readers"
-        );
 
         // Unlink from its chain first: this reads the segment's own
         // prev/next to patch the neighbors, so it must happen before the

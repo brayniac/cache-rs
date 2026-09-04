@@ -81,10 +81,12 @@ fn insert_and_seal(cache: &Segcache, key: &[u8], val: &[u8]) -> (Location, NonZe
     cache.insert(key, val, None, ttl).expect("insert target");
 
     let verifier = cache.segments.verifier();
-    let (location, _freq) = cache
+    let location = cache
         .hashtable
         .lookup_no_freq_update(key, &verifier)
-        .expect("target must resolve");
+        .found()
+        .expect("target must resolve")
+        .location;
     let (seg_raw, _offset) = unpack_location(location);
     let seg_id = NonZeroU32::new(seg_raw).expect("target location must be a real segment");
 
@@ -105,10 +107,12 @@ fn insert_and_seal(cache: &Segcache, key: &[u8], val: &[u8]) -> (Location, NonZe
 
     // The fill is far below eviction pressure, so the target must not have
     // moved.
-    let (loc_after, _) = cache
+    let loc_after = cache
         .hashtable
         .lookup_no_freq_update(key, &verifier)
-        .expect("target still resolves");
+        .found()
+        .expect("target still resolves")
+        .location;
     assert_eq!(loc_after, location, "target must not relocate during fill");
 
     (location, seg_id)
@@ -231,19 +235,98 @@ fn get_terminates_when_key_removed_during_drain() {
 /// in the hashtable (`copy_into`'s `get_item_frequency` gate), so an acked
 /// delete that leaves the entry behind resurrects — a hard memcached
 /// contract violation.
+///
+/// # This test changed shape with the pinned verify (#91), and why
+///
+/// It used to assert that the delete acks *while the segment is still
+/// Draining*, by unlinking the entry itself. That was only possible because
+/// the verifier read the key's bytes with no pin — which is the formally-UB
+/// read #91 removes. A pinned verifier cannot resolve a key in a `Draining`
+/// segment at all (`Draining` is not readable, `state.rs`), so `delete` now
+/// answers the same way every other write path answers an unpinnable
+/// candidate: it waits.
+///
+/// **Waiting is the correct answer, not a concession.** A drain is bounded,
+/// straight-line work with exactly two outcomes, and the delete is right
+/// either way:
+///
+/// - a *merge* drain relocates the item and republishes it in the
+///   destination, so the retry resolves the key there (readable) and unlinks
+///   it — acked `true`, entry really gone;
+/// - a *clear/expire* drain sweeps the entry, so the retry sees the key
+///   absent and answers `false` — the key was evicted, which a cache may
+///   always do.
+///
+/// Neither outcome can resurrect, and neither can wedge: `delete` holds no
+/// pin while it waits, so it cannot be what a drain is waiting for. The
+/// `Relinking` case below is the one that genuinely CANNOT wait — nothing
+/// ever drains a copy destination — and it still unlinks immediately,
+/// because `Relinking` is readable and the verify succeeds there.
+///
+/// So the property under test is now the pair: **no ack until the entry is
+/// really unlinked, and the wait ends when the drain does.**
 #[test]
 fn acked_delete_during_drain_unlinks_the_entry() {
-    let cache = small_merge_cache(8);
+    let cache = Arc::new(small_merge_cache(8));
     let (location, seg_id) = insert_and_seal(&cache, b"victim0", b"Vvicti0");
 
     // A merge drain claims the segment and is "mid copy".
     assert!(cache.segments_for_test().claim_for_drain_for_test(seg_id));
 
-    // DELETE while the drain is in flight: the key is live, so it acks.
+    // DELETE while the drain is in flight, on its own thread.
+    let (tx, rx) = mpsc::channel();
+    // Set before the call, so "no answer yet" can be distinguished from "the
+    // thread never ran". Without it the negative assertion below passes
+    // vacuously on a loaded machine, which is the classic way a
+    // timeout-shaped test rots into a no-op.
+    let started = Arc::new(AtomicBool::new(false));
+    let deleter = {
+        let cache = Arc::clone(&cache);
+        let started = Arc::clone(&started);
+        std::thread::spawn(move || {
+            started.store(true, AtomicOrdering::Release);
+            let _ = tx.send(cache.delete(b"victim0"));
+        })
+    };
+
+    // It must not have answered yet: the key is live, and the only way to
+    // answer `true` right now would be to unlink a slot whose key bytes
+    // nothing was able to read.
     assert!(
-        cache.delete(b"victim0"),
-        "delete of a live key must be acked"
+        matches!(
+            rx.recv_timeout(Duration::from_millis(250)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "delete answered while its key's segment was unreadable: either it \
+         acked without unlinking (resurrection) or it reported a live key gone"
     );
+    assert!(
+        started.load(AtomicOrdering::Acquire),
+        "the deleter thread never ran, so the window above proved nothing"
+    );
+    assert!(
+        cache
+            .hashtable
+            .get_item_frequency(b"victim0", location)
+            .is_some(),
+        "test setup: nothing has swept the entry, so the delete really is \
+         still waiting on the drain rather than already finished"
+    );
+
+    // Drain finishes via the revert arc.
+    assert!(cache.segments.header(seg_id).cas_metadata(
+        State::Draining,
+        State::Sealed,
+        None,
+        None,
+        crate::sync::Ordering::SeqCst,
+    ));
+
+    let acked = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("delete wedged: the wait must end when the drain does");
+    deleter.join().expect("deleter must not panic");
+    assert!(acked, "delete of a live key must be acked");
 
     // The ack must be real: the entry must be unlinked, because this is
     // exactly what the merge's relocation gate consults. A left-behind
@@ -255,15 +338,6 @@ fn acked_delete_during_drain_unlinks_the_entry() {
             .is_none(),
         "acked delete left the hashtable entry; a merge drain would relocate (resurrect) it"
     );
-
-    // Drain finishes via the revert arc; the key must stay deleted.
-    assert!(cache.segments.header(seg_id).cas_metadata(
-        State::Draining,
-        State::Sealed,
-        None,
-        None,
-        crate::sync::Ordering::SeqCst,
-    ));
     assert!(
         cache.get(b"victim0").is_none(),
         "acked delete resurrected after the drain"
@@ -874,4 +948,131 @@ fn merge_churn_no_false_miss_no_resurrection() {
     join_within("churn writer", crx, churner, 300);
     join_within("hot-key reader", rrx, reader, 60);
     join_within("delete/verify worker", drx, deleter, 60);
+}
+
+/// Two DISTINCT `KEY_LEN`-byte keys that share a 12-bit tag and their first
+/// candidate bucket, so a lookup of one genuinely reaches the other's slot and
+/// calls `verify` on it.
+///
+/// Sharing `buckets[0]` specifically is what makes the collision reliable:
+/// `try_claim_new_slot` scans candidates in order, so into a lightly-loaded
+/// table each key lands in its first choice — which is the first bucket the
+/// other one examines.
+fn find_tag_colliding_pair(cache: &Segcache) -> (String, String) {
+    let mut seen: std::collections::HashMap<(u16, usize), String> =
+        std::collections::HashMap::new();
+    for i in 0u64..1_000_000 {
+        let cand = format!("c{i:06}");
+        assert_eq!(cand.len(), KEY_LEN);
+        let (tag, buckets) = cache.hashtable.probe_for_test(cand.as_bytes());
+        if let Some(prev) = seen.get(&(tag, buckets[0])) {
+            return (prev.clone(), cand);
+        }
+        seen.insert((tag, buckets[0]), cand);
+    }
+    panic!("no tag-colliding key pair found");
+}
+
+/// **Regression (#98 adversarial review): an acked delete must not report
+/// NOT_FOUND.**
+///
+/// `delete`'s unpinned-unlink path re-verifies after the unlink — "an acked
+/// delete NEVER leaves the key reachable" — by requiring the key to stop
+/// resolving. Before the pinned verify that re-check had two outcomes, and
+/// `None` meant "confirmed gone". It now has THREE, and `Unknown` means "could
+/// not look", which is *not* confirmation and correctly falls through to the
+/// retry. The bug is what the retry then did: the entry was already unlinked,
+/// so the next iteration found the key genuinely absent and returned `false`
+/// — NOT_FOUND for a key this very call had removed.
+///
+/// Reaching it needs three things at once, all built here rather than raced
+/// for: the victim's segment must refuse a REMOVER pin while still being
+/// READABLE (`Relinking` — a merge copy destination, which is also the one
+/// state that can never wait for a drain), and a tag-colliding foreign entry
+/// must sit in a segment that is NOT readable (`Draining`), so the post-unlink
+/// re-check answers `Unknown` rather than `Absent`.
+///
+/// Red before the fix with:
+/// `acked delete reported NOT_FOUND for a key it had already unlinked`.
+#[test]
+fn acked_delete_is_not_lost_when_the_recheck_cannot_verify() {
+    let cache = Arc::new(small_merge_cache(64));
+    let (victim, sibling) = find_tag_colliding_pair(&cache);
+    let (victim, sibling) = (victim.into_bytes(), sibling.into_bytes());
+
+    // Both keys are seeded BEFORE anything is parked. Order matters only in
+    // that no insert may run after the drain claim below: a set whose old
+    // entry sits in a parked drain rolls its reservation back and restarts,
+    // which burns the (deliberately tiny) heap — see
+    // `same_key_insert_completes_when_parked_drain_progresses`.
+    let (victim_loc, victim_seg) = insert_and_seal(&cache, &victim, b"Vvicti2");
+    let (_sib_loc, sib_seg) = insert_and_seal(&cache, &sibling, b"Vsibli0");
+    assert_ne!(
+        victim_seg, sib_seg,
+        "the two keys must land in different segments"
+    );
+
+    // The victim's segment becomes a copy DESTINATION: readable, so the
+    // lookup resolves it, but refusing remover pins, so `delete` takes the
+    // unpinned-unlink path. (`Relinking` is also the one state that can never
+    // wait for a drain — nothing ever drains a destination.)
+    assert!(cache.segments.header(victim_seg).cas_metadata(
+        State::Sealed,
+        State::Relinking,
+        None,
+        None,
+        crate::sync::Ordering::SeqCst,
+    ));
+
+    // The sibling's segment is parked mid-drain, so it is NOT readable and the
+    // tag-colliding entry in it cannot be verified.
+    assert!(cache.segments_for_test().claim_for_drain_for_test(sib_seg));
+
+    let (tx, rx) = mpsc::channel();
+    let deleter = {
+        let cache = Arc::clone(&cache);
+        let victim = victim.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(cache.delete(&victim));
+        })
+    };
+
+    // Wait until the unlink has actually happened — that is the moment the ack
+    // is owed. Polling the entry by (tag, location) needs no verifier, so it
+    // cannot itself be confused by the parked sibling.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while cache
+        .hashtable
+        .get_item_frequency(&victim, victim_loc)
+        .is_some()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delete never unlinked the victim's entry"
+        );
+        std::thread::yield_now();
+    }
+
+    // Now let the sibling's drain finish, so the retry's lookup can complete.
+    assert!(cache.segments.header(sib_seg).cas_metadata(
+        State::Draining,
+        State::Sealed,
+        None,
+        None,
+        crate::sync::Ordering::SeqCst,
+    ));
+
+    let acked = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("delete wedged after the blocking drain ended");
+    deleter.join().expect("deleter must not panic");
+
+    assert!(
+        acked,
+        "acked delete reported NOT_FOUND for a key it had already unlinked: \
+         the post-unlink re-check answered `Unknown` (a tag-colliding entry in \
+         a draining segment), and the retry then saw the key absent — because \
+         this very call had removed it"
+    );
+    assert!(cache.get(&victim).is_none(), "the victim must stay deleted");
 }

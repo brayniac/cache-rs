@@ -517,11 +517,12 @@ fn numeric_update_preserves_expiry() {
 
     let location_of = |cache: &mut Segcache, key: &[u8]| {
         let verifier = cache.segments.verifier();
-        let (loc, _) = cache
+        cache
             .hashtable
             .lookup_no_freq_update(key, &verifier)
-            .unwrap();
-        loc
+            .found()
+            .unwrap()
+            .location
     };
 
     let before = location_of(&mut cache, b"counter");
@@ -680,10 +681,12 @@ fn try_into_numeric_arms() {
     assert!(cache.insert(b"ascii", b"123", Some(b"opt"), ttl).is_ok());
     let old_bucket_ttl = {
         let verifier = cache.segments.verifier();
-        let (loc, _) = cache
+        let loc = cache
             .hashtable
             .lookup_no_freq_update(b"ascii", &verifier)
-            .unwrap();
+            .found()
+            .unwrap()
+            .location;
         let (seg, _) = unpack_location(loc);
         cache
             .segments
@@ -698,10 +701,12 @@ fn try_into_numeric_arms() {
     drop(item);
     let new_bucket_ttl = {
         let verifier = cache.segments.verifier();
-        let (loc, _) = cache
+        let loc = cache
             .hashtable
             .lookup_no_freq_update(b"ascii", &verifier)
-            .unwrap();
+            .found()
+            .unwrap()
+            .location;
         let (seg, _) = unpack_location(loc);
         cache
             .segments

@@ -2,9 +2,10 @@
 // Licensed under the MIT and Apache-2.0 licenses
 
 //! Deterministic tests for `get_pinned`'s post-pin revalidation retry (#65),
-//! and for the second consumer of the same budget: the bounded
-//! stale-incarnation arm of `relookup_after_pin_failure` (#50), whose own
-//! section is at the bottom of this file.
+//! for the second consumer of the same budget — the bounded stale-incarnation
+//! arm of `triage_unknown_location` (#50) — and for the hot path's own
+//! freshness check, the same-slot location compare (#91/#81). The last two
+//! have their own sections at the bottom of this file.
 //!
 //! The bug: the retry budget was spent re-racing from scratch. On a mismatch
 //! the revalidation lookup has ALREADY returned the key's new location, and
@@ -26,13 +27,27 @@
 //!   (it re-looked-up on every attempt) and fires exactly ONCE against the
 //!   converging loop. That difference is the fix, and
 //!   `get_converges_instead_of_re_racing_the_lookup` is red before it.
-//! - `before_revalidate` fires inside the pin -> revalidate window that the
+//!
+//!   Since #91 it fires from inside `SegmentsVerifier::verify`, just BEFORE
+//!   the reader pin, and only on the verifier `get` uses for its from-scratch
+//!   probe (`Segcache::probe_verifier`). Both halves of that are load-bearing.
+//!   The pin now happens inside the lookup, so a hook that fired after the
+//!   lookup RETURNED would hold a reader pin on the very segment it is trying
+//!   to recycle — `budget_absorbs_recycled_incarnations_without_a_false_absent`
+//!   would get a condemned segment instead of a generation bump and fail its
+//!   own setup assertion. And a hook on the plain verifier would also fire for
+//!   the fallback's revalidation lookups, which are not from-scratch.
+//! - `before_revalidate` fires inside the pin -> re-check window that the
 //!   budget exists to survive, which is the window the fix shrinks but
-//!   deliberately does NOT close. The other two tests pin the budget from both
-//!   sides, including that it is still a BUDGET: unbounded retry was rejected
-//!   (lock-free is not starvation-free, and nothing bounds how long writers
-//!   keep rewriting a hot key), so a build that removed the bound would hang
-//!   `bounded_giveup_when_every_revalidation_loses` rather than pass it.
+//!   deliberately does NOT close: on the hot path, between the pinned verify
+//!   and the same-slot compare; on the fallback, between each pin and its full
+//!   re-probe. Two tests pin the budget from both sides, including that it is
+//!   still a BUDGET: unbounded retry was rejected (lock-free is not
+//!   starvation-free, and nothing bounds how long writers keep rewriting a hot
+//!   key), so a build that removed the bound would hang
+//!   `bounded_giveup_when_every_revalidation_loses` rather than pass it. The
+//!   third, `delete_inside_the_pin_window_is_caught_by_the_same_slot_compare`,
+//!   uses the same hook to drive the window itself rather than the budget.
 
 use crate::segcache::{revalidation_fault, REVALIDATE_RETRIES};
 use crate::*;
@@ -61,7 +76,8 @@ fn location_of(cache: &Segcache, key: &[u8]) -> Option<Location> {
     cache
         .hashtable
         .lookup_no_freq_update(key, &verifier)
-        .map(|(location, _freq)| location)
+        .found()
+        .map(|hit| hit.location)
 }
 
 /// Build the hook body: republish `KEY` (a full `set`, which is what publishes
@@ -224,7 +240,7 @@ fn bounded_giveup_when_every_revalidation_loses() {
 
 // ── The bounded stale-incarnation arm (#50) ───────────────────────────────
 //
-// `relookup_after_pin_failure` has a second arm: when the failed pin's
+// `triage_unknown_location` has a second arm: when the unverifiable
 // location names an incarnation that is GONE (`segments.resolve` says `None`),
 // the retry is charged against `REVALIDATE_RETRIES` and gives up when the
 // budget runs out. The safety argument is that a charge costs a real segment
@@ -416,5 +432,111 @@ fn budget_absorbs_recycled_incarnations_without_a_false_absent() {
         "every recycled incarnation must cost exactly one budget attempt: fewer \
          means the churn stopped invalidating locations, more means some other \
          path is spending the read budget"
+    );
+}
+
+// ── The same-slot freshness compare (#91 / #81 step 2) ────────────────────
+//
+// The pinned verify (#91) settles *which item the bytes at a location are*.
+// It says nothing about whether that entry is still PUBLISHED, and the gap is
+// not theoretical: nothing on the read path consults the tombstone (`verify`
+// discards `allow_deleted`, and `get_pinned` never checks `is_deleted`), so
+// the hashtable unlink is the ONLY thing that makes a delete visible to a
+// reader. A reader that loads the slot word, is descheduled, and resumes after
+// a `delete` has completed will pin a perfectly live segment, match the
+// incarnation tag, compare the key equal — a delete flips one header bit — and
+// hand back a deleted item. Linearizable, but with a staleness window bounded
+// by thread SCHEDULING rather than by protocol.
+//
+// `get_pinned` closes it by re-reading the same slot word and comparing the
+// location field before it builds the `Item`. The test below drives exactly
+// that window with the `before_revalidate` hook, which fires between the pin
+// and the compare.
+
+/// **The same-slot compare, exercised.** A `delete` lands inside the pin
+/// window; the `get` must not hand the item back.
+///
+/// # Proven red by neutering the compare
+///
+/// This is the anti-vacuity note the test needs, because the cold fallback
+/// reaches the same *answer* by a different route whenever it runs at all.
+/// Making `MultiChoiceHashtable::slot_publishes` return `true`
+/// unconditionally fails this test with exactly the property it is about:
+///
+/// ```text
+/// a get whose entry was deleted inside its own pin window must not hand the
+/// item back: the pin proves WHICH item the bytes are, never that the entry
+/// is still published
+///   left: Some("[118, 48]")
+///  right: None
+/// ```
+///
+/// Three of the four tests above go red under that neutering too, and the
+/// breakdown is worth stating exactly, because an earlier version of this
+/// paragraph asserted it from memory and got it wrong:
+///
+/// ```text
+/// budget_absorbs_republication_inside_the_revalidation_window  :170  hook count, 1 vs 15
+/// get_converges_instead_of_re_racing_the_lookup                :142  wrong answer, stale v0
+/// bounded_giveup_when_every_revalidation_loses                 :223  wrong answer, item for a miss
+/// budget_absorbs_recycled_incarnations_without_a_false_absent        still passes
+/// ```
+///
+/// So it is one hook count and two wrong answers, not three hook counts — a
+/// compare that always says "still published" makes the fast path answer every
+/// get, which starves the hook in one test and hands back the pre-republish
+/// item in the other two. The fourth is the #50 stale-incarnation test, which
+/// never depends on the compare at all.
+///
+/// What is distinctive about THIS test is narrower and is the reason it exists:
+/// it is the only one whose wrong answer is a **deleted** item. The others are
+/// stale; a tombstone is the case nothing else on the read path can catch,
+/// because `verify` discards `allow_deleted` and `get_pinned` never checks
+/// `is_deleted`.
+#[test]
+fn delete_inside_the_pin_window_is_caught_by_the_same_slot_compare() {
+    let cache = roomy_cache();
+    cache.insert(KEY, b"v0", None, TTL).expect("seed");
+
+    let fired = Arc::new(AtomicUsize::new(0));
+    let item = {
+        let _hook = revalidation_fault::on_before_revalidate({
+            let cache = Arc::clone(&cache);
+            let fired = Arc::clone(&fired);
+            move || {
+                // Once: the reader must see a DELETED entry, not a churning
+                // one, so the fallback has nothing to converge on.
+                if fired.fetch_add(1, AtomicOrdering::Relaxed) > 0 {
+                    return;
+                }
+                // Re-entered while the reader holds a READER pin. A delete
+                // takes a remover pin, whose counter is independent
+                // (`try_pin_remover` never waits on readers), so this cannot
+                // deadlock against its own caller.
+                assert!(
+                    cache.delete(KEY),
+                    "test setup: the key must still be live when the hook fires"
+                );
+            }
+        });
+        cache.get(KEY)
+    };
+
+    assert_eq!(
+        fired.load(AtomicOrdering::Relaxed),
+        1,
+        "the hook must fire exactly once, in the window between the pin and \
+         the freshness compare"
+    );
+    assert_eq!(
+        item.map(|item| format!("{:?}", item.value())),
+        None,
+        "a get whose entry was deleted inside its own pin window must not hand \
+         the item back: the pin proves WHICH item the bytes are, never that \
+         the entry is still published"
+    );
+    assert!(
+        cache.get(KEY).is_none(),
+        "and the key must stay deleted afterwards"
     );
 }

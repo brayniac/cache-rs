@@ -21,7 +21,10 @@
 //! 2. **The stale-location policy.** A location whose tag no longer matches its
 //!    segment's live generation names an item that no longer exists.
 //!    `Segments::resolve` rejects it, and each consumer answers per the design's
-//!    policy table: a lookup treats it as a miss, `acquire_item_at` refuses the
+//!    policy table: a lookup reports it as UNVERIFIABLE (`Lookup::Unknown` —
+//!    the verifier pins before it compares, so the tag rejects at the pin and
+//!    no comparison happens; `Segcache::get_pinned` is what turns that into a
+//!    miss, under a bounded budget), `acquire_item_at` refuses the
 //!    pin, `remove_at` skips the decrement, and `Segcache::replace_at` refuses
 //!    to address the item at all (rolling its reservation back and reporting
 //!    `Exists`, its ordinary lost-the-race answer). None of them is an error
@@ -78,7 +81,8 @@ fn location_of(cache: &Segcache, key: &[u8]) -> Option<Location> {
     cache
         .hashtable
         .lookup_no_freq_update(key, &verifier)
-        .map(|(location, _freq)| location)
+        .found()
+        .map(|hit| hit.location)
 }
 
 /// The segment a location addresses, ignoring its tag (so a stale location can
@@ -481,16 +485,44 @@ fn stale_location_is_rejected_by_every_consumer() {
         "a stale remove must not decrement the live incarnation's accounting"
     );
 
-    // (4) A lookup that returns a stale location is a MISS. Plant one for a key
-    //     whose bytes really are at that address — so the hashtable's own key
-    //     verification passes and only the tag can reject it — and confirm the
-    //     read reports the key gone rather than serving the current occupant
-    //     through a location that no longer names it.
+    // (4) A lookup that reaches a stale location cannot verify it, and the
+    //     `get` built on that answer is a MISS. Plant one for a key whose bytes
+    //     really ARE at that address, so a key comparison there would pass and
+    //     only the tag can reject it — and note WHERE it rejects: the verifier
+    //     pins before it compares, so `acquire_item_at` fails the tag check and
+    //     the byte comparison never runs at all. The hashtable therefore
+    //     reports `Lookup::Unknown` (asserted below), and the `None` from `get`
+    //     comes one level up, from `get_pinned` charging its bounded
+    //     stale-incarnation budget. Either way the read must not serve the
+    //     current occupant through a location that no longer names it.
     let stale_fresh = pack_location(
         seg,
         cache.segments.generation(seg).wrapping_sub(1),
         unpack_location(fresh).1 as u64,
     );
+
+    // Capture the entry's SLOT while the live location is still published.
+    // Step (5) needs it, and after the plant it can no longer be obtained by
+    // key: the verifier pins before it compares, and a stale location's pin is
+    // refused, so `lookup_slot` reports `Unknown` rather than handing the entry
+    // back. `cas_location` replaces in place, so the plant does not move the
+    // entry — and `cas_location_at` re-validates the slot regardless (see its
+    // "why a stale `SlotRef` can't CAS the wrong entry").
+    let (live_location, planted_slot) = match cache
+        .hashtable
+        .lookup_slot(key_of(fresh_key).as_bytes(), &cache.segments.verifier())
+    {
+        Lookup::Found(found) => found,
+        Lookup::Absent => panic!("the live key must resolve before the plant"),
+        Lookup::Unknown(location) => {
+            panic!("the live key's own location must be verifiable: {location:?}")
+        }
+    };
+    assert_eq!(
+        live_location, fresh,
+        "test setup: the slot captured must be the live entry's"
+    );
+
     assert!(
         cache
             .hashtable
@@ -500,6 +532,21 @@ fn stale_location_is_rejected_by_every_consumer() {
     assert!(
         cache.get(key_of(fresh_key).as_bytes()).is_none(),
         "a lookup resolving to a stale incarnation must report a miss"
+    );
+
+    // ... and the miss is reported as UNKNOWN, not ABSENT. The distinction is
+    // the caller's whole basis for triage: `Segcache::get_pinned` charges the
+    // bounded stale-incarnation arm for exactly this answer, where an `Absent`
+    // would end the get outright.
+    assert!(
+        matches!(
+            cache
+                .hashtable
+                .lookup_slot(key_of(fresh_key).as_bytes(), &cache.segments.verifier()),
+            Lookup::Unknown(location) if location == stale_fresh
+        ),
+        "a stale incarnation must be reported as unverifiable, naming the \
+         location the caller has to triage"
     );
 
     // (5) `replace_at` — the cas / try_into_numeric publish path — refuses to
@@ -522,15 +569,19 @@ fn stale_location_is_rejected_by_every_consumer() {
     //     The token passed in is exactly the one the publish path recomputes
     //     (the stale location plus the segment's CURRENT generation), so the
     //     token compare CANNOT be what rejects this call — only the incarnation
-    //     gate can. The stale entry planted in (4) is still in place, and the
-    //     bytes it addresses really are this key's, so the hashtable's own key
-    //     verification passes too.
-    let planted = cache
-        .hashtable
-        .lookup_slot(key_of(fresh_key).as_bytes(), &cache.segments.verifier())
-        .expect("the planted stale entry is still found by key bytes");
-    assert_eq!(
-        planted.0, stale_fresh,
+    //     gate can. The bytes the stale location addresses really are this
+    //     key's, so a key comparison at that address would pass; what rejects
+    //     it is the tag, and this asserts that `replace_at` consults it under
+    //     its own remover pin rather than relying on the read path's verifier
+    //     having refused first.
+    //     Read the slot by (tag, location) rather than by key: the verifier
+    //     refuses the pin for a stale incarnation, so no key-based lookup can
+    //     observe this entry any more — which is the point of (4).
+    assert!(
+        cache
+            .hashtable
+            .get_item_frequency(key_of(fresh_key).as_bytes(), stale_fresh)
+            .is_some(),
         "the planted stale location is what the publish path would be handed"
     );
     let generation = cache.segments.generation(seg);
@@ -539,7 +590,7 @@ fn stale_location_is_rejected_by_every_consumer() {
         cache.replace_at_for_test(
             key_of(fresh_key).as_bytes(),
             stale_fresh,
-            planted.1,
+            planted_slot,
             val_of(fresh_key).as_bytes(),
             Some(token),
         ),
@@ -552,9 +603,11 @@ fn stale_location_is_rejected_by_every_consumer() {
         "the reservation must not have recycled the segment under the test \
          (otherwise the rejection above proves nothing about the tag)"
     );
-    assert_eq!(
-        location_of(&cache, key_of(fresh_key).as_bytes()),
-        Some(stale_fresh),
+    assert!(
+        cache
+            .hashtable
+            .get_item_frequency(key_of(fresh_key).as_bytes(), stale_fresh)
+            .is_some(),
         "a refused publish must leave the hashtable entry exactly as it found it"
     );
 

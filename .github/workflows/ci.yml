@@ -150,9 +150,11 @@ jobs:
   # protocols — all expressed through atomics) and flags exactly the
   # non-atomic racing accesses; the issue #61 spike found it surfaces in
   # one ordinary 16s run what the stress tests need thousands of runs to
-  # hit once. One suppression is loaded (tsan-suppressions.txt): the
-  # accepted unpinned-verify byte race, tracked for removal in issue #91.
-  # halt_on_error makes any OTHER report fail the job.
+  # hit once. NO suppressions: the engine's last accepted race — the
+  # unpinned verify byte read — was removed in #91 (the verifier now
+  # compares under a reader pin whose incarnation tag it checked), and
+  # tsan-suppressions.txt went with it. halt_on_error makes any report
+  # fail the job.
   #
   # Skips: full_cache_long* are single-threaded throughput soaks with zero
   # concurrency value under a race detector (they dominate the runtime
@@ -183,7 +185,7 @@ jobs:
 
       - name: Test under ThreadSanitizer
         env:
-          TSAN_OPTIONS: "halt_on_error=1 suppressions=${{ github.workspace }}/tsan-suppressions.txt"
+          TSAN_OPTIONS: "halt_on_error=1"
         run: >
           cargo +nightly test -p segcache -Zbuild-std
           --target x86_64-unknown-linux-gnu --features debug --tests --

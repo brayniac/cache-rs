@@ -86,7 +86,8 @@ pub use segments::segment_fault as fault;
 pub(crate) use crate::rand::*;
 pub(crate) use cas::CasToken;
 pub(crate) use hashtable::{
-    pack_location, unpack_location, Hashtable, MultiChoiceHashtable, SegmentsVerifier, SlotRef,
+    pack_location, unpack_location, Hashtable, Hit, Insert, Lookup, MultiChoiceHashtable,
+    SegmentsVerifier, SlotRef,
 };
 pub(crate) use item::*;
 pub(crate) use keyvalue::{RawItem, ITEM_HDR_SIZE};

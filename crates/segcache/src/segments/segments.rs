@@ -239,11 +239,59 @@ impl Segments {
 
     /// Create a `SegmentsVerifier` for key verification in the hashtable.
     pub(crate) fn verifier(&self) -> SegmentsVerifier<'_> {
-        SegmentsVerifier::new(
-            &self.data[..],
-            self.segment_size as usize,
-            self.cap as usize,
-        )
+        SegmentsVerifier::new(self)
+    }
+
+    /// Total number of segments in the heap — the largest issuable segment id.
+    ///
+    /// The verifier range-checks against this before handing a location to
+    /// [`Self::acquire_item_at`], whose `assert!` a ghost location would
+    /// otherwise trip.
+    #[inline]
+    pub(crate) fn num_segments(&self) -> usize {
+        self.cap as usize
+    }
+
+    /// Prefetch the item bytes at `location` into L1.
+    ///
+    /// Deliberately UNPINNED, and that is sound where the verify next to it is
+    /// not: a prefetch of an arbitrary in-range address performs no
+    /// architectural read — it moves a cache line and cannot fault, tear, or
+    /// observe a value. Pinning here would pay a `SeqCst` pair to hide latency
+    /// that the pin itself would then reintroduce.
+    #[inline]
+    pub(crate) fn prefetch_item_at(&self, location: Location) {
+        let (seg_id, offset) = unpack_location(location);
+        if seg_id == 0 || seg_id > self.cap {
+            return;
+        }
+        let byte_offset = self.segment_size as usize * (seg_id as usize - 1) + offset;
+        if byte_offset >= self.data.len() {
+            return;
+        }
+        // SAFETY: the bounds check above keeps the address inside the heap
+        // mapping; a prefetch reads nothing regardless.
+        let ptr = unsafe { self.data.as_ptr().add(byte_offset) as *const i8 };
+
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "sse"),
+            target_arch = "aarch64"
+        )))]
+        let _ = ptr;
     }
 
     /// Returns the number of available segments (free queue + spare
@@ -745,18 +793,34 @@ impl Segments {
 
     // ── Free queue ───────────────────────────────────────────────────
 
-    /// Return a drained segment to the free queue. The segment must be in
-    /// the Draining state with no readers pinning it. The `Draining ->
-    /// Free` transition bumps the generation (a used incarnation is
-    /// ending); the write statistics are reset here and again at reserve
-    /// time.
+    /// Return a drained segment to the free queue. The `Draining -> Free`
+    /// transition bumps the generation (a used incarnation is ending); the
+    /// write statistics are reset here and again at reserve time.
+    ///
+    /// # Precondition, and why it is not asserted here
+    ///
+    /// The caller must hold the `Draining` claim AND have observed
+    /// `ref_count_seqcst() == 0` — that SeqCst load is the reader half of the
+    /// Dekker pair in `SegmentHeader::try_acquire_reader`, and it is the check
+    /// that means anything. Both production callers do exactly that
+    /// immediately before calling (`finalize_drained`, and `TtlBucket`'s
+    /// expiry).
+    ///
+    /// A `debug_assert` re-reading `ref_count` here used to stand in for that
+    /// precondition. It was UNSOUND, and #91 made it reachable often enough to
+    /// flake the suite. `try_acquire_reader` loads the state, THEN increments,
+    /// and only then re-checks — so a reader that started before the drain
+    /// claim can land its increment after the caller's SeqCst load and back
+    /// out a moment later. `ref_count` is legitimately, transiently non-zero
+    /// there, and the reader never obtains a usable guard (its re-check sees
+    /// the non-readable state, and the incarnation tag under the pin catches
+    /// the recycled case regardless). Re-reading a value the protocol allows
+    /// to flicker is not a check; it just panics the drainer and poisons the
+    /// TTL bucket's mutex. #91 turned a rare race into a frequent one by
+    /// taking a pin per tag-matching candidate on every scan rather than only
+    /// at four already-resolved call sites.
     pub(crate) fn recycle(&self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
-        debug_assert_eq!(
-            self.headers[id_idx].ref_count(),
-            0,
-            "freed a segment pinned by readers"
-        );
 
         // Unlink from its chain first: this reads the segment's own
         // prev/next to patch the neighbors, so it must happen before the

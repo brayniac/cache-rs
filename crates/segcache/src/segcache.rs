@@ -1472,8 +1472,14 @@ impl Segcache {
             let (seg_id, offset) = unpack_location(location);
             let Some(seg_id) = NonZeroU32::new(seg_id) else {
                 // Not expected — `lookup_no_freq_update` only returns real
-                // (non-ghost) entries — but stay defensive: nothing to pin.
-                return self.hashtable.remove(key, location);
+                // (non-ghost) entries, and `verify` rejects an out-of-range
+                // location before pinning — but stay defensive: nothing to pin.
+                //
+                // `unlinked ||` so that EVERY exit from this loop honours an
+                // unlink an earlier iteration already performed. That is the
+                // whole content of the lost-ack fix, and an exit that quietly
+                // opts out of it is how the bug comes back.
+                return unlinked || self.hashtable.remove(key, location);
             };
 
             // Capture the segment generation before anything else: the
@@ -1569,6 +1575,14 @@ impl Segcache {
                     // key is gone, because that question has three answers and
                     // only one of them is "yes".
                     unlinked = true;
+                    // Counted PER UNLINK, matching the pinned path below. That
+                    // is a deliberate change: before the lost-ack fix these
+                    // sat behind the whole `&& ...Absent` conjunction, so this
+                    // path under-counted whenever the re-check did not confirm
+                    // — including every case where it was the retry, not this
+                    // iteration, that finished the job. A `delete` that unlinks
+                    // twice (ours, then a racing re-insert's) now counts twice,
+                    // because two entries really were removed.
                     #[cfg(feature = "metrics")]
                     {
                         HASH_REMOVE.increment();

@@ -21,7 +21,10 @@
 //! 2. **The stale-location policy.** A location whose tag no longer matches its
 //!    segment's live generation names an item that no longer exists.
 //!    `Segments::resolve` rejects it, and each consumer answers per the design's
-//!    policy table: a lookup treats it as a miss, `acquire_item_at` refuses the
+//!    policy table: a lookup reports it as UNVERIFIABLE (`Lookup::Unknown` —
+//!    the verifier pins before it compares, so the tag rejects at the pin and
+//!    no comparison happens; `Segcache::get_pinned` is what turns that into a
+//!    miss, under a bounded budget), `acquire_item_at` refuses the
 //!    pin, `remove_at` skips the decrement, and `Segcache::replace_at` refuses
 //!    to address the item at all (rolling its reservation back and reporting
 //!    `Exists`, its ordinary lost-the-race answer). None of them is an error
@@ -482,11 +485,16 @@ fn stale_location_is_rejected_by_every_consumer() {
         "a stale remove must not decrement the live incarnation's accounting"
     );
 
-    // (4) A lookup that returns a stale location is a MISS. Plant one for a key
-    //     whose bytes really are at that address — so the hashtable's own key
-    //     verification passes and only the tag can reject it — and confirm the
-    //     read reports the key gone rather than serving the current occupant
-    //     through a location that no longer names it.
+    // (4) A lookup that reaches a stale location cannot verify it, and the
+    //     `get` built on that answer is a MISS. Plant one for a key whose bytes
+    //     really ARE at that address, so a key comparison there would pass and
+    //     only the tag can reject it — and note WHERE it rejects: the verifier
+    //     pins before it compares, so `acquire_item_at` fails the tag check and
+    //     the byte comparison never runs at all. The hashtable therefore
+    //     reports `Lookup::Unknown` (asserted below), and the `None` from `get`
+    //     comes one level up, from `get_pinned` charging its bounded
+    //     stale-incarnation budget. Either way the read must not serve the
+    //     current occupant through a location that no longer names it.
     let stale_fresh = pack_location(
         seg,
         cache.segments.generation(seg).wrapping_sub(1),

@@ -471,13 +471,28 @@ fn budget_absorbs_recycled_incarnations_without_a_false_absent() {
 ///  right: None
 /// ```
 ///
-/// Three of the four #65 tests above go red under that neutering too, but for
-/// a different reason and it is worth being precise about which is which: a
-/// compare that always says "still published" means the fast path answers
-/// every get, so those three never reach the fallback they are written to
-/// exercise and fail on their hook counts. Only this test fails on a WRONG
-/// ANSWER — a deleted item handed to a caller — which is the failure the
-/// compare exists to prevent.
+/// Three of the four tests above go red under that neutering too, and the
+/// breakdown is worth stating exactly, because an earlier version of this
+/// paragraph asserted it from memory and got it wrong:
+///
+/// ```text
+/// budget_absorbs_republication_inside_the_revalidation_window  :170  hook count, 1 vs 15
+/// get_converges_instead_of_re_racing_the_lookup                :142  wrong answer, stale v0
+/// bounded_giveup_when_every_revalidation_loses                 :223  wrong answer, item for a miss
+/// budget_absorbs_recycled_incarnations_without_a_false_absent        still passes
+/// ```
+///
+/// So it is one hook count and two wrong answers, not three hook counts — a
+/// compare that always says "still published" makes the fast path answer every
+/// get, which starves the hook in one test and hands back the pre-republish
+/// item in the other two. The fourth is the #50 stale-incarnation test, which
+/// never depends on the compare at all.
+///
+/// What is distinctive about THIS test is narrower and is the reason it exists:
+/// it is the only one whose wrong answer is a **deleted** item. The others are
+/// stale; a tombstone is the case nothing else on the read path can catch,
+/// because `verify` discards `allow_deleted` and `get_pinned` never checks
+/// `is_deleted`.
 #[test]
 fn delete_inside_the_pin_window_is_caught_by_the_same_slot_compare() {
     let cache = roomy_cache();

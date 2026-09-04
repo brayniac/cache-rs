@@ -203,8 +203,10 @@ fn numeric_ops_survive_merge_relocation() {
                 match cache
                     .hashtable
                     .lookup_no_freq_update(COUNTER_KEY, &verifier)
+                    .found()
+                    .map(|hit| hit.location)
                 {
-                    Some((loc, _)) => {
+                    Some(loc) => {
                         if let Some(prev) = last {
                             if prev != loc {
                                 moves.fetch_add(1, AtomicOrdering::Relaxed);

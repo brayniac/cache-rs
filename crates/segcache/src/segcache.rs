@@ -104,7 +104,7 @@ pub(crate) mod revalidation_fault {
     }
 }
 
-/// Test-only tally of how often [`Segcache::relookup_after_pin_failure`] has
+/// Test-only tally of how often [`Segcache::triage_unknown_location`] has
 /// taken its **stale-incarnation** arm and charged the revalidation budget.
 ///
 /// The arm's safety argument is that charging costs a real segment *recycle*,
@@ -193,6 +193,26 @@ impl Segcache {
         self.segments.verifier()
     }
 
+    /// The verifier `get` uses for its FROM-SCRATCH probe.
+    ///
+    /// Identical to [`Self::verifier`] except under `fault-injection`, where it
+    /// fires the `after_lookup` hook just before each pin attempt — the window
+    /// a concurrent writer/evictor gets to stale a slot's location. Keeping it
+    /// a separate instance is what preserves the hook's "once per from-scratch
+    /// lookup" meaning: the cold path's revalidation lookups use the plain
+    /// verifier and do not fire it.
+    #[inline]
+    fn probe_verifier(&self) -> SegmentsVerifier<'_> {
+        #[cfg(feature = "fault-injection")]
+        {
+            self.segments.verifier().probing()
+        }
+        #[cfg(not(feature = "fault-injection"))]
+        {
+            self.segments.verifier()
+        }
+    }
+
     /// Clamp a caller-supplied TTL into the coarse-clock seconds range.
     #[inline]
     fn coarse_ttl(ttl: std::time::Duration) -> Duration {
@@ -238,98 +258,146 @@ impl Segcache {
     }
 
     /// Shared lookup for [`Self::get`]/[`Self::get_no_freq_incr`]: resolve
-    /// the key, pin the item's segment, re-validate, and hand out the item.
-    /// `update_freq` selects whether the initial lookup bumps the item's
-    /// frequency counter.
+    /// the key, hand out the pinned item. `update_freq` selects whether the
+    /// lookup bumps the item's frequency counter.
+    ///
+    /// # The shape, and why it is two paths rather than one
+    ///
+    /// The verifier compares key bytes **under a reader pin whose incarnation
+    /// tag it checked** (`SegmentsVerifier`), so a `Lookup::Found` already
+    /// carries the pinned item: there is nothing left to establish about
+    /// *which item these bytes are*. What a pin does NOT establish is whether
+    /// the entry is still **published** — a reader that loaded the slot word,
+    /// was descheduled, and resumed after a `delete` would pin a perfectly
+    /// live segment, match the tag, compare the key equal (a delete flips one
+    /// header bit), and hand back a deleted item. Linearizable, but with a
+    /// staleness window bounded by thread scheduling rather than by protocol.
+    ///
+    /// So freshness is a second, separate question, and it is answered on the
+    /// hot path by **re-reading the same slot word** and comparing the
+    /// location field ([`MultiChoiceHashtable::slot_publishes`]) — one
+    /// `Acquire` load of a line the scan just touched, exact by the
+    /// CAS-in-place argument written out there.
+    ///
+    /// On a mismatch the read falls through to **exactly the pre-#91 code**: a
+    /// full `lookup_no_freq_update` re-probe, `follow_republished`, and
+    /// `REVALIDATE_RETRIES`. That is not conservatism. The full re-probe is
+    /// what `follow_republished`, the `before_revalidate` fault hook,
+    /// `revalidation_tests` and #68's loom lookup bound are about; a design
+    /// that removes the fast path's *need* for them must not remove the path
+    /// they test. What changes is that it stops being the default cost of a
+    /// hit — the second full hashtable probe every hit used to pay — and
+    /// becomes the cold fallback.
     // inline(always) is measured, not cargo-cult (same story as
     // reserve_and_define): the extraction from get() cost ~3ns on the 255b
     // get benchmark until the call boundary was forced away. It also lets
     // the constant `update_freq` fold at each call site.
     #[inline(always)]
     fn get_pinned(&self, key: &[u8], update_freq: bool) -> Option<Item> {
+        let probe = self.probe_verifier();
         let verifier = self.verifier();
         let backoff = Backoff::new();
         let mut attempts = 0;
-        let mut location = self.lookup_location(key, &verifier, update_freq)?;
-        loop {
-            let (seg_id, _offset) = unpack_location(location);
-            let seg_id = NonZeroU32::new(seg_id)?;
-            // The incarnation check lives INSIDE the pin, not in front of it:
-            // `acquire_item_at` takes the whole `Location` and compares its tag
-            // against the segment's generation under the reader guard, which is
-            // what freezes the generation while it is read. A stale incarnation
-            // therefore fails the pin, and the triage of *why* a pin failed is
-            // `relookup_after_pin_failure`'s job — off the hot path, behind a
-            // cold edge, so the fast path pays for exactly one generation load
-            // (the one inside the pin) and no `resolve` of its own.
-            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
-                location = self.relookup_after_pin_failure(
-                    key,
-                    &verifier,
-                    update_freq,
-                    &backoff,
-                    location,
-                    &mut attempts,
-                )?;
-                continue;
+
+        'resolve: loop {
+            let hit = match self.lookup_hit(key, &probe, update_freq) {
+                Lookup::Found(hit) => hit,
+                Lookup::Absent => return None,
+                // A candidate slot could not be pinned. Reporting that as a
+                // miss is the false absent this arm exists to prevent.
+                Lookup::Unknown(location) => {
+                    self.triage_unknown_location(location, &backoff, &mut attempts)?;
+                    continue 'resolve;
+                }
             };
+
             #[cfg(feature = "fault-injection")]
             revalidation_fault::before_revalidate();
-            // Re-validate AFTER pinning (concurrent-write reader safety, item
-            // 7f). Between the lookup and the pin, `location`'s segment can be
-            // drained, recycled, and REUSED (a different item written at this
-            // offset), so `raw` may be an aliased/torn read — the CI-caught bug
-            // this protocol exists to prevent was a reader handing back ANOTHER
-            // KEY'S VALUE, not a miss.
-            //
-            // A fresh hashtable lookup is the soundness argument. It only ever
-            // reads currently-published items — stale entries are removed from
-            // the hashtable BEFORE a segment is recycled — so it is
-            // authoritative in both directions: resolving to this exact
-            // `location` means the (now pinned, hence un-recyclable) segment
-            // genuinely holds the item we want, and resolving ELSEWHERE hands
-            // us a location that is itself currently published. See
-            // `follow_republished` for why following the second is the same
-            // argument rather than a weakening of it.
-            let current = self
-                .hashtable
-                .lookup_no_freq_update(key, &verifier)
-                .map(|(l, _)| l);
-            if current == Some(location) {
-                // Lazy expiry: an item past its segment deadline is treated
-                // as missing, matching memcached, even before the segment is
-                // reclaimed. The segment is pinned here, so its header's
-                // create_at/ttl are authoritative and cannot be recycled
-                // under us.
-                if self.remaining_ttl(seg_id).is_err() {
-                    drop(guard);
-                    return None;
-                }
-                raw.check_magic();
-                let cas = Self::token_for(&raw, location, self.segments.generation(seg_id));
-                return Some(Item::new(raw, cas, guard));
+
+            if self.hashtable.slot_publishes(hit.slot, hit.location) {
+                return self.item_from_pin(hit.location, hit.pin);
             }
-            drop(guard);
-            location = Self::follow_republished(current, &mut attempts)?;
+
+            // ── Cold fallback ────────────────────────────────────────────
+            // Entered holding a pin on `hit.location`, which the same-slot
+            // compare just said is no longer published there.
+            let (mut location, mut pin) = (hit.location, hit.pin);
+            loop {
+                // A fresh hashtable lookup is the soundness argument. It only
+                // ever reads currently-published items — stale entries are
+                // removed from the hashtable BEFORE a segment is recycled — so
+                // it is authoritative in both directions: resolving to this
+                // exact `location` means the (pinned, hence un-recyclable)
+                // segment genuinely holds the item we want, and resolving
+                // ELSEWHERE hands us a location that is itself currently
+                // published. See `follow_republished` for why following the
+                // second is the same argument rather than a weakening of it.
+                let current = match self.hashtable.lookup_no_freq_update(key, &verifier) {
+                    // The revalidation's own pin is dropped with `other`: this
+                    // path is asking WHERE the key is, not for its bytes.
+                    Lookup::Found(other) => Some(other.location),
+                    Lookup::Absent => None,
+                    Lookup::Unknown(unknown) => {
+                        drop(pin);
+                        self.triage_unknown_location(unknown, &backoff, &mut attempts)?;
+                        continue 'resolve;
+                    }
+                };
+
+                if current == Some(location) {
+                    return self.item_from_pin(location, pin);
+                }
+
+                drop(pin);
+                location = Self::follow_republished(current, &mut attempts)?;
+
+                // Pin the location the revalidation just handed back, rather
+                // than looking the key up again — the #65 convergence.
+                let Some(next) = self.segments.acquire_item_at(location) else {
+                    self.triage_unknown_location(location, &backoff, &mut attempts)?;
+                    continue 'resolve;
+                };
+                pin = next;
+
+                #[cfg(feature = "fault-injection")]
+                revalidation_fault::before_revalidate();
+            }
         }
     }
 
-    /// Resolve `key` to a location from scratch, honouring `update_freq`.
+    /// Resolve `key` from scratch, honouring `update_freq`.
     #[inline(always)]
-    fn lookup_location(
+    fn lookup_hit(
         &self,
         key: &[u8],
         verifier: &SegmentsVerifier<'_>,
         update_freq: bool,
-    ) -> Option<Location> {
-        let (location, _freq) = if update_freq {
-            self.hashtable.lookup(key, verifier)?
+    ) -> Lookup<Hit<(RawItem, SegmentGuard)>> {
+        if update_freq {
+            self.hashtable.lookup(key, verifier)
         } else {
-            self.hashtable.lookup_no_freq_update(key, verifier)?
-        };
-        #[cfg(feature = "fault-injection")]
-        revalidation_fault::after_lookup();
-        Some(location)
+            self.hashtable.lookup_no_freq_update(key, verifier)
+        }
+    }
+
+    /// Turn a pinned, verified, still-published entry into an [`Item`].
+    ///
+    /// The segment is pinned here, so its header's `create_at`/`ttl` are
+    /// authoritative and cannot be recycled under us. Lazy expiry: an item past
+    /// its segment deadline is treated as missing, matching memcached, even
+    /// before the segment is reclaimed.
+    #[inline]
+    fn item_from_pin(&self, location: Location, pin: (RawItem, SegmentGuard)) -> Option<Item> {
+        let (raw, guard) = pin;
+        let (seg_id, _offset) = unpack_location(location);
+        let seg_id = NonZeroU32::new(seg_id)?;
+        if self.remaining_ttl(seg_id).is_err() {
+            drop(guard);
+            return None;
+        }
+        raw.check_magic();
+        let cas = Self::token_for(&raw, location, self.segments.generation(seg_id));
+        Some(Item::new(raw, cas, guard))
     }
 
     /// The revalidation lookup disagreed with the pinned location: `current` is
@@ -340,11 +408,6 @@ impl Segcache {
     /// `current` came out of a fresh lookup, so it is currently published — and
     /// it is not the rejected "trust the pinned location" shape: the next thing
     /// that happens to it is another pin AND another full revalidation lookup.
-    ///
-    /// Before this, every attempt re-raced from scratch, and each attempt's
-    /// vulnerable window spanned lookup + pin + lookup; now it spans only
-    /// pin + lookup, and the second lookup per attempt is gone from the `get`
-    /// path entirely (a cost flagged as "optimize later" when 7f landed).
     ///
     /// `None` out means the `get` is over: either the key is genuinely
     /// unpublished, or the budget is spent. Spending it is a false absent —
@@ -362,10 +425,14 @@ impl Segcache {
         current
     }
 
-    /// The reader pin failed. Both answers are a fresh lookup; they differ only
-    /// in whether the retry is bounded, and the incarnation tag is what tells
-    /// them apart. `acquire_item_at` refuses a pin for exactly two reasons, and
-    /// this is the one place that has to distinguish them:
+    /// A candidate location could not be pinned. Decide how long to wait for
+    /// it, and whether the wait is charged against the read budget.
+    ///
+    /// `Some(())` means "wait done, retry the resolve"; `None` means the budget
+    /// is spent and the `get` is over. Nothing is looked up here — the caller's
+    /// loop re-resolves — but the triage is unchanged, because
+    /// `acquire_item_at` still refuses a pin for exactly two reasons and they
+    /// still want different answers:
     ///
     /// **Transient (`resolve` still says `Some`)** — the segment is in a
     /// non-readable state: a drain owns it (Draining) or it is mid linking.
@@ -373,11 +440,11 @@ impl Segcache {
     /// the copy destination and republished), so an unreadable segment does NOT
     /// mean the key is gone: returning `None` here is a false miss — the key
     /// "reappears" once the merge publishes the relocation, breaking
-    /// read-your-writes and the add/replace semantics built on a get. Look the
-    /// key up again instead (the same protocol as `numeric_update`): the owning
-    /// drain is bounded, straight-line work that either republishes the item at
-    /// a new location (the fresh lookup resolves there, in a readable segment)
-    /// or removes the entry (the lookup returns `None` and we exit). This retry
+    /// read-your-writes and the add/replace semantics built on a get. Retry
+    /// instead (the same protocol as `numeric_update`): the owning drain is
+    /// bounded, straight-line work that either republishes the item at a new
+    /// location (the fresh lookup resolves there, in a readable segment) or
+    /// removes the entry (the lookup returns `Absent` and we exit). This retry
     /// is deliberately NOT counted against the revalidation budget: a drain
     /// window is far longer than a few spins, so a bounded retry would still
     /// report false misses. Termination relies on writers/drains never wedging
@@ -392,9 +459,9 @@ impl Segcache {
     /// and fix it. Retrying is still right — the entry is stale by definition,
     /// so either a writer has already published a fresh location or the key is
     /// gone — and it is retried under a BOUND, which is the whole reason the tag
-    /// is consulted here rather than left to the post-pin revalidation (that
-    /// would also reject the location, but only after routing it through the
-    /// unbounded arm above).
+    /// is consulted here rather than left to the revalidation (that would also
+    /// reject the location, but only after routing it through the unbounded arm
+    /// above).
     ///
     /// **What the bound is actually for.** The design justified it as "a stale
     /// tag must be retried under a bound or a permanently stale entry spins that
@@ -422,21 +489,22 @@ impl Segcache {
     /// So at the instant a generation advances, no entry names the outgoing
     /// incarnation, and a fresh lookup can only hand back a location that was
     /// live when it was read. Each firing of this arm is therefore PAID FOR by a
-    /// drain+recycle completing inside one lookup -> pin window — real
-    /// system-wide progress, the same termination argument as the revalidation
-    /// mismatch it shares a budget with. The loop is lock-free and terminates
-    /// without the bound; the bound buys STARVATION-freedom (a `get` costs at
-    /// most `REVALIDATE_RETRIES` pins under any recycle storm), and it is what
-    /// makes a directly PLANTED stale entry terminate — a state reachable only
-    /// from inside the crate, which is how
+    /// drain+recycle completing inside one resolve window — real system-wide
+    /// progress, the same termination argument as the revalidation mismatch it
+    /// shares a budget with. The loop is lock-free and terminates without the
+    /// bound; the bound buys STARVATION-freedom (a `get` costs at most
+    /// `REVALIDATE_RETRIES` pins under any recycle storm), and it is what makes
+    /// a directly PLANTED stale entry terminate — a state reachable only from
+    /// inside the crate, which is how
     /// `incarnation_tests::stale_location_is_rejected_by_every_consumer` gets to
     /// assert this arm's policy at all.
     ///
-    /// The three write-path loops that also retry a refused pin
+    /// The write-path loops that also retry an unpinnable candidate
     /// (`cas`, `numeric_update`, `try_into_numeric`) do NOT share this bound and
     /// do not triage the two failures at all — they retry both unboundedly. That
     /// is sound for the reason above and NOT parity with this function; each says
-    /// so at its own snooze.
+    /// so at its own snooze. `insert` is the exception that cannot wait at all —
+    /// see its `Insert::Unknown` arm.
     ///
     /// It shares `attempts` — and therefore `REVALIDATE_RETRIES` — with
     /// `follow_republished` rather than carrying `RESERVE_RETRIES`. The two
@@ -449,21 +517,18 @@ impl Segcache {
     /// the false miss on the other face of the same window.
     ///
     /// Charging costs a real segment RECYCLE, so exhausting the budget here
-    /// needs ~16 full segment lifecycles inside one lookup -> pin window.
+    /// needs ~16 full segment lifecycles inside one resolve window.
     /// `revalidation_tests::budget_absorbs_recycled_incarnations_without_a_false_absent`
     /// drives 15 of them deterministically and counts the charges, so that
     /// argument is tested rather than merely stated.
     #[cold]
     #[inline(never)]
-    fn relookup_after_pin_failure(
+    fn triage_unknown_location(
         &self,
-        key: &[u8],
-        verifier: &SegmentsVerifier<'_>,
-        update_freq: bool,
-        backoff: &Backoff,
         location: Location,
+        backoff: &Backoff,
         attempts: &mut usize,
-    ) -> Option<Location> {
+    ) -> Option<()> {
         if self.segments.resolve(location).is_none() {
             #[cfg(all(test, not(model_checking)))]
             stale_incarnation_charges::record();
@@ -473,7 +538,7 @@ impl Segcache {
             }
         }
         backoff.snooze();
-        self.lookup_location(key, verifier, update_freq)
+        Some(())
     }
 
     /// Build the CAS token for an item: location + segment generation,
@@ -536,6 +601,16 @@ impl Segcache {
         // The whole reserve→publish operation restarts (fresh reservation)
         // when publishing would deadlock against a drain of the reservation's
         // own segment — see the replace arm's pin-failure handler below.
+        //
+        // Backs off ACROSS restarts, not within one: each restart burns a
+        // fresh reservation, so a tight rollback/restart loop against a drain
+        // that has not moved yet consumes the free pool in milliseconds and
+        // turns a transient drain into `NoFreeSegments`. The per-attempt
+        // `backoff` below cannot serve — it is reset every iteration — and
+        // spinning in place instead of rolling back is precisely the deadlock
+        // this loop exists to avoid (the drain may be waiting on the WriterPin
+        // inside our own reservation).
+        let restart_backoff = Backoff::new();
         'operation: loop {
             // `Value` is a borrowed enum without `Copy`; re-borrow it for this
             // attempt so a restart can consume it again.
@@ -581,7 +656,26 @@ impl Segcache {
             let backoff = Backoff::new();
             loop {
                 match self.hashtable.lookup_slot(key, &verifier) {
-                    Some((old_location, slot)) => {
+                    // A candidate slot could not be verified, so whether this
+                    // key already has an entry is UNKNOWN. Roll back and
+                    // restart — unconditionally, which is the established
+                    // `old_seg_id == new_seg` arm below and the #54 argument
+                    // transfers exactly. `Unknown` means a candidate segment is
+                    // unpinnable, i.e. a drain owns it, and that drain may be
+                    // waiting on `active_writers` — the WriterPin inside our
+                    // own reservation. Spinning in place cannot resolve;
+                    // rolling back drops the pin, unblocks the drain, and the
+                    // retry reserves in a fresh tail.
+                    //
+                    // Treating `Unknown` as absent is the failure to avoid:
+                    // insert would take the fresh-key arm below and publish a
+                    // DUPLICATE entry for a key that already has one (#46).
+                    Lookup::Unknown(_location) => {
+                        self.rollback_reservation(reserved, new_location);
+                        restart_backoff.snooze();
+                        continue 'operation;
+                    }
+                    Lookup::Found((old_location, slot)) => {
                         if old_location == new_location {
                             // Already published (a prior loop iteration's
                             // fresh-key upsert below raced another insert of this
@@ -662,7 +756,7 @@ impl Segcache {
                         // Lost the unlink race — release the pin and retry.
                         drop(pin);
                     }
-                    None => {
+                    Lookup::Absent => {
                         // Fresh key: `hashtable.insert()` is an atomic upsert
                         // whose entry CREATION is serialized per key-hash
                         // stripe (table.rs), so concurrent fresh inserts of
@@ -688,12 +782,21 @@ impl Segcache {
                             .hashtable
                             .insert(reserved.item().key(), new_location, &verifier)
                         {
-                            Ok(None) => {
+                            // Same rollback-restart as the `lookup_slot` arm
+                            // above, for the same reason: the upsert could not
+                            // establish whether the key already has an entry,
+                            // and publishing on a guess duplicates it.
+                            Ok(Insert::Unknown(_location)) => {
+                                self.rollback_reservation(reserved, new_location);
+                                restart_backoff.snooze();
+                                continue 'operation;
+                            }
+                            Ok(Insert::Created) => {
                                 #[cfg(feature = "metrics")]
                                 HASH_INSERT.increment();
                                 return Ok(());
                             }
-                            Ok(Some(raced_old)) => {
+                            Ok(Insert::Replaced(raced_old)) => {
                                 #[cfg(feature = "metrics")]
                                 HASH_INSERT.increment();
                                 drop(reserved);
@@ -1215,58 +1318,61 @@ impl Segcache {
         let backoff = Backoff::new();
         let mut attempts = 0;
         let (location, slot, current_cas) = loop {
-            let (location, slot) = self
-                .hashtable
-                .lookup_slot(key, &verifier)
-                .ok_or(SegcacheError::NotFound)?;
-
-            let (seg_id, _offset) = unpack_location(location);
+            // ONE probe. Before #91 this was three: `lookup_slot` (unpinned),
+            // then `acquire_item_at` to pin the location it returned, then a
+            // full `lookup_no_freq_update` to prove the pinned bytes were
+            // still this key's. The verifier pins in order to compare, so the
+            // first two collapse into one another, and the third is answered
+            // by re-reading the slot the lookup already found.
+            let hit = match self.hashtable.lookup_no_freq_update(key, &verifier) {
+                Lookup::Found(hit) => hit,
+                Lookup::Absent => return Err(SegcacheError::NotFound),
+                // Transient drain window, or a location whose incarnation is
+                // gone; either way the fresh lookup on retry resolves the live
+                // location or reports the key gone.
+                //
+                // NOT counted against `attempts`, and — unlike `get_pinned` —
+                // not counted against anything else either: this loop does not
+                // triage the two failures, so it has no bounded arm to charge.
+                // Sound because neither can spin. A drain is bounded,
+                // straight-line work; and a fresh lookup cannot keep handing
+                // back a dead incarnation, because no hashtable entry survives
+                // its segment's generation bump (the reachability argument is
+                // written out on `triage_unknown_location`), so every stale pin
+                // failure is paid for by a real recycle. `attempts` /
+                // `RESERVE_RETRIES` below bounds the OTHER face of this window
+                // — a key being republished under us.
+                Lookup::Unknown(_location) => {
+                    backoff.snooze();
+                    continue;
+                }
+            };
+            let (raw, guard) = hit.pin;
+            let (seg_id, _offset) = unpack_location(hit.location);
             let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
             // Lazy expiry: memcached returns NOT_FOUND for a cas on an expired
-            // key, even before the segment is reclaimed. The header is read
-            // unpinned here, so this is a semantic filter, not a safety
-            // mechanism — if the segment races a recycle, the token/generation
-            // check below still protects correctness.
-            self.remaining_ttl(seg_id)?;
+            // key, even before the segment is reclaimed. Read under the pin, so
+            // unlike the pre-#91 form it is not merely a semantic filter racing
+            // a recycle — the header cannot be recycled while the guard is
+            // held.
+            if let Err(error) = self.remaining_ttl(seg_id) {
+                drop(guard);
+                return Err(error);
+            }
 
-            // Pin briefly to read the item's seqlock version (numeric
-            // items fold it into the token); the pin drops before the
-            // reservation below — pinned segments are unevictable.
-            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
-                // Transient drain window, or a location whose incarnation is
-                // gone (`acquire_item_at` refuses the pin — see
-                // `Segments::resolve`); either way the fresh lookup on retry
-                // resolves the live location or reports the key gone.
-                //
-                // NOT counted against `attempts`, and — unlike `get_pinned`
-                // — not counted against anything else either: this loop does
-                // not triage the two failures, so it has no bounded arm to
-                // charge. Sound because neither can spin. A drain is bounded,
-                // straight-line work; and a fresh lookup cannot keep handing
-                // back a dead incarnation, because no hashtable entry
-                // survives its segment's generation bump (the reachability
-                // argument is written out on `relookup_after_pin_failure`),
-                // so every stale pin failure is paid for by a real recycle.
-                // `attempts`/`RESERVE_RETRIES` below bounds the OTHER face of
-                // this window — a key being republished under us.
-                backoff.snooze();
-                continue;
-            };
-            // Re-validate after pinning (see `get_pinned`): if the key no
-            // longer resolves to this exact location, the entry moved (or
-            // the segment recycled) between lookup and pin — the token we
-            // would mint from `raw` could be an aliased read. A bounded
-            // number of mismatches means the key is churning under us, and
-            // any relocation/replacement has already staled the caller's
-            // location-bearing token: fail `Exists` (never a false
+            // Freshness: is the entry we pinned still the PUBLISHED one? The
+            // pin settles which item these bytes are; it says nothing about
+            // whether a racing writer has since superseded them, and a token
+            // minted from a superseded item is a bad CAS token — a correctness
+            // question here, not merely a staleness one. Exact by the
+            // CAS-in-place argument (`MultiChoiceHashtable::slot_publishes`).
+            //
+            // A bounded number of mismatches means the key is churning under
+            // us, and any relocation/replacement has already staled the
+            // caller's location-bearing token: fail `Exists` (never a false
             // `NotFound` for a live key).
-            if self
-                .hashtable
-                .lookup_no_freq_update(key, &verifier)
-                .map(|(l, _)| l)
-                != Some(location)
-            {
+            if !self.hashtable.slot_publishes(hit.slot, hit.location) {
                 drop(guard);
                 attempts += 1;
                 if attempts >= RESERVE_RETRIES {
@@ -1274,8 +1380,12 @@ impl Segcache {
                 }
                 continue;
             }
-            let token = Self::token_for(&raw, location, self.segments.generation(seg_id));
-            break (location, slot, token);
+            let token = Self::token_for(&raw, hit.location, self.segments.generation(seg_id));
+            // The pin is released HERE, before the reservation below: a verify
+            // pin is never held across a wait, and `reserve_and_define` can
+            // drive an eviction.
+            drop(guard);
+            break (hit.location, hit.slot, token);
         };
         if current_cas != cas {
             return Err(SegcacheError::Exists);
@@ -1336,9 +1446,19 @@ impl Segcache {
         let backoff = Backoff::new();
         loop {
             // Look up the item to get its location
-            let (location, _freq) = match self.hashtable.lookup_no_freq_update(key, &verifier) {
-                Some(result) => result,
-                None => return false,
+            // The verify pin the lookup took is dropped with `hit`, before the
+            // remover pin below: a verify pin is never held across a lock
+            // acquisition, and `remove_at` can take a bucket `chain_lock`.
+            let location = match self.hashtable.lookup_no_freq_update(key, &verifier) {
+                Lookup::Found(hit) => hit.location,
+                Lookup::Absent => return false,
+                // Unbounded retry, as at the refused remover pin below: a
+                // draining segment does not mean the key is gone, and an acked
+                // `false` for a live key is a lost delete.
+                Lookup::Unknown(_location) => {
+                    backoff.snooze();
+                    continue;
+                }
             };
 
             let (seg_id, offset) = unpack_location(location);
@@ -1367,13 +1487,23 @@ impl Segcache {
             // decrement, so a concurrent drain of this segment cannot
             // interleave with the decrement.
             //
-            // If the pin FAILS, the segment is Draining (a drain owns it) or
-            // Relinking (a merge/promotion copy destination mid-fill). The
-            // delete must still unlink the hashtable entry itself: a merge
-            // drain RETAINS live items — `copy_into` relocates every item
-            // still present in the hashtable — and a Relinking destination is
-            // never swept at all, so "the drain will remove it" does NOT
-            // hold; an acked delete that leaves the entry behind resurrects.
+            // If the pin FAILS, the segment is Relinking — a merge/promotion
+            // copy destination mid-fill — or it was claimed for drain in the
+            // instant since the lookup. The `Relinking` case is why the unlink
+            // below happens WITHOUT a pin rather than waiting: a copy
+            // destination is never swept by anyone, so "the drain will remove
+            // it" does not hold there and an acked delete that left the entry
+            // behind would resurrect.
+            //
+            // A segment already `Draining` when the lookup ran never reaches
+            // here: `Draining` is not readable, so the pinned verify (#91)
+            // answers `Unknown` and the loop above waits it out instead. That
+            // is the right answer for a drain — a merge drain RETAINS live
+            // items and republishes them, so the retry unlinks the entry at
+            // its new location, and a clear/expire drain sweeps it, so the
+            // retry reports the key gone. Neither can resurrect, and the wait
+            // cannot wedge: `delete` holds no pin while it waits, so it can
+            // never be what a drain is waiting on.
             //
             // Doing the unlink WITHOUT the pin is safe: `hashtable.remove`
             // only CASes the hashtable slot — it touches neither segment
@@ -1426,10 +1556,10 @@ impl Segcache {
             let Some(pin) = self.segments.try_pin_remover(seg_id) else {
                 if self.segments.generation(seg_id) == observed_gen
                     && self.hashtable.remove(key, location)
-                    && self
-                        .hashtable
-                        .lookup_no_freq_update(key, &verifier)
-                        .is_none()
+                    && matches!(
+                        self.hashtable.lookup_no_freq_update(key, &verifier),
+                        Lookup::Absent
+                    )
                 {
                     #[cfg(feature = "metrics")]
                     {
@@ -1578,14 +1708,37 @@ impl Segcache {
     ///
     /// Returns the value this call published.
     fn numeric_update(&self, key: &[u8], op: impl Fn(u64) -> u64) -> Result<u64, SegcacheError> {
+        let verifier = self.verifier();
         let backoff = Backoff::new();
         loop {
-            let verifier = self.verifier();
-            let (location, _freq) = self
-                .hashtable
-                .lookup(key, &verifier)
-                .ok_or(SegcacheError::NotFound)?;
-            let (seg_id, _offset) = unpack_location(location);
+            let hit = match self.hashtable.lookup(key, &verifier) {
+                Lookup::Found(hit) => hit,
+                Lookup::Absent => return Err(SegcacheError::NotFound),
+                // Segment not readable (draining; a relocation is in flight),
+                // or the location's incarnation is gone — back off and retry
+                // from the lookup, giving the drain a chance to finish instead
+                // of busy-waiting through its whole window.
+                //
+                // Unbounded, and NOT the bounded arm `get_pinned` gives a
+                // stale incarnation: this loop does not triage the two. Safe
+                // for both — a drain is bounded work, and a fresh lookup
+                // cannot keep resolving to a dead incarnation, because no
+                // hashtable entry survives its segment's generation bump (see
+                // `triage_unknown_location` for the invariants).
+                Lookup::Unknown(_location) => {
+                    backoff.snooze();
+                    continue;
+                }
+            };
+            // The lookup's OWN pin. Before #91 this path looked the key up
+            // unpinned and then pinned the location it got back; the verifier
+            // now pins in order to compare at all, so re-pinning here would be
+            // a second `SeqCst` pair for a guarantee already in hand. The pin
+            // is also what establishes `raw` as a REAL item of this
+            // incarnation, which is what makes the version-word access below
+            // sound.
+            let (raw, _guard) = hit.pin;
+            let (seg_id, _offset) = unpack_location(hit.location);
             let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
             // Lazy expiry: a counter past its segment deadline is
@@ -1593,82 +1746,59 @@ impl Segcache {
             // expire() reclaims the segment.
             self.remaining_ttl(seg_id)?;
 
-            match self.segments.acquire_item_at(location) {
-                // Segment not readable (draining; a relocation is in
-                // flight), or the location's incarnation is gone (the pin
-                // is refused — see `Segments::resolve`) — back off and retry
-                // from the lookup, giving the drain a chance to finish
-                // instead of busy-waiting through its whole window.
-                //
-                // Unbounded, and NOT the bounded arm `get_pinned` gives a
-                // stale incarnation: this loop does not triage the two. Safe
-                // for both — a drain is bounded work, and a fresh lookup
-                // cannot keep resolving to a dead incarnation, because no
-                // hashtable entry survives its segment's generation bump (see
-                // `relookup_after_pin_failure` for the invariants).
-                None => {
-                    backoff.snooze();
-                    continue;
-                }
-                Some((raw, _guard)) => {
-                    // Re-validate after pinning (see `get`): if the key no longer
-                    // resolves to this exact location, the segment was
-                    // recycled+reused between lookup and pin and `raw` is a
-                    // stale/aliased item — retry rather than update the WRONG
-                    // item in place (item 7f). The fresh lookup only reads
-                    // currently-published items, so it is safe and authoritative.
-                    // It also establishes `raw` as a REAL item, making the
-                    // version-word access below sound.
-                    if self.hashtable.lookup(key, &verifier).map(|(l, _)| l) != Some(location) {
-                        continue;
-                    }
-
-                    // Take the item's seqlock writer lock, then re-validate
-                    // linkage INSIDE it, so the "still the published item"
-                    // check and the value write are one atomic step with
-                    // respect to every party that serializes on this lock —
-                    // a cas publish, which re-verifies its token and swaps
-                    // the hashtable slot while holding it (`replace_at`),
-                    // and a merge/s3fifo relocation, which byte-copies the
-                    // item and relinks its location while holding it
-                    // (`copy_into`, `s3fifo_promote_from`; a relocation
-                    // that completed first is seen by the re-check below as
-                    // a new location, and we retry against the
-                    // destination). Interleavings:
-                    //
-                    //   - cas critical section completed first and
-                    //     PUBLISHED: the re-check below sees the new
-                    //     location, we drop the lock unchanged and retry —
-                    //     the increment applies (once) to the NEW item.
-                    //     Acked only after it is visible.
-                    //   - cas critical section completed first but FAILED
-                    //     (token stale): slot unchanged, we update in
-                    //     place. Correct.
-                    //   - our update completes first: the cas's in-lock
-                    //     token re-verify sees our bumped version and
-                    //     fails `Exists` — our acked increment survives on
-                    //     the still-linked item. A cas whose token was
-                    //     read AFTER our update legitimately carries our
-                    //     increment forward in the value it publishes.
-                    //
-                    // A checked-then-written window simply cannot contain
-                    // a token-gated publish, and non-token-gated writes
-                    // (set/delete/convert) owe no preservation to a
-                    // concurrent increment — losing to them is a legal
-                    // linearization. This is why the validation must sit
-                    // inside the lock: a post-write re-check variant
-                    // double-applies when a fresh-token cas lands between
-                    // the write and the re-check.
-                    let vguard = raw
-                        .lock_numeric_version()
-                        .map_err(|_| SegcacheError::NotNumeric)?;
-                    if self.hashtable.lookup(key, &verifier).map(|(l, _)| l) != Some(location) {
-                        drop(vguard);
-                        continue;
-                    }
-                    return Ok(vguard.update(&op));
-                }
+            // Take the item's seqlock writer lock, then re-validate
+            // linkage INSIDE it, so the "still the published item"
+            // check and the value write are one atomic step with
+            // respect to every party that serializes on this lock —
+            // a cas publish, which re-verifies its token and swaps
+            // the hashtable slot while holding it (`replace_at`),
+            // and a merge/s3fifo relocation, which byte-copies the
+            // item and relinks its location while holding it
+            // (`copy_into`, `s3fifo_promote_from`; a relocation
+            // that completed first is seen by the re-check below as
+            // a new location, and we retry against the
+            // destination). Interleavings:
+            //
+            //   - cas critical section completed first and
+            //     PUBLISHED: the re-check below sees the slot moved,
+            //     we drop the lock unchanged and retry — the
+            //     increment applies (once) to the NEW item. Acked
+            //     only after it is visible.
+            //   - cas critical section completed first but FAILED
+            //     (token stale): slot unchanged, we update in
+            //     place. Correct.
+            //   - our update completes first: the cas's in-lock
+            //     token re-verify sees our bumped version and
+            //     fails `Exists` — our acked increment survives on
+            //     the still-linked item. A cas whose token was
+            //     read AFTER our update legitimately carries our
+            //     increment forward in the value it publishes.
+            //
+            // A checked-then-written window simply cannot contain
+            // a token-gated publish, and non-token-gated writes
+            // (set/delete/convert) owe no preservation to a
+            // concurrent increment — losing to them is a legal
+            // linearization. This is why the validation must sit
+            // inside the lock: a post-write re-check variant
+            // double-applies when a fresh-token cas lands between
+            // the write and the re-check.
+            //
+            // The check itself is the SAME-SLOT compare, not a fresh probe.
+            // It is exact for "still published" by the CAS-in-place argument
+            // (`MultiChoiceHashtable::slot_publishes`): every party that could
+            // supersede or move this item — a cas publish, a relocation, an
+            // unlink — CASes the slot the entry occupies, which is the slot
+            // the lookup above found it in. A full re-probe would answer the
+            // same question by re-hashing the key and rescanning its buckets,
+            // and would take a pin of its own to do it.
+            let vguard = raw
+                .lock_numeric_version()
+                .map_err(|_| SegcacheError::NotNumeric)?;
+            if !self.hashtable.slot_publishes(hit.slot, hit.location) {
+                drop(vguard);
+                continue;
             }
+            return Ok(vguard.update(&op));
         }
     }
 
@@ -1703,42 +1833,44 @@ impl Segcache {
         let backoff = Backoff::new();
         let mut attempts = 0;
         let (location, slot, parsed, opt_buf, olen, seg_ttl) = loop {
-            let Some((location, slot)) = self.hashtable.lookup_slot(key, &verifier) else {
-                // Missing: create with the caller's ttl. NOTE for the
-                // concurrent future: this publishes via plain insert, which
-                // would overwrite a concurrently created value; revisit with
-                // insert-if-absent when the API goes concurrent.
-                return self.insert(key, initial, None, ttl);
+            // ONE probe, same collapse as `cas` above: the verifier pins in
+            // order to compare, so the lookup already hands back the pinned
+            // item, and freshness is the same-slot re-read rather than a
+            // second full probe.
+            let hit = match self.hashtable.lookup_no_freq_update(key, &verifier) {
+                Lookup::Found(hit) => hit,
+                // Transient drain window, or a stale incarnation whose pin is
+                // refused — retry from the lookup.
+                //
+                // Unbounded, for both, and NOT parity with `get_pinned` (which
+                // bounds its stale arm): this loop does not triage the two
+                // failures. Neither can spin — a drain is bounded work, and no
+                // hashtable entry survives its segment's generation bump, so a
+                // fresh lookup cannot keep returning a dead incarnation (see
+                // `triage_unknown_location`). `attempts` below bounds the
+                // separate churn face of this window.
+                Lookup::Unknown(_location) => {
+                    backoff.snooze();
+                    continue;
+                }
+                Lookup::Absent => {
+                    // Missing: create with the caller's ttl. NOTE for the
+                    // concurrent future: this publishes via plain insert, which
+                    // would overwrite a concurrently created value; revisit with
+                    // insert-if-absent when the API goes concurrent.
+                    return self.insert(key, initial, None, ttl);
+                }
             };
-
-            let (seg_id, _offset) = unpack_location(location);
+            let (raw, guard) = hit.pin;
+            let (seg_id, _offset) = unpack_location(hit.location);
             let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
-            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
-                // Transient drain window, or a stale incarnation whose pin is
-                // refused (`Segments::resolve`) — retry from the lookup.
-                //
-                // Unbounded, for both, and NOT parity with `get_pinned`
-                // (which bounds its stale arm): this loop does not triage the
-                // two failures. Neither can spin — a drain is bounded work,
-                // and no hashtable entry survives its segment's generation
-                // bump, so a fresh lookup cannot keep returning a dead
-                // incarnation (see `relookup_after_pin_failure`). `attempts`
-                // below bounds the separate churn face of this window.
-                backoff.snooze();
-                continue;
-            };
-            // Re-validate after pinning (see `get_pinned`): a moved entry
-            // means `raw` may be an aliased read; retry, and after a
-            // bounded number of mismatches report the churn as `Exists`
-            // (the same outcome `replace_at` gives a concurrent
-            // replacement), never a false `NotFound`.
-            if self
-                .hashtable
-                .lookup_no_freq_update(key, &verifier)
-                .map(|(l, _)| l)
-                != Some(location)
-            {
+            // Freshness (see `cas`): a superseded entry means the bytes below
+            // are no longer the published value. Retry, and after a bounded
+            // number of mismatches report the churn as `Exists` (the same
+            // outcome `replace_at` gives a concurrent replacement), never a
+            // false `NotFound`.
+            if !self.hashtable.slot_publishes(hit.slot, hit.location) {
                 drop(guard);
                 attempts += 1;
                 if attempts >= RESERVE_RETRIES {
@@ -1758,7 +1890,8 @@ impl Segcache {
                 o.len()
             });
             let seg_ttl = self.remaining_ttl(seg_id)?;
-            break (location, slot, parsed, opt_buf, olen, seg_ttl);
+            // `guard` is released at the break, before the reservation below.
+            break (hit.location, hit.slot, parsed, opt_buf, olen, seg_ttl);
         };
 
         let reserved =

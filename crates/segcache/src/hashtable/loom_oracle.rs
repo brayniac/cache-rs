@@ -20,8 +20,8 @@
 //! using it structurally blind to key identity: a location can be relocated,
 //! recycled, refilled with somebody else's key, or freed outright and the
 //! stub keeps saying "yes, your key is there". Every read path's
-//! `verify`-failure branch — the entire STALE-LOCATION guard in
-//! `MultiChoiceHashtable::verify_slot` — is dead code under `AlwaysVerifier`.
+//! `verify`-failure branch — every `DifferentKey` and `Unknown` arm the
+//! caller's retry policy rests on — is dead code under `AlwaysVerifier`.
 //!
 //! [`KeyOracle`] replaces that stub with model atomics representing
 //! "which key currently lives at this location". Raw mmap'd bytes stay
@@ -64,7 +64,7 @@
 use crate::hashtable::location::Location;
 use crate::hashtable::pack_location;
 use crate::hashtable::table::MultiChoiceHashtable;
-use crate::hashtable::traits::{Hashtable, KeyVerifier};
+use crate::hashtable::traits::{Hashtable, KeyVerifier, Verified};
 use crate::sync::{AtomicU64, Ordering};
 use core::num::NonZeroU32;
 
@@ -117,19 +117,48 @@ fn key_id(key: &[u8]) -> u64 {
 
 /// A location -> key map backed by loom-tracked atomics.
 ///
-/// One cell per modeled storage location. `0` means the location holds
-/// nothing this model knows about (freed, or recycled and not yet rewritten);
-/// otherwise the cell holds the id of the key whose bytes currently live
-/// there.
+/// One cell per modeled storage location — a cell IS a segment. Each cell
+/// holds two things, in ONE atomic word:
+///
+/// - the **occupant**: the id of the key whose bytes currently live there, or
+///   `0` for "nothing this model knows about" (freed, or recycled and not yet
+///   rewritten);
+/// - the **generation**: which incarnation of the cell those bytes belong to.
+///
+/// They share a word because production reads them together *under the reader
+/// pin*: `Segments::acquire_item_at` takes the guard, then compares the
+/// location's tag against the header's generation, so the generation cannot
+/// move while it is read. A model that let a scan observe the occupant of one
+/// incarnation and the generation of another would manufacture states the real
+/// primitive cannot produce, and any "bug" it found would be a fiction.
 pub(crate) struct KeyOracle {
     cells: [AtomicU64; NUM_CELLS],
 }
 
+/// Pack an occupant id and a generation into one cell word.
+#[inline]
+fn cell_word(occupant: u64, generation: u16) -> u64 {
+    ((generation as u64) << 32) | occupant
+}
+
+/// The occupant half of a cell word.
+#[inline]
+fn cell_occupant(word: u64) -> u64 {
+    word & 0xFFFF_FFFF
+}
+
+/// The generation half of a cell word.
+#[inline]
+fn cell_generation(word: u64) -> u16 {
+    (word >> 32) as u16
+}
+
 impl KeyOracle {
-    /// All locations start vacant. Seed with [`KeyOracle::place`].
+    /// All locations start vacant, in their FIRST incarnation. Seed with
+    /// [`KeyOracle::place`].
     pub(crate) fn new() -> Self {
         Self {
-            cells: std::array::from_fn(|_| AtomicU64::new(0)),
+            cells: std::array::from_fn(|_| AtomicU64::new(cell_word(0, 0))),
         }
     }
 
@@ -162,14 +191,37 @@ impl KeyOracle {
     pub(crate) fn place(&self, cell: usize, key: &[u8]) {
         let id = key_id(key);
         debug_assert!(id != 0, "place() called with a key the oracle cannot name");
-        self.cells[cell].store(id, Ordering::Release);
+        let generation = cell_generation(self.cells[cell].load(Ordering::Acquire));
+        self.cells[cell].store(cell_word(id, generation), Ordering::Release);
+    }
+
+    /// The cell's current incarnation.
+    #[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
+    pub(crate) fn generation(&self, cell: usize) -> u16 {
+        cell_generation(self.cells[cell].load(Ordering::Acquire))
+    }
+
+    /// The segment was drained and RECYCLED: its bytes stop being anybody's
+    /// item and its generation advances (`Segments::recycle`, the
+    /// `Draining -> Free` bump).
+    ///
+    /// This is what makes every location published by the outgoing incarnation
+    /// unpinnable — the tag check in `acquire_item_at` fails — and it is the
+    /// difference between the two answers a verifier can give for a location it
+    /// cannot match: `Unknown` (the incarnation is gone) rather than
+    /// `DifferentKey` (this really is another key's item).
+    #[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
+    pub(crate) fn recycle(&self, cell: usize) {
+        let generation = cell_generation(self.cells[cell].load(Ordering::Acquire));
+        self.cells[cell].store(cell_word(0, generation.wrapping_add(1)), Ordering::Release);
     }
 
     /// The item at `cell` was freed and the space released: the location now
     /// holds nothing. Models removal (`remove` + segment decrement).
     #[cfg_attr(not(feature = "loom"), allow(dead_code))] // loom-model-only helper
     pub(crate) fn vacate(&self, cell: usize) {
-        self.cells[cell].store(0, Ordering::Release);
+        let generation = cell_generation(self.cells[cell].load(Ordering::Acquire));
+        self.cells[cell].store(cell_word(0, generation), Ordering::Release);
     }
 
     /// One merge-drain relocation of [`KEY`], in the order production
@@ -178,12 +230,20 @@ impl KeyOracle {
     /// 1. copy the item into `dst` — its bytes are valid there BEFORE
     ///    anything points at them;
     /// 2. relink the slot with the `Release` CAS, publishing `dst`;
-    /// 3. the source segment is finalized, recycled, and rewritten by
-    ///    another writer, so `src` now holds an unrelated key.
+    /// 3. the source segment is finalized and RECYCLED — its generation
+    ///    advances, so every location the outgoing incarnation published stops
+    ///    being pinnable — and is then rewritten by another writer, so `src`
+    ///    now holds an unrelated key.
     ///
     /// Step 3 runs whether or not the relink landed: a lost relink means the
     /// item at `src` was superseded by a racing writer, and the source
     /// segment is recycled all the same.
+    ///
+    /// The recycle is what makes the model faithful to the pinned verify. A
+    /// reader still holding `location(src)` (the FIRST incarnation) gets
+    /// `Verified::Unknown` from the tag check, not a byte comparison against
+    /// somebody else's key — the compare never happens, which is the whole
+    /// point of #91.
     ///
     /// Returns whether the relink CAS landed. Models that race the drain
     /// against a mutator must tolerate `false`; models where nothing else
@@ -191,6 +251,7 @@ impl KeyOracle {
     pub(crate) fn drain_relocate(&self, ht: &MultiChoiceHashtable, src: usize, dst: usize) -> bool {
         self.place(dst, KEY);
         let relinked = ht.cas_location(KEY, Self::location(src), Self::location(dst), true);
+        self.recycle(src);
         self.place(src, OTHER);
         relinked
     }
@@ -225,8 +286,13 @@ impl KeyOracle {
         cell: usize,
         generation: u16,
     ) -> bool {
+        debug_assert_eq!(
+            self.generation(cell),
+            generation,
+            "recycle_and_refill must name the incarnation the cell is actually in"
+        );
         let swept = ht.remove(KEY, Self::location_in(cell, generation));
-        self.vacate(cell);
+        self.recycle(cell);
         self.place(cell, KEY);
         ht.insert(KEY, Self::location_in(cell, generation + 1), self)
             .expect("the republish must find a slot");
@@ -265,28 +331,66 @@ impl KeyOracle {
 }
 
 impl KeyVerifier for KeyOracle {
+    /// The cells are the storage and they outlive every model, so there is
+    /// nothing for a pin to hold.
+    type Pin = ();
+
     /// Answer from the CURRENT occupant of `location`, exactly as
     /// `SegmentsVerifier` answers from the bytes currently at that offset.
     ///
     /// A `false` here therefore carries the same ambiguity as production's:
     /// it may mean "different key", or it may mean "this location stopped
     /// being your entry's while you were asking". Resolving that ambiguity
-    /// is what the slot protocol's STALE-LOCATION guard is for, and what
-    /// these models exercise.
+    /// is what the three-way [`Verified`] answer is for, and what these
+    /// models exercise.
     ///
-    /// TAG-BLIND, exactly like `SegmentsVerifier`: it addresses with
-    /// `unpack_location`, which deliberately drops the incarnation tag
-    /// because the tag is not part of the address. A location from a dead
-    /// incarnation therefore verifies `true` whenever the current occupant
-    /// happens to be the same key — which is the whole reason the tag has to
-    /// be checked by somebody else.
-    fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
+    /// Structured exactly like `SegmentsVerifier`: **check the incarnation
+    /// first, compare bytes only under it.** One atomic load stands in for
+    /// `acquire_item_at`'s "take the guard, then read the generation", so the
+    /// two halves of the cell are observed as one value and the model cannot
+    /// see a torn incarnation the real primitive would have frozen.
+    ///
+    /// Three answers, and which one comes back is the whole contract:
+    ///
+    /// - the location's tag does not match the cell's current generation, or
+    ///   the cell is vacant: the pin is refused, nothing is compared, and the
+    ///   answer is [`Verified::Unknown`]. This is the state
+    ///   [`KeyOracle::drain_relocate`] and [`KeyOracle::recycle_and_refill`]
+    ///   build, and it is what sends a caller off to triage-and-retry instead
+    ///   of concluding the key is gone.
+    /// - the incarnation matches and the occupant is somebody else's key:
+    ///   [`Verified::DifferentKey`], which is now AUTHORITATIVE — nothing was
+    ///   mutating those bytes while they were compared.
+    /// - the incarnation matches and the occupant is this key:
+    ///   [`Verified::Match`].
+    ///
+    /// The tag is only 6 bits wide, so a cell refilled exactly
+    /// `2^6` incarnations later aliases the outgoing one and answers `Match`
+    /// for a dead location — the documented limit of the scheme, not a bug in
+    /// this fixture. `NUM_INCARNATIONS` keeps every model well short of it.
+    fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> Verified<()> {
         let (seg_id, offset) = crate::hashtable::unpack_location(location);
         if seg_id == 0 || seg_id as usize > NUM_CELLS || offset != 0 {
-            return false;
+            return Verified::DifferentKey;
         }
         let cell = seg_id as usize - 1;
-        let occupant = self.cells[cell].load(Ordering::Acquire);
-        occupant != 0 && occupant == key_id(key)
+
+        let word = self.cells[cell].load(Ordering::Acquire);
+        if location.tag() != crate::hashtable::location::tag_for_generation(cell_generation(word)) {
+            // The incarnation this location names is gone: the pin is refused
+            // and no comparison happens.
+            return Verified::Unknown(location);
+        }
+
+        let occupant = cell_occupant(word);
+        if occupant == 0 {
+            // Recycled and not yet rewritten: nothing to pin.
+            return Verified::Unknown(location);
+        }
+        if occupant == key_id(key) {
+            Verified::Match(())
+        } else {
+            Verified::DifferentKey
+        }
     }
 }

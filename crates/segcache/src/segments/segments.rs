@@ -239,11 +239,59 @@ impl Segments {
 
     /// Create a `SegmentsVerifier` for key verification in the hashtable.
     pub(crate) fn verifier(&self) -> SegmentsVerifier<'_> {
-        SegmentsVerifier::new(
-            &self.data[..],
-            self.segment_size as usize,
-            self.cap as usize,
-        )
+        SegmentsVerifier::new(self)
+    }
+
+    /// Total number of segments in the heap — the largest issuable segment id.
+    ///
+    /// The verifier range-checks against this before handing a location to
+    /// [`Self::acquire_item_at`], whose `assert!` a ghost location would
+    /// otherwise trip.
+    #[inline]
+    pub(crate) fn num_segments(&self) -> usize {
+        self.cap as usize
+    }
+
+    /// Prefetch the item bytes at `location` into L1.
+    ///
+    /// Deliberately UNPINNED, and that is sound where the verify next to it is
+    /// not: a prefetch of an arbitrary in-range address performs no
+    /// architectural read — it moves a cache line and cannot fault, tear, or
+    /// observe a value. Pinning here would pay a `SeqCst` pair to hide latency
+    /// that the pin itself would then reintroduce.
+    #[inline]
+    pub(crate) fn prefetch_item_at(&self, location: Location) {
+        let (seg_id, offset) = unpack_location(location);
+        if seg_id == 0 || seg_id > self.cap {
+            return;
+        }
+        let byte_offset = self.segment_size as usize * (seg_id as usize - 1) + offset;
+        if byte_offset >= self.data.len() {
+            return;
+        }
+        // SAFETY: the bounds check above keeps the address inside the heap
+        // mapping; a prefetch reads nothing regardless.
+        let ptr = unsafe { self.data.as_ptr().add(byte_offset) as *const i8 };
+
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "sse"),
+            target_arch = "aarch64"
+        )))]
+        let _ = ptr;
     }
 
     /// Returns the number of available segments (free queue + spare

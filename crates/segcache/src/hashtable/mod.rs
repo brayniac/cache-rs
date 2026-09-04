@@ -20,8 +20,9 @@ pub(crate) mod loom_oracle;
 
 pub use location::Location;
 pub(crate) use table::{MultiChoiceHashtable, SlotRef};
-pub(crate) use traits::{Hashtable, KeyVerifier};
+pub(crate) use traits::{Hashtable, Hit, Insert, KeyVerifier, Lookup, Verified};
 
+use crate::segments::SegmentGuard;
 use core::num::NonZeroU32;
 use keyvalue::RawItem;
 
@@ -89,85 +90,137 @@ pub(crate) fn unpack_location(loc: Location) -> (u32, usize) {
     (seg_id, offset)
 }
 
-/// Adapter that implements [`KeyVerifier`] for the existing Segments data buffer.
+/// The [`KeyVerifier`] the cache runs on: it compares key bytes **under a
+/// reader pin whose incarnation tag it checked**.
 ///
-/// This is temporary — it will be removed when Segments is replaced in Phase 2.
-/// It only needs read access to the segment data for key comparison.
+/// # Why the pin is the whole design (#91)
+///
+/// The previous verifier held a `&[u8]` over the segment heap and compared
+/// bytes at whatever offset a hashtable slot named, with no pin and no
+/// generation tag. A slot's location can be stale — the segment behind it
+/// recycled and rewritten between the slot read and the compare — so that read
+/// raced a writer's plain writes. Three consequences, all closed here:
+///
+/// - **it was formally UB.** A plain read racing a plain write is undefined
+///   behaviour whatever the protocol does with the answer, and it was the one
+///   remaining ThreadSanitizer report class, suppressed by function name so the
+///   CI gate could land.
+/// - **it could read out of bounds.** A garbage `klen`/`olen` decoded at a
+///   stale offset near a segment's end let `RawItem::key` build a slice past
+///   the end of the heap.
+/// - **it forced two probes on every hit.** Because an unpinned compare is not
+///   authoritative, `get` pinned and then performed a *second full hashtable
+///   lookup* to revalidate.
+///
+/// [`Segments::acquire_item_at`] is already exactly the read this needs: it
+/// takes the reader guard first and checks the location's generation tag
+/// *under* the pin, so the generation is frozen while it is read.
+///
+/// **Under a held pin with a matching tag the compared bytes are
+/// published-immutable.** A pin blocks both `-> Free` transitions, and within
+/// one incarnation a segment is append-only: an offset is never rewritten
+/// until the segment is recycled, and recycling bumps the generation, which
+/// fails the tag check. No writer can be mutating those bytes, so the compare
+/// is a plain `memcmp` — it vectorizes, which is the entire cost difference
+/// from the parked word-granular-atomics attempt.
 pub(crate) struct SegmentsVerifier<'a> {
-    data: &'a [u8],
-    segment_size: usize,
-    num_segments: usize,
+    segments: &'a crate::segments::Segments,
+    /// Fire the `after_lookup` fault hook before each pin attempt.
+    ///
+    /// Set only on the verifier `get` uses for its **from-scratch** probe, so
+    /// the hook keeps meaning "once per from-scratch lookup" and does not also
+    /// fire for the cold path's revalidation lookups. It sits before the pin
+    /// rather than after the lookup returns because that is now the whole
+    /// hazard window: a slot word read a moment before a drain recycles the
+    /// segment behind it is exactly what produces a stale location, and a hook
+    /// that fired after the lookup would be holding this reader's pin — which
+    /// would stop the very recycle the test is standing in for.
+    #[cfg(feature = "fault-injection")]
+    fault_probe: bool,
 }
 
 impl<'a> SegmentsVerifier<'a> {
-    /// Create a new verifier from the segments data buffer.
+    /// Create a new verifier over the segment heap.
     #[inline]
-    pub(crate) fn new(data: &'a [u8], segment_size: usize, num_segments: usize) -> Self {
+    pub(crate) fn new(segments: &'a crate::segments::Segments) -> Self {
         Self {
-            data,
-            segment_size,
-            num_segments,
+            segments,
+            #[cfg(feature = "fault-injection")]
+            fault_probe: false,
         }
+    }
+
+    /// The same verifier, wired to fire the `after_lookup` fault hook before
+    /// each pin attempt. See [`Self::fault_probe`].
+    #[cfg(feature = "fault-injection")]
+    #[inline]
+    pub(crate) fn probing(mut self) -> Self {
+        self.fault_probe = true;
+        self
     }
 }
 
 impl KeyVerifier for SegmentsVerifier<'_> {
-    fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> bool {
-        let (seg_id, offset) = unpack_location(location);
+    /// The pinned item and the guard keeping its segment alive. `get` keeps
+    /// both — the guard is what an [`crate::Item`] is built around; every other
+    /// caller drops them the moment the compare is answered.
+    type Pin = (RawItem, SegmentGuard);
 
-        if seg_id == 0 || seg_id as usize > self.num_segments {
-            return false;
+    fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> Verified<Self::Pin> {
+        // Range-check ahead of the pin. `acquire_item_at` opens with
+        // `assert!(seg_id <= cap)`, and `Location::GHOST` is all-ones, so it
+        // would trip that assert. Bucket scans filter ghosts before verifying,
+        // but the verifier must not RELY on its caller.
+        let (seg_id, _offset) = unpack_location(location);
+        if seg_id == 0 || seg_id as usize > self.segments.num_segments() {
+            debug_assert!(
+                false,
+                "verify reached an unrepresentable location: the bucket scans                  filter empty slots and ghosts before calling it"
+            );
+            return Verified::DifferentKey;
         }
 
-        let byte_offset = self.segment_size * (seg_id as usize - 1) + offset;
-
-        if byte_offset + keyvalue::ITEM_HDR_SIZE > self.data.len() {
-            return false;
+        #[cfg(feature = "fault-injection")]
+        if self.fault_probe {
+            crate::segcache::revalidation_fault::after_lookup();
         }
 
-        // SAFETY: We verified the offset is within the data buffer.
-        // The data buffer is the segment heap and items are written with valid headers.
-        let item = RawItem::from_ptr(unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) });
-        item.key() == key
+        match self.segments.acquire_item_at(location) {
+            Some((raw, guard)) => {
+                // The out-of-bounds read is closed by construction, not by
+                // clamping: a pinned, tag-valid location names a real published
+                // item of that incarnation, so its `klen`/`olen` are the values
+                // a writer wrote rather than garbage decoded at a recycled
+                // offset. Recorded as a checked precondition rather than a
+                // comment.
+                debug_assert!(
+                    _offset + raw.size() <= self.segments.segment_size() as usize,
+                    "a pinned, tag-valid item must lie inside its segment:                      offset {_offset} + size {} > segment size {}",
+                    raw.size(),
+                    self.segments.segment_size()
+                );
+                if raw.key() == key {
+                    Verified::Match((raw, guard))
+                } else {
+                    // Authoritative. Nothing was mutating these bytes, so
+                    // "different key" cannot mean "the bytes stopped being this
+                    // entry's" — the ambiguity `classify_failed_verify` and the
+                    // STALE-LOCATION invariant block existed to resolve.
+                    Verified::DifferentKey // guard drops here
+                }
+            }
+            // Either the segment is not readable (a drain owns it) or the
+            // location's incarnation is gone. Both are the caller's to triage;
+            // see `Segcache::triage_unknown_location`.
+            None => Verified::Unknown(location),
+        }
     }
 
     #[inline]
     fn prefetch(&self, location: Location) {
-        let (seg_id, offset) = unpack_location(location);
-        if seg_id == 0 || seg_id as usize > self.num_segments {
-            return;
-        }
-        let byte_offset = self.segment_size * (seg_id as usize - 1) + offset;
-        if byte_offset >= self.data.len() {
-            return;
-        }
-        let ptr = unsafe { self.data.as_ptr().add(byte_offset) as *const i8 };
-
-        #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            std::arch::asm!(
-                "prfm pldl1keep, [{ptr}]",
-                ptr = in(reg) ptr,
-                options(nostack, preserves_flags)
-            );
-        }
-
-        #[cfg(not(any(
-            all(target_arch = "x86_64", target_feature = "sse"),
-            target_arch = "aarch64"
-        )))]
-        let _ = ptr;
+        self.segments.prefetch_item_at(location);
     }
 }
-
-// SAFETY: SegmentsVerifier only holds a shared reference to a byte slice.
-unsafe impl Send for SegmentsVerifier<'_> {}
-unsafe impl Sync for SegmentsVerifier<'_> {}
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,6 @@
 # Pinned verify (issue #91)
 
-**Status:** design for review 2026-08-31 (not yet built)
+**Status:** BUILT 2026-09-03. Section 6 records where the implementation departed from this design and why.
 **Issue:** pelikan-io/cache-rs#91. Closes #81 (get's hot-path re-probe) in the same change, and removes the `SegmentsVerifier::verify` suppression the #61/#92 TSan gate shipped with. Supersedes the parked `racy-bytes` branch (@ 03f3ff2).
 
 ## 1. Problem
@@ -204,3 +204,230 @@ The get benches must *win*: deleting a full hashtable probe from the hot path is
 The budget exists because `racy-bytes` was parked at +12–19% after the fact. Committing the number before the work starts is what keeps the merge decision from being made by whoever is tired at the end.
 
 **Where the budget most likely goes:** insert's `lookup_slot` now takes a reader pin per tag-matching candidate — an uncontended `SeqCst` `fetch_add`/`fetch_sub` pair each. That is the one new cost on the write path, and it is the first thing to measure.
+
+
+## 6. As built (2026-09-03)
+
+Everything in §2 and §3 landed as designed. Four things the design did not
+anticipate, recorded here because each is a decision a reader will otherwise
+have to re-derive from the diff.
+
+### 6.1 `delete` cannot unlink through a `Draining` segment any more
+
+§2's "the other write paths ... retry a refused pin unboundedly ... their
+`lookup_*` calls gain the `Unknown` arm routed into the snooze they already
+have" is right for `cas`, `numeric_update` and `try_into_numeric`. For
+`delete` it is a **behaviour change**, and the design missed it.
+
+`delete` previously unlinked an entry in a `Draining` segment *immediately*:
+its remover pin failed, and it fell into the unpinned-unlink path with a
+generation guard. That path depended on `lookup_no_freq_update` having
+resolved the key at all — which it could only do via the unpinned compare this
+change removes. `Draining` is not readable, so under a pinned verify the key
+simply cannot be resolved there, and `Unknown` is the only honest answer.
+
+Waiting is correct rather than a concession. A drain is bounded,
+straight-line work with two outcomes and `delete` is right on both: a merge
+drain relocates the item and republishes it, so the retry unlinks it at the
+new location and acks `true`; a clear/expire drain sweeps the entry, so the
+retry reports the key absent and answers `false` — an eviction, which a cache
+may always perform. Neither can resurrect, and neither can wedge, because
+`delete` holds no pin while it waits and so cannot be what a drain is waiting
+on.
+
+The `Relinking` case — the one that genuinely cannot wait, because nothing
+ever drains a copy destination — is unaffected: `Relinking` is readable
+(`state.rs`), so the verify succeeds and the unpinned unlink still runs.
+
+`pin_failure_tests::acked_delete_during_drain_unlinks_the_entry` is the one
+test whose *property* changed. It used to assert the ack happens while the
+segment is parked in `Draining`; it now asserts the pair that replaces it —
+**no ack until the entry is really unlinked, and the wait ends when the drain
+does**. Its `Relinking` sibling is unchanged.
+
+### 6.2 Insert's rollback-restart needs a backoff ACROSS attempts
+
+§2 says "Unconditionally: `rollback_reservation(reserved, new_location);
+continue 'operation;`". That is right, and incomplete: each restart burns a
+fresh reservation, so a tight rollback/restart loop against a drain that has
+not moved yet consumes the free pool in milliseconds and turns a transient
+drain into `NoFreeSegments`.
+
+`Segcache::insert` therefore carries a `Backoff` declared OUTSIDE the
+`'operation` loop. The per-attempt `backoff` cannot serve (it is reset every
+iteration), and spinning in place instead of rolling back is the deadlock the
+loop exists to avoid. `pin_failure_tests::
+same_key_insert_completes_when_parked_drain_progresses` is what catches this:
+it waits to observe three restarts' worth of consumed segments before it lets
+the parked drain finish, and a loop with no backoff exhausts all 64 first.
+
+### 6.3 The `after_lookup` fault hook moved into the verifier
+
+The four `revalidation_tests` pass with their bodies unmodified, but only
+because the hook moved. It fires from inside `SegmentsVerifier::verify`, just
+BEFORE the pin, and only on the verifier `get` uses for its from-scratch probe
+(`Segcache::probe_verifier`). Both halves are load-bearing:
+
+- the pin now happens *inside* the lookup, so a hook that fired after the
+  lookup returned would be holding a reader pin on the very segment
+  `budget_absorbs_recycled_incarnations_without_a_false_absent` needs
+  recycled — it would get a condemned segment instead of a generation bump
+  and fail its own setup assertion;
+- a hook on the plain verifier would also fire for the fallback's
+  revalidation lookups, which are not from-scratch, and
+  `get_converges_instead_of_re_racing_the_lookup` counts firings.
+
+This is also the more faithful placement for the new design: the window
+between reading a slot word and pinning the location it names is now the whole
+hazard, and it is what produces `Unknown`.
+
+### 6.4 `Hit` carries no `freq`
+
+§2's sketch gives `Hit<P>` a `freq: u8`. Nothing reads it — the pre-#91
+`lookup` returned `(Location, u8)` and every caller already discarded the
+frequency, and `get_frequency` covers the one query that wants it. Carrying it
+would have earned a `#[allow(dead_code)]` for nothing, so it is not there.
+
+### 6.6 The write paths collapsed from three probes to one
+
+§5 predicted where the write-path budget would go — "insert's `lookup_slot`
+now takes a reader pin per tag-matching candidate ... the first thing to
+measure" — and the first measurement said something more interesting: the
+biggest regression was not `insert` at all but **`incr/hot_counter`, at
++38.2%**, and it was pure redundancy the design had left in place.
+
+`numeric_update`, `cas` and `try_into_numeric` each did **three hashtable
+probes and two pins** per operation, and every one of them was a consequence
+of the *unpinned* verify:
+
+1. look the key up (unpinned — it could not hand back an item);
+2. `acquire_item_at` the location it returned, to get a pin;
+3. a full second lookup, to prove the pinned bytes were still this key's.
+
+Under a verifier that pins *in order to compare*, (1) and (2) are the same
+operation — the lookup already hands back the pinned item — and (3) is the
+same-slot re-read the hot read path uses, exact by the same CAS-in-place
+argument. Each of those paths is now **one probe and one slot re-read**.
+
+`incr/hot_counter` went from **+38.2% to −43.2%** on that change alone.
+
+Two consequences worth stating rather than leaving to be discovered:
+
+- **`incr` now bumps the frequency counter once per operation, not three
+  times.** All three of the old probes were `lookup` rather than
+  `lookup_no_freq_update`, so an increment counted as three hits against the
+  eviction policy. One is the defensible number, but it does shift eviction
+  bias for counter-heavy workloads.
+- **`cas`'s lazy-expiry check is now read under the pin.** It used to run
+  before the pin, with a comment conceding it was "a semantic filter, not a
+  safety mechanism" because it raced a recycle. It no longer does.
+
+### 6.7 `SlotRef` shrank to 8 bytes
+
+A `SlotRef` now rides inside every `Hit`, and a lookup returns by value
+through several frames. Three naturally-sized fields (`usize`, `usize`,
+`u16`) made that return 24 bytes wider than it needed to be, which showed up
+where there is nothing else to pay for it: `get_miss/1b` was +5.4% while
+`set_fresh/8b/64b` — the same scan with a reservation in front of it — was
+neutral. `bucket_index` is a `u32` and `slot_index` a `u8`, with
+`with_choices` asserting the bound (2^32 buckets is a quarter-terabyte of
+hashtable) rather than leaving it implied.
+
+### 6.5 Model coverage of §4's unpinnable-candidate model
+
+§4 asks for "a loom/shuttle model in which a candidate slot's segment is
+unpinnable, asserting (a) `get` does not report a false absent, (b) `insert`
+rolls back rather than duplicating, (c) no execution wedges". All three are
+asserted, by extending the existing oracle-backed models rather than adding a
+sixth:
+
+- `KeyOracle` is now generation-aware — cell occupant and generation live in
+  ONE atomic word, because production reads them together under the pin — so
+  `drain_relocate` and `recycle_and_refill` produce a real tag mismatch and
+  the verifier answers `Unknown` for the outgoing incarnation.
+- (a) the five `loom_*_survives_relocation_and_recycle` models now assert
+  **never `Absent`** plus convergence (the same read resolves at the
+  destination once the drain settles), which is what stops "never absent"
+  from being satisfiable by answering `Unknown` forever.
+- (b) `loom_insert_replace_scan_survives_repeated_relocation` runs the
+  caller's rollback-restart loop over `Insert::Unknown` and still asserts
+  exactly one live entry and a `Replaced` outcome.
+- (c) loom terminates on every one of them.
+
+What is *not* modeled at the hashtable level is the difference between the two
+reasons a pin is refused — a drain owning the segment (transient) versus a
+dead incarnation (a miss). The hashtable answers `Unknown` either way; the
+distinction lives entirely in `Segcache::triage_unknown_location`, which reads
+`Segments::resolve`, and neither loom nor shuttle can reach `Segments`' mmap'd
+headers. That triage is covered deterministically instead: the transient arm
+by `pin_failure_tests` (get/cas/`try_into_numeric` retry through a parked
+drain; `delete` waits it out) and the bounded stale-incarnation arm by
+`revalidation_tests::budget_absorbs_recycled_incarnations_without_a_false_absent`,
+which counts the charges.
+
+
+## 7. Acceptance gate: measured (2026-09-04)
+
+Method as pre-committed in §5: same-path interleaved A/B (both binaries built
+from the same working directory, so nothing differs but the code), min-of-5,
+machine load reported alongside. `aarch64-apple-darwin`, criterion's own 30 s
+measurement window per benchmark, load average 5.9 at the start and 5.7 at the
+end — a busy shared machine, which is why the round-to-round spread of the
+BASE side against itself is reported as the noise floor.
+
+| bench | base (min) | new (min) | delta | A/A spread | bar | verdict |
+|---|---|---|---|---|---|---|
+| `get_hit/1b` | 39.34 ns | 34.38 ns | **-12.6%** | 4.9% | neutral or better | **PASS** |
+| `get_hit/255b` | 78.46 ns | 54.16 ns | **-31.0%** | 8.3% | neutral or better | **PASS** |
+| `set/1b/1b` | 40.15 ns | 45.73 ns | +13.9% | 7.4% | <= +3% | **FAIL** |
+| `set/1b/64b` | 43.30 ns | 48.69 ns | +12.4% | 6.4% | <= +3% | **FAIL** |
+| `set/255b/16384b` | 380.78 ns | 390.68 ns | +2.6% | 8.7% | <= +3% | PASS |
+| `incr/hot_counter` | 54.52 ns | 30.78 ns | **-43.6%** | 4.2% | <= +3% | **PASS** |
+| `get_miss/1b` | 15.94 ns | 16.69 ns | +4.7% | 5.8% | (not in the gate) | — |
+
+**The gets had to win, and they did.** §5: "deleting a full hashtable probe
+from the hot path is the change's payment for the pin, and if it does not show
+up there the design's premise is wrong." -12.6% and -31.0%.
+
+**Two lines fail, and they are one cause.** `set/1b/1b` and `set/1b/64b` are
+the small-value REPLACE path, and the regression is ~5.5 ns on both — two
+`SeqCst` RMWs, which is exactly one reader pin.
+
+The attribution is measured rather than argued, by splitting the workload
+instead of the code. Three benchmarks never call `verify` at all:
+`get_miss/1b` (no tag match), `set_fresh/8b/64b` (fresh keys only), and
+`set/255b/16384b` (16 KB values in a 64 MB heap, so nothing is resident to
+replace). All three are neutral within their own A/A spread. The benchmarks
+that DO verify are the ones that moved. `set/1b/1b` cycles a million ~16-byte
+items through a 64 MB heap, so after the first pass every key is resident and
+every set is a replace — one `lookup_slot`, one verify, one pin.
+
+That pin is the price of not doing the undefined read. The pre-#91 code got
+those 5.5 ns by comparing key bytes with no synchronization at all, which is
+the bug this change exists to remove.
+
+**Where the recovery is, if it is wanted.** §5 predicted the cost here
+("insert's `lookup_slot` now takes a reader pin per tag-matching candidate ...
+the first thing to measure") and the measurement agrees. What it did not
+notice is that `Segcache::insert` takes a SECOND pin on the same segment a few
+lines later — `try_pin_remover(old_seg_id)` — and a held remover pin has the
+same structural property the verify relies on: `try_pin_remover` fails on a
+`Draining` segment, and `claim_for_drain` waits out removers before sweeping,
+so the incarnation cannot advance while it is held. Verifying under the
+remover pin, with the same explicit tag check `acquire_item_at` performs,
+would make the replace path take ONE pin instead of two.
+
+That is deliberately NOT in this change. It is a second pin discipline, and
+this design's §2 chose the opposite on purpose — `lookup_slot` never hands out
+a pin so that "a verify pin is never held across a lock acquisition or a wait"
+is enforced structurally rather than by a rule someone has to remember. Adding
+a second, path-specific rule at the end of a change this size, unmodeled and
+with its own soundness argument to write, is how the next bug gets in. It
+wants its own issue, its own loom model, and its own gate.
+
+**The decision this gate exists to force.** §5: "Committing the number before
+the work starts is what keeps the merge decision from being made by whoever is
+tired at the end." The number was committed, the number was missed on two
+lines, and the cause is understood and has a known fix. Merging on the read
+win versus holding for the remover-pin fold is a call for the maintainer, not
+a rationalization to be written here.

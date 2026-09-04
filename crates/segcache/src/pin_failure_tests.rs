@@ -81,10 +81,12 @@ fn insert_and_seal(cache: &Segcache, key: &[u8], val: &[u8]) -> (Location, NonZe
     cache.insert(key, val, None, ttl).expect("insert target");
 
     let verifier = cache.segments.verifier();
-    let (location, _freq) = cache
+    let location = cache
         .hashtable
         .lookup_no_freq_update(key, &verifier)
-        .expect("target must resolve");
+        .found()
+        .expect("target must resolve")
+        .location;
     let (seg_raw, _offset) = unpack_location(location);
     let seg_id = NonZeroU32::new(seg_raw).expect("target location must be a real segment");
 
@@ -105,10 +107,12 @@ fn insert_and_seal(cache: &Segcache, key: &[u8], val: &[u8]) -> (Location, NonZe
 
     // The fill is far below eviction pressure, so the target must not have
     // moved.
-    let (loc_after, _) = cache
+    let loc_after = cache
         .hashtable
         .lookup_no_freq_update(key, &verifier)
-        .expect("target still resolves");
+        .found()
+        .expect("target still resolves")
+        .location;
     assert_eq!(loc_after, location, "target must not relocate during fill");
 
     (location, seg_id)
@@ -231,19 +235,87 @@ fn get_terminates_when_key_removed_during_drain() {
 /// in the hashtable (`copy_into`'s `get_item_frequency` gate), so an acked
 /// delete that leaves the entry behind resurrects — a hard memcached
 /// contract violation.
+///
+/// # This test changed shape with the pinned verify (#91), and why
+///
+/// It used to assert that the delete acks *while the segment is still
+/// Draining*, by unlinking the entry itself. That was only possible because
+/// the verifier read the key's bytes with no pin — which is the formally-UB
+/// read #91 removes. A pinned verifier cannot resolve a key in a `Draining`
+/// segment at all (`Draining` is not readable, `state.rs`), so `delete` now
+/// answers the same way every other write path answers an unpinnable
+/// candidate: it waits.
+///
+/// **Waiting is the correct answer, not a concession.** A drain is bounded,
+/// straight-line work with exactly two outcomes, and the delete is right
+/// either way:
+///
+/// - a *merge* drain relocates the item and republishes it in the
+///   destination, so the retry resolves the key there (readable) and unlinks
+///   it — acked `true`, entry really gone;
+/// - a *clear/expire* drain sweeps the entry, so the retry sees the key
+///   absent and answers `false` — the key was evicted, which a cache may
+///   always do.
+///
+/// Neither outcome can resurrect, and neither can wedge: `delete` holds no
+/// pin while it waits, so it cannot be what a drain is waiting for. The
+/// `Relinking` case below is the one that genuinely CANNOT wait — nothing
+/// ever drains a copy destination — and it still unlinks immediately,
+/// because `Relinking` is readable and the verify succeeds there.
+///
+/// So the property under test is now the pair: **no ack until the entry is
+/// really unlinked, and the wait ends when the drain does.**
 #[test]
 fn acked_delete_during_drain_unlinks_the_entry() {
-    let cache = small_merge_cache(8);
+    let cache = Arc::new(small_merge_cache(8));
     let (location, seg_id) = insert_and_seal(&cache, b"victim0", b"Vvicti0");
 
     // A merge drain claims the segment and is "mid copy".
     assert!(cache.segments_for_test().claim_for_drain_for_test(seg_id));
 
-    // DELETE while the drain is in flight: the key is live, so it acks.
+    // DELETE while the drain is in flight, on its own thread.
+    let (tx, rx) = mpsc::channel();
+    let deleter = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let _ = tx.send(cache.delete(b"victim0"));
+        })
+    };
+
+    // It must not have answered yet: the key is live, and the only way to
+    // answer `true` right now would be to unlink a slot whose key bytes
+    // nothing was able to read.
     assert!(
-        cache.delete(b"victim0"),
-        "delete of a live key must be acked"
+        matches!(
+            rx.recv_timeout(Duration::from_millis(250)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "delete answered while its key's segment was unreadable: either it \
+         acked without unlinking (resurrection) or it reported a live key gone"
     );
+    assert!(
+        cache
+            .hashtable
+            .get_item_frequency(b"victim0", location)
+            .is_some(),
+        "test setup: nothing has swept the entry, so the delete really is \
+         still waiting on the drain rather than already finished"
+    );
+
+    // Drain finishes via the revert arc.
+    assert!(cache.segments.header(seg_id).cas_metadata(
+        State::Draining,
+        State::Sealed,
+        None,
+        None,
+        crate::sync::Ordering::SeqCst,
+    ));
+
+    let acked = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("delete wedged: the wait must end when the drain does");
+    deleter.join().expect("deleter must not panic");
+    assert!(acked, "delete of a live key must be acked");
 
     // The ack must be real: the entry must be unlinked, because this is
     // exactly what the merge's relocation gate consults. A left-behind
@@ -255,15 +327,6 @@ fn acked_delete_during_drain_unlinks_the_entry() {
             .is_none(),
         "acked delete left the hashtable entry; a merge drain would relocate (resurrect) it"
     );
-
-    // Drain finishes via the revert arc; the key must stay deleted.
-    assert!(cache.segments.header(seg_id).cas_metadata(
-        State::Draining,
-        State::Sealed,
-        None,
-        None,
-        crate::sync::Ordering::SeqCst,
-    ));
     assert!(
         cache.get(b"victim0").is_none(),
         "acked delete resurrected after the drain"

@@ -29,6 +29,8 @@ use clocksource::coarse::{Duration, Instant};
 use core::hash::{BuildHasher, Hasher};
 
 // submodules
+pub mod clock;
+
 mod builder;
 mod cas;
 mod error;

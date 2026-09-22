@@ -49,7 +49,7 @@ impl Eviction {
 
         Self {
             policy,
-            last_update_time: Instant::now(),
+            last_update_time: crate::clock::now(),
             ranked_segs,
             index: 0,
             rng: Box::new(rng()),
@@ -78,7 +78,7 @@ impl Eviction {
             | Policy::Merge { .. }
             | Policy::S3Fifo { .. } => false,
             Policy::Fifo | Policy::Cte | Policy::Util => {
-                let now = Instant::now();
+                let now = crate::clock::now();
                 if self.ranked_segs[0].is_none()
                     || (now - self.last_update_time).as_secs() > 1
                     || self.ranked_segs.len() < (self.index + 8)

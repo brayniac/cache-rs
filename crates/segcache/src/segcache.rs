@@ -1254,7 +1254,7 @@ impl Segcache {
         if ttl.as_secs() == 0 {
             return Ok(Duration::from_secs(0));
         }
-        let now = Instant::now();
+        let now = crate::clock::now();
         let expires_at = create_at + ttl;
         if expires_at <= now {
             return Err(SegcacheError::NotFound);

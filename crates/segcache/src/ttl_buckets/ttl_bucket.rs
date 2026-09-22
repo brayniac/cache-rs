@@ -154,7 +154,7 @@ impl TtlBucket {
     /// immediately — the last reader's guard drop frees it. Returns the
     /// number of segments actually freed by this pass.
     pub(super) fn expire(&self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
-        let now = Instant::now();
+        let now = crate::clock::now();
         self.drain_chain(hashtable, segments, Some(now))
     }
 

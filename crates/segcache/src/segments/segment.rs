@@ -589,11 +589,21 @@ impl<'a> Segment<'a> {
             let item_frequency = hashtable.get_item_frequency(item.key(), loc).unwrap_or(0) as f64;
             let weighted_frequency = item_frequency / (item_size as f64 / mean_size);
 
-            if cutoff >= 0.0001
+            let pruned = cutoff >= 0.0001
                 && to_drop > 0
                 && n_dropped < to_drop as usize
-                && weighted_frequency <= cutoff
-            {
+                && weighted_frequency <= cutoff;
+
+            // Recorded at the decision, not inferred from what survives the
+            // run: an item can be absent at the end because a prune dropped
+            // it, because an overwrite superseded it, or because its segment
+            // expired, and a survival count cannot tell those apart. The raw
+            // frequency is banded, not the weighted one, so the table is
+            // comparable against an engine whose weighting differs -- the
+            // weighting is part of what is being compared.
+            crate::retention_trace::record(item_size as u32, item_frequency as u8, !pruned);
+
+            if pruned {
                 trace!(
                     "evicting item size: {item_size} freq: {item_frequency} w_freq: {weighted_frequency} cutoff: {cutoff}"
                 );

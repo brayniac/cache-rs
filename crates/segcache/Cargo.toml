@@ -23,6 +23,12 @@ harness = false
 # needs both sides driven, or the one honouring expiry is penalised for it.
 virtual-clock = []
 
+# Tally what a merge pass keeps, by item size and frequency band. Gated
+# because the record sits inside the prune loop; with it off the call
+# compiles away. Measurement only, for comparing this engine's retention
+# decisions against another cache's on the same trace.
+retention-trace = []
+
 # enables item header integrity (magic + CRC32)
 integrity = ["keyvalue/integrity"]
 

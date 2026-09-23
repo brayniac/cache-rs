@@ -30,6 +30,7 @@ use core::hash::{BuildHasher, Hasher};
 
 // submodules
 pub mod clock;
+pub mod retention_trace;
 
 mod builder;
 mod cas;

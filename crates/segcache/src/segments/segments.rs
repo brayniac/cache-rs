@@ -1237,11 +1237,35 @@ impl Segments {
                     let bucket_id = (offset + i) % buckets;
                     let ttl_bucket = &ttl_buckets.buckets[bucket_id];
                     if let Some(first_seg) = ttl_bucket.head() {
-                        let start = ttl_bucket.next_to_merge().unwrap_or(first_seg);
+                        // EXPERIMENT: always start at the head, never
+                        // resume from the cursor.
+                        //
+                        // Upstream sweeps a chain: `merge_evict` returns the
+                        // segment after the consumed region and the cursor
+                        // resumes there next pass, so survivors -- which are
+                        // head-inserted -- get a full sweep before being
+                        // judged again. The engine this is compared against
+                        // always restarts at the head, so its survivors are
+                        // candidate #1 for the very next pass and face a
+                        // compounding prune: an item surviving k merges has
+                        // been judged k times against k thresholds.
+                        //
+                        // That is the leading explanation for why this
+                        // engine retains cold items 3-12x more often at the
+                        // same total item count. Removing the cursor here
+                        // tests it by making this engine behave like the
+                        // other, which is the cheaper direction: the other
+                        // engine's head-always behaviour is entangled with
+                        // its chain splice, which verifies contiguity from
+                        // the head.
+                        let start = first_seg;
                         match self.merge_evict(start, ttl_bucket, hashtable) {
                             Ok(next_to_merge) => {
                                 debug!("merged ttl_bucket: {bucket_id} seg: {start}");
-                                ttl_bucket.set_next_to_merge(next_to_merge);
+                                // Cursor deliberately not advanced: the
+                                // next pass restarts at the head.
+                                let _ = next_to_merge;
+                                ttl_bucket.set_next_to_merge(None);
 
                                 #[cfg(feature = "metrics")]
                                 EVICT_TIME.add(now.elapsed().as_nanos() as _);

@@ -24,6 +24,62 @@ impl Default for Builder {
     }
 }
 
+/// A frequency seed unrelated to the eviction seed it is derived from.
+///
+/// Multiplied by an odd constant and xor-folded, so adjacent eviction seeds
+/// (1, 2, 3 ... as a sweep uses) do not become adjacent frequency seeds --
+/// which on a counter-based generator would mean two sweep points sharing
+/// most of their frequency stream.
+fn derive_freq_seed(seed: u64) -> u64 {
+    // Xor before multiplying: zero is a fixed point of multiply-then-fold,
+    // so seed 0 would derive to 0 and hand both generators one stream --
+    // and 0 is exactly the seed someone reaches for first.
+    let z = (seed ^ 0x9E37_79B9_7F4A_7C15).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    z ^ (z >> 32)
+}
+
+#[cfg(test)]
+mod seed_derivation_tests {
+    use super::derive_freq_seed;
+
+    /// The frequency seed must not equal the eviction seed it comes from.
+    ///
+    /// Both generators are SplitMix64 counters stepping by the same GAMMA,
+    /// so an identical seed makes them the identical sequence. Handing both
+    /// the caller's seed is the obvious implementation and the wrong one.
+    #[test]
+    fn a_derived_frequency_seed_differs_from_its_source() {
+        for seed in [0u64, 1, 2, 3, 4, 5, 7, 99, u64::MAX] {
+            assert_ne!(
+                derive_freq_seed(seed),
+                seed,
+                "seed {seed} derived to itself, so both generators share a stream"
+            );
+        }
+    }
+
+    /// And adjacent seeds must not derive to adjacent seeds.
+    ///
+    /// A sweep uses 1, 2, 3, 4, 5. On a counter-based generator, frequency
+    /// seeds one apart would share all but the first draw, so two sweep
+    /// points would differ far less than they appear to -- and the spread
+    /// across seeds is the thing being measured.
+    #[test]
+    fn adjacent_seeds_do_not_derive_to_adjacent_seeds() {
+        for seed in 1u64..=8 {
+            let a = derive_freq_seed(seed);
+            let b = derive_freq_seed(seed + 1);
+            let gap = a.wrapping_sub(b).min(b.wrapping_sub(a));
+            assert!(
+                gap > 1 << 20,
+                "seeds {seed} and {} derived {gap} apart; their frequency \
+                 streams would overlap almost entirely",
+                seed + 1
+            );
+        }
+    }
+}
+
 impl Builder {
     /// Specify the hash power, which limits the size of the hashtable to 2^N
     /// entries. 1/8th of these are used for metadata storage, meaning that the
@@ -177,11 +233,17 @@ impl Builder {
     /// ```
     pub fn build(self) -> Result<Segcache, std::io::Error> {
         let mut hashtable = MultiChoiceHashtable::new(self.hash_power);
-        // The same seed drives both generators. They are separate streams
-        // so neither perturbs the other, but one knob is enough: a caller
-        // wanting reproducibility wants all of it.
+        // One knob seeds both generators -- a caller wanting reproducibility
+        // wants all of it -- but they must not be handed the *same* seed.
+        // Both are SplitMix64 counters stepping by the same GAMMA, so an
+        // identical seed makes them the identical sequence, consumed at
+        // different rates. Here that would be nearly harmless, since
+        // eviction draws a few hundred times against ASFC's millions and
+        // they desynchronise at once, but "nearly harmless" is not a
+        // property to rely on. The frequency stream is offset so the two
+        // are unrelated by construction rather than by usage pattern.
         if let Some(seed) = self.segments_builder.evict_seed {
-            hashtable.set_freq_seed(seed);
+            hashtable.set_freq_seed(derive_freq_seed(seed));
         }
         let segments = self
             .segments_builder

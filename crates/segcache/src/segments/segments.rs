@@ -198,7 +198,7 @@ impl Segments {
             spare_count: crate::sync::AtomicU32::new(spare_capacity),
             data,
             policy: evict_policy,
-            evict: std::sync::Mutex::new(Eviction::new(segments, evict_policy)),
+            evict: std::sync::Mutex::new(Eviction::new(segments, evict_policy, builder.evict_seed)),
             admission_cap,
             admission_count: crate::sync::AtomicU32::new(0),
         })

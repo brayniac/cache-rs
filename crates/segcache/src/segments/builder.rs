@@ -12,7 +12,7 @@ pub(crate) struct SegmentsBuilder {
     pub(super) heap_size: usize,
     pub(super) segment_size: i32,
     pub(super) evict_policy: Policy,
-    pub(super) evict_seed: Option<u64>,
+    pub(crate) evict_seed: Option<u64>,
 }
 
 impl Default for SegmentsBuilder {

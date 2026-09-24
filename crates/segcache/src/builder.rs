@@ -176,7 +176,13 @@ impl Builder {
     ///     .eviction(Policy::Random).build();
     /// ```
     pub fn build(self) -> Result<Segcache, std::io::Error> {
-        let hashtable = MultiChoiceHashtable::new(self.hash_power);
+        let mut hashtable = MultiChoiceHashtable::new(self.hash_power);
+        // The same seed drives both generators. They are separate streams
+        // so neither perturbs the other, but one knob is enough: a caller
+        // wanting reproducibility wants all of it.
+        if let Some(seed) = self.segments_builder.evict_seed {
+            hashtable.set_freq_seed(seed);
+        }
         let segments = self
             .segments_builder
             .build()

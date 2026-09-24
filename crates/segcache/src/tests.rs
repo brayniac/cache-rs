@@ -1204,7 +1204,7 @@ fn full_cache_long() {
     assert_eq!(cache.items(), 0);
     assert_eq!(cache.segments.free(), segments);
 
-    let mut rng = rand::rng();
+    let mut rng = ::rand::rng();
 
     let mut key = vec![0; key_size];
     let mut value = vec![0; value_size];
@@ -1243,7 +1243,7 @@ fn full_cache_long_2() {
     assert_eq!(cache.items(), 0);
     assert_eq!(cache.segments.free(), segments);
 
-    let mut rng = rand::rng();
+    let mut rng = ::rand::rng();
 
     let mut key = vec![0; key_size];
     let mut value = vec![0; value_size];

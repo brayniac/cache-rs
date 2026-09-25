@@ -15,6 +15,14 @@ harness = false
 
 [features]
 
+# Let a caller drive expiry from its own clock instead of the system one.
+# Gated because the check sits on the read path: with it off, the clock
+# helper compiles to the same call the code made before it existed. A trace
+# replay needs it -- a replay consumes hours of recorded time in seconds, so
+# wall-clock expiry never fires -- and a comparison against another engine
+# needs both sides driven, or the one honouring expiry is penalised for it.
+virtual-clock = []
+
 # enables item header integrity (magic + CRC32)
 integrity = ["keyvalue/integrity"]
 

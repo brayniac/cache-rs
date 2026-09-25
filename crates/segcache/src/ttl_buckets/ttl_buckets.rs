@@ -84,7 +84,7 @@ impl TtlBuckets {
     /// coarse tick (the loser observes its own freshly-stored value and
     /// skips the redundant pass) without needing any lock.
     pub(crate) fn expire(&self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
-        let now = Instant::now();
+        let now = crate::clock::now();
         if self.last_expired.swap(now, Ordering::Relaxed) == now {
             return 0;
         }

@@ -944,7 +944,7 @@ impl SegmentHeader {
 
     #[inline]
     pub fn mark_created(&self) {
-        self.create_at.store(Instant::now(), Ordering::Relaxed);
+        self.create_at.store(crate::clock::now(), Ordering::Relaxed);
     }
 
     #[inline]
@@ -954,7 +954,7 @@ impl SegmentHeader {
 
     #[inline]
     pub fn mark_merged(&self) {
-        self.merge_at.store(Instant::now(), Ordering::Relaxed);
+        self.merge_at.store(crate::clock::now(), Ordering::Relaxed);
     }
 
     // -- TTL --

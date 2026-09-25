@@ -353,7 +353,7 @@ fn acked_delete_in_relinking_segment_unlinks_the_entry() {
     let cache = small_merge_cache(8);
     let (location, seg_id) = insert_and_seal(&cache, b"victim1", b"Vvicti1");
 
-    // Force the copy-destination state (what `link_dest_at_head` publishes
+    // Force the copy-destination state (what `link_dest_before` publishes
     // while the owner fills the destination).
     assert!(cache.segments.header(seg_id).cas_metadata(
         State::Sealed,

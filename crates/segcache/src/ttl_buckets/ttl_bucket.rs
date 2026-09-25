@@ -49,7 +49,7 @@ pub struct TtlBucket {
     /// Serializes all chain-STRUCTURE mutations of THIS bucket (head/tail
     /// pointer updates and the prev/next neighbour patches done as chain
     /// surgery): `reserve`'s `try_expand` (link/seal/set_tail), eviction's
-    /// dest head-insert (`link_dest_at_head` + `set_head`), each drained
+    /// dest insert (`link_dest_before`, in place of the source), each drained
     /// candidate's `finalize_drained` unlink/splice, `drain_chain`/`expire`/
     /// `clear`, and `remove_at`'s empty-free + head fixup all take it.
     ///

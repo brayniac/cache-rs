@@ -25,15 +25,21 @@
 //!
 //! Gated behind `virtual-clock`: with the feature off there is no lookup,
 //! no branch, and no difference from calling the clock directly.
+//!
+//! Also compiled into this crate's own unit tests, feature or not, so a test
+//! in `src/` can move time instead of sleeping through it and a plain
+//! `cargo test` runs it. That reaches unit tests only: an integration test
+//! under `tests/` links the library built without `cfg(test)`, and still
+//! needs the feature.
 
 use clocksource::coarse::Instant;
 
-#[cfg(feature = "virtual-clock")]
+#[cfg(any(feature = "virtual-clock", test))]
 use clocksource::coarse::Duration;
-#[cfg(feature = "virtual-clock")]
+#[cfg(any(feature = "virtual-clock", test))]
 use core::cell::Cell;
 
-#[cfg(feature = "virtual-clock")]
+#[cfg(any(feature = "virtual-clock", test))]
 thread_local! {
     /// The instant to report on this thread instead of the monotonic clock.
     ///
@@ -54,7 +60,7 @@ thread_local! {
 /// The current instant, as every expiry decision sees it.
 #[inline]
 pub fn now() -> Instant {
-    #[cfg(feature = "virtual-clock")]
+    #[cfg(any(feature = "virtual-clock", test))]
     {
         if let Some(instant) = VIRTUAL_NOW.with(Cell::get) {
             return instant;
@@ -72,7 +78,7 @@ pub fn now() -> Instant {
 /// monotonically nondecreasing, so a second earlier than the anchor holds
 /// the clock still rather than moving it back. Letting it move back would
 /// un-expire items that an earlier record had already aged out.
-#[cfg(feature = "virtual-clock")]
+#[cfg(any(feature = "virtual-clock", test))]
 pub fn set_virtual_now(secs: u32) {
     let (base, base_secs) = ANCHOR.with(|anchor| match anchor.get() {
         Some(pinned) => pinned,
@@ -87,14 +93,35 @@ pub fn set_virtual_now(secs: u32) {
 }
 
 /// Restore the system clock on this thread.
-#[cfg(feature = "virtual-clock")]
+#[cfg(any(feature = "virtual-clock", test))]
 pub fn clear_virtual_now() {
     VIRTUAL_NOW.with(|now| now.set(None));
     ANCHOR.with(|anchor| anchor.set(None));
 }
 
 /// The virtual time in force on this thread, or `None` for the real clock.
-#[cfg(feature = "virtual-clock")]
+#[cfg(any(feature = "virtual-clock", test))]
 pub fn virtual_now() -> Option<Instant> {
     VIRTUAL_NOW.with(Cell::get)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The override must be reachable from a unit test without the feature,
+    /// or the `cfg(test)` half of the gate is doing nothing.
+    #[test]
+    fn a_unit_test_drives_the_clock_without_the_feature() {
+        set_virtual_now(1_000);
+        let start = now();
+        set_virtual_now(1_060);
+        assert_eq!(now(), start + Duration::from_secs(60));
+
+        clear_virtual_now();
+        assert!(
+            virtual_now().is_none(),
+            "clearing must restore the real clock"
+        );
+    }
 }

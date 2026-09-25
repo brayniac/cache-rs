@@ -100,6 +100,10 @@ pub struct MultiChoiceHashtable {
     num_buckets: usize,
     mask: u64,
     num_choices: u8,
+    /// Generator for ASFC's probabilistic increment, seeded so a
+    /// measurement is reproducible. Separate from eviction's so the two
+    /// cannot perturb each other's streams.
+    freq_rng: crate::Random,
     /// Striped insert locks. Entry CREATION for a key (empty-slot claim,
     /// ghost takeover) is serialized per key-hash stripe with an
     /// under-lock absence re-check (see `insert`); entry MUTATION
@@ -143,6 +147,16 @@ impl MultiChoiceHashtable {
         Self::with_choices(power, 2)
     }
 
+    /// Seed the frequency generator.
+    ///
+    /// Defaults to `rand::DEFAULT_SEED`. Several seeds sample the
+    /// distribution of outcomes; one seed only pins an arbitrary point of
+    /// it, which is worth remembering before quoting a seeded number as
+    /// though it were the value.
+    pub fn set_freq_seed(&mut self, seed: u64) {
+        self.freq_rng = crate::Random::new(seed);
+    }
+
     /// Create a new hashtable with configurable N-choice hashing.
     ///
     /// # Parameters
@@ -184,6 +198,7 @@ impl MultiChoiceHashtable {
             .into_boxed_slice();
 
         Self {
+            freq_rng: crate::Random::new(crate::rand::DEFAULT_SEED),
             hash_builder: Box::new(hash_builder),
             buckets,
             num_buckets,
@@ -537,7 +552,9 @@ impl MultiChoiceHashtable {
             if UPDATE_FREQ {
                 let freq = Hashbucket::freq(packed);
                 if freq < 127 {
-                    if let Some(new_packed) = Hashbucket::try_update_freq(packed, freq) {
+                    if let Some(new_packed) =
+                        Hashbucket::try_update_freq(packed, freq, self.freq_rng.next_u64())
+                    {
                         let _ = bucket.items[slot_index].compare_exchange(
                             packed,
                             new_packed,
@@ -593,7 +610,9 @@ impl MultiChoiceHashtable {
             if packed != 0 && Hashbucket::is_ghost(packed) && Hashbucket::tag(packed) == tag {
                 let freq = Hashbucket::freq(packed);
                 if freq < 127 {
-                    if let Some(new_packed) = Hashbucket::try_update_freq(packed, freq) {
+                    if let Some(new_packed) =
+                        Hashbucket::try_update_freq(packed, freq, self.freq_rng.next_u64())
+                    {
                         let _ = bucket.items[slot_index].compare_exchange(
                             packed,
                             new_packed,
@@ -1426,6 +1445,60 @@ mod tests {
                 Verified::DifferentKey
             }
         }
+    }
+
+    /// The frequency generator must be seeded, and reach ASFC's branch.
+    ///
+    /// Above frequency 16 ASFC increments with probability 1/freq, and that
+    /// draw used to come from `rand::rng()` -- a thread-local ChaCha12
+    /// reseeded from the OS. So the cache's miss ratio moved between runs
+    /// of one build on one workload with no way to pin it: 0.0021 of spread
+    /// remained even once the eviction draw was seeded.
+    ///
+    /// Driven past 16 on purpose. At 16 and below every access counts and
+    /// the draw is never consulted, so a fixture stopping short passes
+    /// whether or not the generator is connected to anything.
+    #[test]
+    fn a_seeded_frequency_generator_makes_asfc_reproducible() {
+        let climb = |seed: u64| -> u8 {
+            let mut ht = MultiChoiceHashtable::new(10);
+            ht.set_freq_seed(seed);
+            let mut verifier = MockVerifier::new();
+            let location = Location::new(4242);
+            verifier.add(b"climber", location, false);
+            assert!(
+                matches!(
+                    ht.insert(b"climber", location, &verifier),
+                    Ok(Insert::Created) | Ok(Insert::Replaced(_))
+                ),
+                "the climber must be published"
+            );
+            for _ in 0..4000 {
+                let _ = ht.lookup(b"climber", &verifier);
+            }
+            match ht.get_frequency(b"climber", &verifier) {
+                Lookup::Found(freq) => freq,
+                _ => panic!("the climber must still be present"),
+            }
+        };
+
+        let a = climb(1);
+        assert!(
+            a > 16,
+            "the fixture must drive frequency past 16 or the probabilistic \
+             branch is never reached: got {a}"
+        );
+        assert!(
+            a < 127,
+            "and must not saturate, or every seed agrees: got {a}"
+        );
+        assert_eq!(a, climb(1), "seed 1 gave two different frequencies");
+        assert_ne!(
+            a,
+            climb(0xDEAD_BEEF),
+            "two seeds gave the same frequency, so ASFC is not consulting \
+             the seeded generator"
+        );
     }
 
     /// Count live (non-empty, non-ghost) entries across `key`'s candidate

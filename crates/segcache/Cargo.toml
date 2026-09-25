@@ -75,7 +75,6 @@ keyvalue = { workspace = true }
 log = { workspace = true }
 metriken = { workspace = true, optional = true }
 rand = { workspace = true, features = ["sys_rng"] }
-rand_xoshiro = { workspace = true }
 memmap2 = { workspace = true }
 thiserror = { workspace = true }
 
@@ -83,6 +82,11 @@ loom = { version = "0.7", features = ["checkpoint"], optional = true }
 shuttle = { version = "0.9", optional = true }
 
 [dev-dependencies]
+# Load generation only. Deliberately a different generator from the cache's
+# own: the workload's randomness and the cache's eviction randomness are
+# separate concerns and must be separately seeded, or a change to one
+# silently moves the other.
+rand_xoshiro = { workspace = true }
 criterion = { workspace = true }
 # For layout-proof integration-test sizing (item_size): features unify
 # with the lib's own requirement, so the tests always see the layout the

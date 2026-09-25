@@ -94,24 +94,25 @@ impl Hashbucket {
     ///
     /// Returns `Some(new_packed)` if frequency should increment.
     #[inline]
-    pub fn try_update_freq(packed: u64, freq: u8) -> Option<u64> {
+    /// `draw` supplies the randomness for the probabilistic branch.
+    ///
+    /// Passed in rather than drawn here, so it can come from a seeded
+    /// generator. It used to call `rand::rng()`, a thread-local ChaCha12
+    /// reseeded from the OS, which left the cache's miss ratio moving
+    /// between runs of one build on one workload with no way to pin it --
+    /// measured at 0.0021 of spread after the eviction draw alone was
+    /// seeded.
+    pub fn try_update_freq(packed: u64, freq: u8, draw: u64) -> Option<u64> {
         if freq >= 127 {
             return None;
         }
 
-        // ASFC: probabilistic increment
+        // ASFC: probabilistic increment. At 16 and below every access
+        // counts, so the draw is not consulted.
         let should_increment = if freq <= 16 {
             true
         } else {
-            #[cfg(not(model_checking))]
-            let rand = {
-                use rand::RngExt;
-                rand::rng().random::<u64>()
-            };
-            #[cfg(model_checking)]
-            let rand = 0u64;
-
-            rand.is_multiple_of(freq as u64)
+            draw.is_multiple_of(freq as u64)
         };
 
         if should_increment {

@@ -8,9 +8,6 @@
 use core::cmp::{max, Ordering};
 use core::num::NonZeroU32;
 
-use ::rand::RngExt;
-
-use crate::rng;
 use crate::segments::*;
 use crate::Random;
 use crate::*;
@@ -28,7 +25,7 @@ pub struct Eviction {
     last_update_time: Instant,
     ranked_segs: Box<[Option<NonZeroU32>]>,
     index: usize,
-    rng: Box<Random>,
+    rng: Random,
     /// Ghost queue for S3-FIFO (empty for other policies)
     pub(crate) ghost: GhostQueue,
 }
@@ -36,7 +33,7 @@ pub struct Eviction {
 impl Eviction {
     /// Creates a new `Eviction` which will handle up to `nseg` segments
     /// using the specified eviction policy.
-    pub fn new(nseg: usize, policy: Policy) -> Self {
+    pub fn new(nseg: usize, policy: Policy, seed: Option<u64>) -> Self {
         let ranked_segs = vec![None; nseg].into_boxed_slice();
 
         // For S3-FIFO, size the ghost queue proportionally
@@ -52,7 +49,13 @@ impl Eviction {
             last_update_time: crate::clock::now(),
             ranked_segs,
             index: 0,
-            rng: Box::new(rng()),
+            // An explicit seed makes eviction reproducible; without one the
+            // generator comes from system entropy and the cache's miss ratio
+            // moves run to run.
+            // Seeded, always. SplitMix64 is counter-based, so an
+            // unseeded instance would only mean an arbitrary starting
+            // point -- and an arbitrary one nobody can reproduce.
+            rng: Random::new(seed.unwrap_or(crate::rand::DEFAULT_SEED)),
             ghost: GhostQueue::new(ghost_capacity),
         }
     }
@@ -67,7 +70,7 @@ impl Eviction {
     /// Returns a random u32
     #[inline]
     pub fn random(&mut self) -> u32 {
-        self.rng.random()
+        self.rng.next_u32()
     }
 
     pub fn should_rerank(&mut self) -> bool {

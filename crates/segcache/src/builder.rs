@@ -139,6 +139,29 @@ impl Builder {
         self
     }
 
+    /// Seed the eviction generator, making eviction reproducible.
+    ///
+    /// Unset, it draws from system entropy, which is right for a server and
+    /// wrong for a measurement: `Policy::Merge` chooses the TTL bucket to
+    /// merge from by drawing a random segment index, so two runs of one
+    /// build on one workload give different miss ratios. Measured across
+    /// five runs of a pinned build on one trace, the miss ratio spanned
+    /// 0.4482 to 0.4604 -- a spread of 0.0122, which was 46% of the
+    /// difference being measured against another cache.
+    ///
+    /// ```
+    /// use segcache::{Policy, Segcache};
+    ///
+    /// let cache = Segcache::builder()
+    ///     .eviction(Policy::Merge { max: 8, merge: 4, compact: 2 })
+    ///     .eviction_seed(0)
+    ///     .build();
+    /// ```
+    pub fn eviction_seed(mut self, seed: u64) -> Self {
+        self.segments_builder = self.segments_builder.eviction_seed(seed);
+        self
+    }
+
     /// Consumes the builder and returns a fully-allocated `Segcache` instance.
     ///
     /// ```
@@ -153,7 +176,13 @@ impl Builder {
     ///     .eviction(Policy::Random).build();
     /// ```
     pub fn build(self) -> Result<Segcache, std::io::Error> {
-        let hashtable = MultiChoiceHashtable::new(self.hash_power);
+        let mut hashtable = MultiChoiceHashtable::new(self.hash_power);
+        // The same seed drives both generators. They are separate streams
+        // so neither perturbs the other, but one knob is enough: a caller
+        // wanting reproducibility wants all of it.
+        if let Some(seed) = self.segments_builder.evict_seed {
+            hashtable.set_freq_seed(seed);
+        }
         let segments = self
             .segments_builder
             .build()

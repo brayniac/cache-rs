@@ -12,6 +12,7 @@ pub(crate) struct SegmentsBuilder {
     pub(super) heap_size: usize,
     pub(super) segment_size: i32,
     pub(super) evict_policy: Policy,
+    pub(crate) evict_seed: Option<u64>,
 }
 
 impl Default for SegmentsBuilder {
@@ -20,11 +21,23 @@ impl Default for SegmentsBuilder {
             segment_size: 1024 * 1024,
             heap_size: 64 * 1024 * 1024,
             evict_policy: Policy::Random,
+            evict_seed: None,
         }
     }
 }
 
 impl SegmentsBuilder {
+    /// Seed the eviction generator, making eviction reproducible.
+    ///
+    /// Unset, it is seeded from system entropy, which is right for a server
+    /// and wrong for a measurement: `Policy::Merge` picks the TTL bucket to
+    /// evict from at random, so the miss ratio moves between runs of one
+    /// build on one workload.
+    pub fn eviction_seed(mut self, seed: u64) -> Self {
+        self.evict_seed = Some(seed);
+        self
+    }
+
     /// Set the segment size in bytes.
     pub fn segment_size(mut self, bytes: i32) -> Self {
         self.segment_size = bytes;

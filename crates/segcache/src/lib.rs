@@ -50,6 +50,10 @@ mod metrics;
 #[cfg(test)]
 mod tests;
 
+// Single-threaded and clock-driven: nothing for a model checker to explore.
+#[cfg(all(test, not(model_checking)))]
+mod ttl_ceiling_tests;
+
 #[cfg(all(test, not(model_checking)))]
 mod pin_failure_tests;
 

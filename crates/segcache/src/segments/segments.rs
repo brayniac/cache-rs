@@ -353,6 +353,27 @@ impl Segments {
         (header.create_at(), header.ttl())
     }
 
+    /// Give a copy destination the creation time of the segment it replaces.
+    ///
+    /// A TTL is a ceiling: the cache may drop an item early, never serve it
+    /// late. Expiry is `create_at + ttl` per segment, on reads as well as on
+    /// reclamation, and a freshly reserved segment is stamped with the
+    /// current time -- so copying items into one without this restarts their
+    /// clock, and every item a merge or an S3-FIFO promotion kept was served
+    /// for a full TTL past the moment it was moved.
+    ///
+    /// Merging s0..sN collapses them into s0: s1..sN are copied in and take
+    /// s0's time, and s0 is the oldest of the run, so everything in it can
+    /// only expire earlier than it would have. The destination is s0 swapped
+    /// out for a compacted copy, which is why it also takes s0's place in the
+    /// chain (`link_dest_before`). An S3-FIFO promotion or second chance is
+    /// the one-segment case. Only `create_at` is inherited: `merge_at` stays
+    /// at the reserve time, so S3-FIFO still queues the destination as new.
+    fn inherit_created(&self, dest: NonZeroU32, src: NonZeroU32) {
+        let created = self.headers[src.get() as usize - 1].create_at();
+        self.headers[dest.get() as usize - 1].set_create_at(created);
+    }
+
     /// Returns the generation counter for a segment. Bumped once per
     /// segment lifecycle, on the transition that ends a *used* incarnation
     /// (`Draining -> Free` or the condemned `AwaitingRelease -> Free`), so
@@ -735,9 +756,23 @@ impl Segments {
     }
 
     /// Link a Reserved copy-destination segment (merge spare / s3fifo target)
-    /// at the front of a chain and publish it as `Relinking`: Reserved ->
-    /// Linking carries the next pointer, the old head's prev is patched, then
-    /// Linking -> Relinking publishes (never the write tail — the tail is Live).
+    /// immediately before `at` -- the source it replaces -- and publish it as
+    /// `Relinking`: Reserved -> Linking carries both links, the neighbours are
+    /// patched (or the bucket head, if `at` was the head), then Linking ->
+    /// Relinking publishes.
+    ///
+    /// In place of the source rather than at the bucket head, because the
+    /// destination carries the source's creation time (`inherit_created`) and
+    /// a chain is oldest-first: expiry walks from the head and stops at the
+    /// first live segment, so a destination ahead of older segments would hold
+    /// them past their deadline. `at` must be claimed (`Draining`) by the
+    /// caller under the bucket's `chain_lock`, so it cannot be unlinked or
+    /// recycled underneath this; being claimed from `Sealed`, it is never the
+    /// write tail, so neither is the destination.
+    ///
+    /// Links are written so an unlocked walker (`find_oldest_seg_in_pool`)
+    /// sees a consistent chain at every step: the destination points at both
+    /// neighbours before either points at it.
     ///
     /// `Relinking` is readable (survivors relinked into the destination via
     /// `cas_location` stay reachable to readers) but NOT evictable (only
@@ -747,22 +782,27 @@ impl Segments {
     /// (`claim_for_drain` CASes from `Sealed`, which a `Relinking` segment is
     /// not). The owner calls `publish_dest_sealed` (Relinking -> Sealed) once
     /// the fill completes, making the destination a legal future candidate.
-    fn link_dest_at_head(&self, this: NonZeroU32, head: Option<NonZeroU32>) {
+    fn link_dest_before(&self, this: NonZeroU32, at: NonZeroU32, bucket: &TtlBucket) {
         let this_idx = this.get() as usize - 1;
+        let at_idx = at.get() as usize - 1;
+        let prev = self.headers[at_idx].prev_seg();
+
         let linking = self.headers[this_idx].cas_metadata(
             State::Reserved,
             State::Linking,
-            Some(head),
-            Some(None),
+            Some(Some(at)),
+            Some(prev),
             Ordering::AcqRel,
         );
-        debug_assert!(linking, "head insert requires a Reserved segment");
+        debug_assert!(linking, "insert requires a Reserved segment");
 
-        if let Some(head_id) = head {
-            let head_idx = head_id.get() as usize - 1;
-            debug_assert!(self.headers[head_idx].prev_seg().is_none());
-            self.headers[head_idx].update_links(None, Some(Some(this)));
+        match prev {
+            Some(prev_id) => {
+                self.headers[prev_id.get() as usize - 1].update_links(Some(Some(this)), None)
+            }
+            None => bucket.set_head(Some(this)),
         }
+        self.headers[at_idx].update_links(None, Some(Some(this)));
 
         let relinking = self.headers[this_idx].cas_metadata(
             State::Linking,
@@ -1628,9 +1668,16 @@ impl Segments {
         // policy lock taken for the merge params below.
         let _chain = ttl_bucket.chain_lock();
 
-        let old_head = ttl_bucket.head();
-        self.link_dest_at_head(spare_id, old_head);
-        ttl_bucket.set_head(Some(spare_id));
+        // Claim s0 before the spare goes in its place: until it is ours, a
+        // concurrent drain can unlink and recycle it, and splicing next to a
+        // recycled segment would corrupt the chain. Losing the claim means
+        // there is nothing to merge here; the spare goes back unpublished.
+        if !self.headers[start.get() as usize - 1].can_evict() || !self.claim_for_drain(start) {
+            self.release_unused(spare_id);
+            return Err(SegmentsError::NoEvictableSegments);
+        }
+        self.inherit_created(spare_id, start);
+        self.link_dest_before(spare_id, start, ttl_bucket);
 
         // Merge state.
         let mut cutoff = 1.0;
@@ -1675,7 +1722,8 @@ impl Segments {
             // can_evict). Header-only — no Segment view / &mut [u8] is derived
             // on the un-claimed candidate (C2). The authoritative claim is the
             // CAS below.
-            if !self.headers[cand_id.get() as usize - 1].can_evict() {
+            // s0 is already claimed, to link the spare in its place.
+            if cand_id != start && !self.headers[cand_id.get() as usize - 1].can_evict() {
                 trace!("stop merge: can't evict candidate segment");
                 break;
             }
@@ -1692,7 +1740,7 @@ impl Segments {
             // not readable) and can cause a transient miss on an item mid-
             // relink (old location unpinnable, new not yet published). Existing
             // pins stay valid. Acceptable under concurrent eviction.
-            if !self.claim_for_drain(cand_id) {
+            if cand_id != start && !self.claim_for_drain(cand_id) {
                 trace!("stop merge: lost drain claim on candidate");
                 break;
             }
@@ -1840,9 +1888,13 @@ impl Segments {
         // path returns earlier without the lock). Held across the copy loop.
         let _chain = ttl_bucket.chain_lock();
 
-        let old_head = ttl_bucket.head();
-        self.link_dest_at_head(spare_id, old_head);
-        ttl_bucket.set_head(Some(spare_id));
+        // Claim s0 before the spare goes in its place (see merge_evict).
+        if !self.headers[start.get() as usize - 1].can_evict() || !self.claim_for_drain(start) {
+            self.release_unused(spare_id);
+            return Err(SegmentsError::NoEvictableSegments);
+        }
+        self.inherit_created(spare_id, start);
+        self.link_dest_before(spare_id, start, ttl_bucket);
 
         // Merge state.
         let mut merged = 0;
@@ -1868,7 +1920,8 @@ impl Segments {
             // Fast advisory pre-check (header-only — no Segment view / &mut [u8]
             // on the un-claimed candidate, C2; authoritative claim is the CAS
             // below).
-            if !self.headers[cand_id.get() as usize - 1].can_evict() {
+            // s0 is already claimed, to link the spare in its place.
+            if cand_id != start && !self.headers[cand_id.get() as usize - 1].can_evict() {
                 trace!("stop merge: can't evict candidate segment");
                 break;
             }
@@ -1886,7 +1939,7 @@ impl Segments {
             // merge_evict (see its comment for the full rationale + the
             // transient-miss behavior note). A lost claim means the candidate
             // was concurrently taken / is no longer Sealed — stop.
-            if !self.claim_for_drain(cand_id) {
+            if cand_id != start && !self.claim_for_drain(cand_id) {
                 trace!("stop merge: lost drain claim on candidate");
                 break;
             }
@@ -2025,14 +2078,14 @@ impl Segments {
         if let Some(tid) = target_id {
             self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
-            // Link the target at the head of the TTL bucket, published as
-            // `Relinking`: readable (promoted survivors stay reachable) but NOT
-            // evictable, so a concurrent evictor can neither select nor
-            // claim_for_drain the target while we fill it (C1). It is never the
-            // write tail (Live == the bucket tail reserve() writes into).
-            let old_head = ttl_bucket.head();
-            self.link_dest_at_head(tid, old_head);
-            ttl_bucket.set_head(Some(tid));
+            // The target replaces the source: its creation time, and its place
+            // in the chain. Published as `Relinking`: readable (promoted
+            // survivors stay reachable) but NOT evictable, so a concurrent
+            // evictor can neither select nor claim_for_drain the target while
+            // we fill it (C1). The source is Draining, so never the write tail,
+            // and neither is the target.
+            self.inherit_created(tid, seg_id);
+            self.link_dest_before(tid, seg_id, ttl_bucket);
 
             self.s3fifo_promote_from(seg_id, tid, hashtable);
 
@@ -2046,9 +2099,8 @@ impl Segments {
         self.s3fifo_ghost_remaining(seg_id, hashtable);
 
         // Finalize the already-Draining source (recycle-or-condemn, NO second
-        // Sealed->Draining CAS). Capture links AFTER link_dest_at_head patched
-        // the source's prev (if the source was the old head, its prev now
-        // points at the freshly linked target) and BEFORE finalize unlinks it.
+        // Sealed->Draining CAS). Capture links AFTER link_dest_before patched
+        // the source's prev (it now points at the freshly linked target) and BEFORE finalize unlinks it.
         let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
         let outcome = self.finalize_drained(seg_id, hashtable, false);
 
@@ -2279,11 +2331,10 @@ impl Segments {
         if let Some(tid) = target_id {
             self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
-            // Head insert as `Relinking`, then seal after the fill (see
-            // s3fifo_evict_admission for the C1 rationale).
-            let old_head = ttl_bucket.head();
-            self.link_dest_at_head(tid, old_head);
-            ttl_bucket.set_head(Some(tid));
+            // In the source's place, with its creation time, as `Relinking`,
+            // then seal after the fill (see s3fifo_evict_admission).
+            self.inherit_created(tid, seg_id);
+            self.link_dest_before(tid, seg_id, ttl_bucket);
 
             // Copy freq > 0 items (same promote logic, but no ghost).
             self.s3fifo_promote_from(seg_id, tid, hashtable);
@@ -2293,7 +2344,7 @@ impl Segments {
         }
 
         // Finalize the already-Draining source (recycle-or-condemn, NO second
-        // Sealed->Draining CAS). Capture links after link_dest_at_head, before
+        // Sealed->Draining CAS). Capture links after link_dest_before, before
         // finalize unlinks it.
         let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
         let outcome = self.finalize_drained(seg_id, hashtable, false);

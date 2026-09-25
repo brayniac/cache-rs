@@ -947,6 +947,15 @@ impl SegmentHeader {
         self.create_at.store(crate::clock::now(), Ordering::Relaxed);
     }
 
+    /// Backdate the creation time, which is what expiry is measured from.
+    ///
+    /// For a segment receiving items copied out of older ones: it must not
+    /// give them a later deadline than the segment they came from.
+    #[inline]
+    pub fn set_create_at(&self, at: Instant) {
+        self.create_at.store(at, Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn merge_at(&self) -> Instant {
         self.merge_at.load(Ordering::Relaxed)

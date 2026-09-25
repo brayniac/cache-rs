@@ -53,7 +53,12 @@ impl TtlBuckets {
         let mut buckets = Vec::with_capacity(TOTAL_BUCKETS);
         for width in &widths {
             for j in 0..BUCKETS_PER_TIER {
-                let ttl = width * j + 1;
+                // The bottom of the range this bucket holds, which is the
+                // shortest TTL any of its items carries: stamping a segment
+                // with anything longer serves those items past their TTL.
+                // Bucket 0 holds 1..width (a zero TTL goes to the last
+                // bucket), so its floor is 1, not 0.
+                let ttl = (width * j).max(1);
                 buckets.push(TtlBucket::new(ttl as i32));
             }
         }

@@ -1247,3 +1247,56 @@ fn clear_churn_does_not_starve_inserts_of_unrelated_keys() {
         starved.unwrap()
     );
 }
+
+/// An insert blocked by a drain stops waiting when the drain finishes, even
+/// if the segment is then condemned to a reader. A condemned segment keeps its
+/// generation and refuses new pins until its last reader drops its `Item`, so
+/// a wait for "readable again or stale" lasts as long as that reader, which
+/// can be the inserting thread itself.
+#[test]
+fn insert_stops_waiting_when_the_drain_condemns_the_segment() {
+    let cache = Arc::new(small_merge_cache(64));
+    let (_loc, seg_id) = insert_and_seal(&cache, b"parked3", b"Vparke3");
+
+    // A reader holds an Item, and so a SegmentGuard, into the segment.
+    let held = cache.get(b"parked3").expect("hit");
+
+    assert!(cache.segments_for_test().claim_for_drain_for_test(seg_id));
+
+    let (tx, rx) = mpsc::channel();
+    let writer = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let ttl = Duration::from_secs(3600);
+            let _ = tx.send(cache.insert(b"parked3", b"Wparke3", None, ttl));
+        })
+    };
+    while cache.insert_drain_waits.load(AtomicOrdering::Relaxed) == 0 {
+        std::thread::yield_now();
+    }
+
+    // The drain finishes: it sweeps the entry and condemns the segment to the
+    // held reader.
+    assert_eq!(
+        cache
+            .segments_for_test()
+            .finalize_drained_for_test(seg_id, &cache.hashtable),
+        ClearOutcome::Deferred
+    );
+    assert_eq!(
+        cache.segments_for_test().header(seg_id).state(),
+        State::AwaitingRelease
+    );
+
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    writer.join().unwrap();
+    assert!(
+        matches!(result, Ok(Ok(()))),
+        "insert was still waiting 5 s after the drain finished: {result:?}"
+    );
+    let item = cache
+        .get(b"parked3")
+        .expect("the insert's value is readable");
+    assert_eq!(item.value(), Value::Bytes(b"Wparke3"));
+}

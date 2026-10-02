@@ -859,17 +859,18 @@ impl Segcache {
     ///
     /// # Termination
     ///
-    /// Exits on either of the two ways an `Unknown` can resolve, and both are
-    /// bounded by the drain, which is bounded straight-line work:
+    /// Waits while the candidate's segment is `Draining` under the same
+    /// incarnation, which is bounded by the drain, which is bounded
+    /// straight-line work. When the drain finishes, the segment is `Free`
+    /// (`resolve` says `None` once the generation is bumped) or condemned to
+    /// its readers (`AwaitingRelease`). Either way the drain has swept or
+    /// relinked the candidate's hashtable entry, so a fresh lookup resolves
+    /// the key at its new location or reports it absent.
     ///
-    /// - **the segment becomes readable again** — the pin probe succeeds, so a
-    ///   fresh lookup can now verify the candidate;
-    /// - **the location goes stale** — `resolve` says `None`, the incarnation
-    ///   is gone, and there is nothing left to wait for: a fresh lookup will
-    ///   resolve the key at its new location or report it absent.
-    ///
-    /// `resolve` is checked first because it is the cheaper question and the
-    /// one that needs no pin.
+    /// The wait does not extend to an `AwaitingRelease` segment becoming
+    /// readable again or stale. It keeps its generation and refuses new pins
+    /// until its last reader drops its `Item`, and that reader can be the
+    /// thread waiting here.
     #[cold]
     #[inline(never)]
     fn wait_out_unverifiable(&self, location: Location) {
@@ -878,8 +879,10 @@ impl Segcache {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let backoff = Backoff::new();
-        while self.segments.resolve(location).is_some()
-            && self.segments.acquire_item_at(location).is_none()
+        while self
+            .segments
+            .resolve(location)
+            .is_some_and(|(seg_id, _)| self.segments.header(seg_id).state() == State::Draining)
         {
             backoff.snooze();
         }

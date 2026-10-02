@@ -92,16 +92,14 @@ fn random_evicts_short_ttl_segment_when_full() {
     );
 }
 
-// ── Bug: compare_fifo sorts by NEWEST first (LIFO) instead of OLDEST (FIFO) ──
+// ── Fifo evicts the oldest segment first ──
 //
-// compare_fifo called lhs_age.cmp(&rhs_age).reverse(). sort_by is ascending,
-// so .reverse() placed the segment with the LARGEST timestamp (most recently
-// created/merged) at index 0, which is the slot evicted first. This is LIFO.
-// Removing .reverse() makes the oldest segment sort first — correct FIFO.
+// Fifo ranks segments ascending by `max(create_at, merge_at)`, and index 0
+// of the ranking is evicted first, so the oldest segment goes first.
 //
 // clocksource::coarse::Instant has 1-second resolution (stored as whole
 // seconds), so we need at least a 1-second sleep to produce timestamps that
-// the comparator can distinguish.
+// the ranking can distinguish.
 
 #[test]
 fn fifo_evicts_oldest_segment_first() {

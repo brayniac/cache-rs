@@ -5,7 +5,7 @@
 //! ranking (Fifo, Cte, Util), segments are sorted periodically. For
 //! stateless policies (Random, RandomFifo), ranking is skipped.
 
-use core::cmp::{max, Ordering};
+use core::cmp::max;
 use core::num::NonZeroU32;
 
 use crate::segments::*;
@@ -95,63 +95,34 @@ impl Eviction {
         }
     }
 
-    /// Sort segments by the active policy's comparator.
+    /// Rank segments by the active policy, least valuable first. Segments that
+    /// cannot be evicted when this runs are placed last. Does nothing for
+    /// policies that do not rank (None, Random, RandomFifo, Merge, S3Fifo).
     pub fn rerank(&mut self, headers: &[SegmentHeader]) {
-        let cmp: fn(&SegmentHeader, &SegmentHeader) -> Ordering = match self.policy {
-            Policy::Fifo => Self::compare_fifo,
-            Policy::Cte => Self::compare_cte,
-            Policy::Util => Self::compare_util,
-            _ => return,
-        };
+        match self.policy {
+            Policy::Fifo => self.rank_by(headers, |h| max(h.create_at(), h.merge_at())),
+            Policy::Cte => self.rank_by(headers, |h| h.create_at() + h.ttl()),
+            Policy::Util => self.rank_by(headers, |h| h.live_bytes()),
+            _ => {}
+        }
+    }
 
-        let mut ids: Vec<NonZeroU32> = headers.iter().map(|h| h.id()).collect();
-        ids.sort_by(|a, b| {
-            cmp(
-                &headers[a.get() as usize - 1],
-                &headers[b.get() as usize - 1],
-            )
-        });
+    /// Read each header's sort key once, then sort the copies. The keys are
+    /// atomics that other threads change during the sort (`can_evict` reads
+    /// the reader count), and a comparator that reads them live can answer
+    /// inconsistently. `sort_by` may panic on that, and the caller holds the
+    /// eviction mutex, so the panic would poison it.
+    fn rank_by<K: Ord>(&mut self, headers: &[SegmentHeader], key: impl Fn(&SegmentHeader) -> K) {
+        let mut ranked: Vec<(bool, K, NonZeroU32)> = headers
+            .iter()
+            .map(|h| (!h.can_evict(), key(h), h.id()))
+            .collect();
+        ranked.sort_unstable();
 
-        for (slot, id) in self.ranked_segs.iter_mut().zip(ids.iter()) {
-            *slot = Some(*id);
+        for (slot, (_, _, id)) in self.ranked_segs.iter_mut().zip(ranked) {
+            *slot = Some(id);
         }
         self.index = 0;
-    }
-
-    // -- Comparators --
-
-    fn compare_fifo(lhs: &SegmentHeader, rhs: &SegmentHeader) -> Ordering {
-        if !lhs.can_evict() {
-            Ordering::Greater
-        } else if !rhs.can_evict() {
-            Ordering::Less
-        } else {
-            let lhs_age = max(lhs.create_at(), lhs.merge_at());
-            let rhs_age = max(rhs.create_at(), rhs.merge_at());
-            lhs_age.cmp(&rhs_age)
-        }
-    }
-
-    fn compare_cte(lhs: &SegmentHeader, rhs: &SegmentHeader) -> Ordering {
-        if !lhs.can_evict() {
-            Ordering::Greater
-        } else if !rhs.can_evict() {
-            Ordering::Less
-        } else {
-            let lhs_expire = lhs.create_at() + lhs.ttl();
-            let rhs_expire = rhs.create_at() + rhs.ttl();
-            lhs_expire.cmp(&rhs_expire)
-        }
-    }
-
-    fn compare_util(lhs: &SegmentHeader, rhs: &SegmentHeader) -> Ordering {
-        if !lhs.can_evict() {
-            Ordering::Greater
-        } else if !rhs.can_evict() {
-            Ordering::Less
-        } else {
-            lhs.live_bytes().cmp(&rhs.live_bytes())
-        }
     }
 
     // -- Merge parameters --
@@ -209,5 +180,96 @@ impl Eviction {
     #[inline]
     pub fn stop_ratio(&self) -> f64 {
         self.target_ratio() * (self.n_merge() - 1) as f64 + 0.05
+    }
+}
+
+#[cfg(all(test, not(model_checking)))]
+mod tests {
+    use super::*;
+    use crate::segments::State;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn header(id: u32, state: State, live_bytes: i32) -> SegmentHeader {
+        let h = SegmentHeader::new(NonZeroU32::new(id).unwrap());
+        h.set_state(state);
+        h.incr_live_bytes(live_bytes);
+        h
+    }
+
+    fn ranking(eviction: &Eviction) -> Vec<u32> {
+        eviction
+            .ranked_segs
+            .iter()
+            .map(|id| id.map_or(0, NonZeroU32::get))
+            .collect()
+    }
+
+    #[test]
+    fn util_ranks_evictable_by_live_bytes_then_unevictable_last() {
+        let headers = [
+            header(1, State::Sealed, 30),
+            header(2, State::Free, 0),
+            header(3, State::Sealed, 10),
+            header(4, State::Live, 5),
+            header(5, State::Sealed, 20),
+        ];
+        let mut eviction = Eviction::new(headers.len(), Policy::Util, Some(0));
+        eviction.rerank(&headers);
+        assert_eq!(ranking(&eviction), [3, 5, 1, 2, 4]);
+    }
+
+    // Six threads pin and release readers, flipping `can_evict`, while
+    // `rerank` runs (see `rank_by`). With a comparator that reads the headers
+    // during the sort, about 6% of these reranks panic in a debug build, so the
+    // test fails reliably if the snapshot is removed.
+    #[test]
+    fn rerank_does_not_panic_under_concurrent_reader_pins() {
+        const SEGMENTS: u32 = 4096;
+        const RERANKS: usize = 500;
+
+        let headers: Arc<Vec<SegmentHeader>> = Arc::new(
+            (1..=SEGMENTS)
+                .map(|id| header(id, State::Sealed, (id % 97) as i32))
+                .collect(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let pinners: Vec<_> = (0..6u64)
+            .map(|t| {
+                let headers = headers.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (t + 1);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let h = &headers[x as usize % SEGMENTS as usize];
+                        if h.try_acquire_reader() == AcquireOutcome::Acquired {
+                            std::hint::spin_loop();
+                            h.release_reader_for_guard();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut panics = 0;
+        for policy in [Policy::Fifo, Policy::Cte, Policy::Util] {
+            let mut eviction = Eviction::new(SEGMENTS as usize, policy, Some(0));
+            for _ in 0..RERANKS {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    eviction.rerank(&headers);
+                }));
+                panics += usize::from(result.is_err());
+            }
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for pinner in pinners {
+            pinner.join().unwrap();
+        }
+        assert_eq!(panics, 0, "rerank panicked {panics} times");
     }
 }

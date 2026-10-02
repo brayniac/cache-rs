@@ -21,7 +21,7 @@ use crate::segments::SegmentHeader;
 /// is the same contract `RawItem` already has with the segment data.
 pub(crate) struct SegmentGuard {
     header: *const SegmentHeader,
-    free_queue: *const crate::sync::SegmentQueue,
+    free_queue: *const crate::segments::FreeQueue,
 }
 
 impl SegmentGuard {
@@ -33,11 +33,11 @@ impl SegmentGuard {
     ///   `AcquireOutcome::Acquired` on `header`, and ownership of that pin
     ///   transfers to this guard.
     /// - `header` must point into the `Segments` headers allocation and
-    ///   `free_queue` at the `Segments`-owned boxed Injector; both must
+    ///   `free_queue` at the `Segments`-owned boxed `FreeQueue`; both must
     ///   outlive the guard.
     pub(crate) unsafe fn new(
         header: *const SegmentHeader,
-        free_queue: *const crate::sync::SegmentQueue,
+        free_queue: *const crate::segments::FreeQueue,
     ) -> Self {
         Self { header, free_queue }
     }
@@ -84,7 +84,7 @@ impl Drop for SegmentGuard {
             // see or update the spare queue/count. A segment freed here
             // always lands in the free queue; the held-back spare
             // self-heals on the next unpinned `recycle`/`condemn` return.
-            unsafe { (*self.free_queue).push(header.id().get()) };
+            unsafe { (*self.free_queue).push_freed(header.id().get()) };
 
             #[cfg(feature = "metrics")]
             {

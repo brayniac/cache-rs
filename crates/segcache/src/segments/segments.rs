@@ -38,7 +38,7 @@ pub(crate) struct Segments {
     /// Lock-free free segment queue. Boxed for a stable address: guards
     /// hold a raw pointer to it so the AwaitingRelease handoff can return
     /// segments without `&mut Segments`.
-    free_queue: Box<crate::sync::SegmentQueue>,
+    free_queue: Box<FreeQueue>,
     /// Held-back spare segments for merge compaction. Never handed out by
     /// `reserve_free` (normal writes), so a destination is always available
     /// to merge even when the main free queue is empty.
@@ -73,6 +73,18 @@ pub(crate) struct Segments {
     admission_cap: u32,
     /// Current number of segments in the admission pool.
     admission_count: crate::sync::AtomicU32,
+    /// Calls to `evict` started and finished since construction.
+    evicts_started: crate::sync::AtomicU64,
+    evicts_finished: crate::sync::AtomicU64,
+}
+
+/// Counts an `evict` call as finished when it returns, on every path.
+struct EvictFinished<'a>(&'a crate::sync::AtomicU64);
+
+impl Drop for EvictFinished<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Result of draining a segment: `Freed` means it was returned to the
@@ -186,7 +198,7 @@ impl Segments {
         // Initialize each segment and fill the free/spare queues. Segments
         // rest in the Free state with no chain links; both queues are
         // lock-free Injectors rather than intrusive lists.
-        let free_queue = Box::new(crate::sync::SegmentQueue::new());
+        let free_queue = Box::new(FreeQueue::new());
         let spare_queue = Box::new(crate::sync::SegmentQueue::new());
         for idx in 0..segments {
             let begin = segment_size as usize * idx;
@@ -232,6 +244,8 @@ impl Segments {
             )),
             admission_cap,
             admission_count: crate::sync::AtomicU32::new(0),
+            evicts_started: crate::sync::AtomicU64::new(0),
+            evicts_finished: crate::sync::AtomicU64::new(0),
         })
     }
 
@@ -339,15 +353,39 @@ impl Segments {
         self.free_queue.len() + self.spare_queue.len()
     }
 
-    /// Segments available to normal writes (the general free queue only,
-    /// excluding the held-back spare). Used by `reserve_and_define` as an
-    /// eviction-progress signal: if an `evict()` pass does not raise this, it
-    /// freed nothing a reserve can use (e.g. a merge that only refilled the
-    /// spare), so the retry loop must not spin on it. `Injector::len` is an
-    /// estimate, which is fine here — a stale read only costs a bounded extra
-    /// retry or an early give-up, never an unbounded loop.
-    pub(crate) fn free_queue_len(&self) -> usize {
-        self.free_queue.len()
+    /// Count an eviction as running until the returned guard is dropped, as
+    /// `evict` does, so a test can stand in for an eviction on another thread.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) fn begin_evict_for_test(&self) -> impl Drop + '_ {
+        self.evicts_started.fetch_add(1, Ordering::Relaxed);
+        EvictFinished(&self.evicts_finished)
+    }
+
+    /// Number of segments freed onto the free queue since construction,
+    /// by a drain or by the last reader of a condemned segment. Compare two
+    /// readings to tell whether any segment was freed in between.
+    pub(crate) fn freed_count(&self) -> u64 {
+        self.free_queue.freed()
+    }
+
+    /// Wait until as many `evict` calls have finished as had started when
+    /// this was called, or until a segment is freed after `freed_before` was
+    /// read. Returns whether a segment was freed.
+    ///
+    /// Evictions that start after this call do not extend the wait. The
+    /// counts are totals, so a later eviction that finishes first also
+    /// counts, and the wait can return while an eviction that was running at
+    /// the call is still running.
+    pub(crate) fn wait_for_running_evictions(&self, freed_before: u64) -> bool {
+        let started = self.evicts_started.load(Ordering::Relaxed);
+        let backoff = Backoff::new();
+        while self.evicts_finished.load(Ordering::Acquire) < started {
+            if self.freed_count() != freed_before {
+                return true;
+            }
+            backoff.snooze();
+        }
+        self.freed_count() != freed_before
     }
 
     /// Returns the number of segments available to normal writes (free
@@ -1020,7 +1058,7 @@ impl Segments {
         let mut count = self.spare_count.load(Ordering::Relaxed);
         loop {
             if count >= self.spare_capacity {
-                self.free_queue.push(id);
+                self.free_queue.push_freed(id);
                 return;
             }
             match self.spare_count.compare_exchange_weak(
@@ -1335,17 +1373,20 @@ impl Segments {
         }
     }
 
-    /// Perform eviction based on the configured eviction policy. A success
-    /// indicates that a segment was put onto the free queue and `reserve_free()`
-    /// should return some segment id.
+    /// Perform eviction based on the configured eviction policy. Returns `Ok`
+    /// when the pass drained at least one segment. The segment may have gone
+    /// to the merge spare rather than the free queue, or been taken by
+    /// another reserve, so `Ok` does not mean `reserve_free` will succeed.
     pub fn evict(
         &self,
         ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
+        self.evicts_started.fetch_add(1, Ordering::Relaxed);
+        let _finished = EvictFinished(&self.evicts_finished);
+
         // Cheap path first: drop whole expired segments (no spare, no
-        // copy). If any segment frees, a subsequent reserve_free will now
-        // succeed, and the spare-consuming merge is skipped entirely.
+        // copy). If any segment frees, return without running the policy.
         if ttl_buckets.expire(hashtable, self) > 0 {
             return Ok(());
         }

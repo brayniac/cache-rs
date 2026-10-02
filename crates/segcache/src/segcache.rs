@@ -10,6 +10,9 @@ use core::num::NonZeroU32;
 use crossbeam_utils::Backoff;
 use std::cmp::min;
 
+/// Eviction passes that free no segment `reserve_and_define` tolerates before
+/// returning `NoFreeSegments`; also the attempt cap for the `cas` and
+/// `try_into_numeric` freshness retries.
 const RESERVE_RETRIES: usize = 3;
 
 /// How many post-pin revalidation mismatches `get_pinned` tolerates before it
@@ -24,8 +27,8 @@ const RESERVE_RETRIES: usize = 3;
 /// key, and this is the library's hottest path. So the loop keeps a hard cap.
 ///
 /// The cap is its own constant rather than `RESERVE_RETRIES` because it bounds
-/// a different thing (concurrent republications of one key, not reservation
-/// attempts), and because 3 is far too tight: with retries that CONVERGE on
+/// a different thing (concurrent republications of one key, not eviction
+/// passes), and because 3 is far too tight: with retries that CONVERGE on
 /// the location the revalidation just returned, exhausting the budget needs 16
 /// consecutive republications each landing inside a pin+lookup window. At the
 /// ~1% per-attempt mismatch rate measured on the worst realistic workload
@@ -520,7 +523,7 @@ impl Segcache {
     /// bound the same thing (how many times ONE `get` re-attempts because the
     /// world moved under it, one pin apiece), so a single counter is what caps
     /// a `get` at `REVALIDATE_RETRIES` pins no matter how an adversary mixes the
-    /// arms. `RESERVE_RETRIES` bounds reservation attempts on the write path;
+    /// arms. `RESERVE_RETRIES` bounds the write path's eviction passes that free no segment;
     /// #68 split the read path's budget out of it precisely because 3 is far too
     /// tight for a live key, and re-coupling this arm to it would re-introduce
     /// the false miss on the other face of the same window.
@@ -979,21 +982,20 @@ impl Segcache {
                     return Err(SegcacheError::ItemOversized { size });
                 }
                 Err(TtlBucketsError::NoFreeSegments) => {
-                    // Try to make room. Count a retry unless eviction actually
-                    // raised the general free queue — i.e. produced a segment a
-                    // reserve can use. An `evict()` that returns Ok but frees
-                    // nothing usable (e.g. a merge pass that only refills the
-                    // spare) must NOT grant an unbounded free retry, or this
-                    // loop livelocks; bounding it turns "can't make room" into a
-                    // NoFreeSegments error instead of a hang.
-                    let before = self.segments.free_queue_len();
-                    let evicted = self
-                        .segments
-                        .evict(&self.ttl_buckets, &self.hashtable)
-                        .is_ok();
-                    if evicted && self.segments.free_queue_len() > before {
-                        // A segment became available to normal writes — retry
-                        // the reserve without spending a retry.
+                    // Evict, then retry without spending a retry if any
+                    // segment was freed since `freed_before`, on this thread
+                    // or another, including one another reserve has since
+                    // taken. Otherwise wait for the evictions counted as
+                    // running (see `wait_for_running_evictions`), and spend a
+                    // retry if none of them freed one. A pass that only
+                    // refills the merge spare frees nothing to the free
+                    // queue. The number of passes is not bounded while other
+                    // threads keep freeing segments.
+                    let freed_before = self.segments.freed_count();
+                    let _ = self.segments.evict(&self.ttl_buckets, &self.hashtable);
+                    if self.segments.freed_count() != freed_before
+                        || self.segments.wait_for_running_evictions(freed_before)
+                    {
                         continue;
                     }
 

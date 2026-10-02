@@ -96,6 +96,32 @@ pub(crate) enum AllocOutcome {
     NotWritable,
 }
 
+/// Test-only hook in [`Segments::lock_sealed_in_bucket`], between the TTL
+/// read that picks a bucket and the `chain_lock` acquisition. A test installs
+/// a closure that drains the segment and reuses it in another bucket, which
+/// puts the interleaving the membership check exists for on one thread.
+///
+/// The hook is taken when it fires, so it runs once even if the closure
+/// itself reaches eviction.
+#[cfg(all(test, not(model_checking)))]
+pub(crate) mod chain_lock_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_LOCK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn on_before_lock(f: impl FnOnce() + 'static) {
+        BEFORE_LOCK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(crate) fn before_lock() {
+        if let Some(hook) = BEFORE_LOCK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+}
+
 impl Segments {
     /// Allocate and initialize segments by consuming the builder. The backing
     /// heap is an anonymous mmap region instead of a boxed slice so that large
@@ -1025,6 +1051,45 @@ impl Segments {
 
     // ── Eviction ─────────────────────────────────────────────────────
 
+    /// Whether `id` is a `Sealed` segment in `ttl_bucket`'s chain. Call it
+    /// with that bucket's `chain_lock` held, immediately before claiming `id`.
+    /// If it returns true and the claim then wins, `id` is in this bucket's
+    /// chain.
+    ///
+    /// A caller picks the bucket from the segment's TTL, or from a stored
+    /// segment id, before it takes the lock. In between, the segment can be
+    /// drained, freed, and reused by another bucket, and its `Sealed ->
+    /// Draining` claim would still succeed on the new incarnation, in a chain
+    /// this thread has not locked.
+    ///
+    /// A segment joins or leaves a chain, and enters or leaves `Sealed`, only
+    /// under that chain's lock, and its TTL is written only while it is
+    /// `Reserved`. The Acquire state load makes the TTL read return this
+    /// incarnation's TTL or a later one. A later one can be this bucket's TTL
+    /// on a segment that `try_expand` has reserved and is waiting on this lock
+    /// to link. The answer is then true for a `Reserved` segment, and the
+    /// claim CAS fails on it.
+    fn is_sealed_member(&self, id: NonZeroU32, ttl_bucket: &TtlBucket) -> bool {
+        let header = &self.headers[id.get() as usize - 1];
+        header.state() == State::Sealed && ttl_bucket.holds_ttl(header.ttl())
+    }
+
+    /// Lock the chain of the bucket that segment `id` belongs to. Returns the
+    /// bucket and the guard, or `None` if `id` is not a `Sealed` member of
+    /// that bucket once the lock is held (see [`Self::is_sealed_member`]).
+    fn lock_sealed_in_bucket<'b>(
+        &self,
+        id: NonZeroU32,
+        ttl_buckets: &'b TtlBuckets,
+    ) -> Option<(&'b TtlBucket, crate::sync::MutexGuard<'b, ()>)> {
+        let ttl_bucket = ttl_buckets.get_bucket(self.headers[id.get() as usize - 1].ttl());
+        #[cfg(all(test, not(model_checking)))]
+        chain_lock_hook::before_lock();
+        let guard = ttl_bucket.chain_lock();
+        self.is_sealed_member(id, ttl_bucket)
+            .then_some((ttl_bucket, guard))
+    }
+
     /// Drain a Sealed segment and return it to the free queue, or
     /// condemn it to the last reader if it is pinned.
     ///
@@ -1061,6 +1126,10 @@ impl Segments {
     /// must win this CAS BEFORE mutating a candidate's data region, so the
     /// `segment()` accessor's exclusivity contract holds even under concurrent
     /// evictors deterministically selecting the same candidate.
+    ///
+    /// Callers hold the chain lock of the bucket `id` is in, and confirm that
+    /// with `is_sealed_member` or by reaching `id` through that chain under
+    /// the lock.
     fn claim_for_drain(&self, id: NonZeroU32) -> bool {
         let id_idx = id.get() as usize - 1;
 
@@ -1124,6 +1193,19 @@ impl Segments {
         hashtable: &MultiChoiceHashtable,
     ) {
         self.s3fifo_promote_from(src_id, dst_id, hashtable, RelinkFreq::Preserve);
+    }
+
+    /// Test-only shim exposing the private `merge_evict`, so
+    /// `bucket_membership_tests` can pass the stale merge cursor the evict loop
+    /// would pass, for a chosen bucket.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) fn merge_evict_for_test(
+        &self,
+        start: NonZeroU32,
+        ttl_bucket: &TtlBucket,
+        hashtable: &MultiChoiceHashtable,
+    ) -> Result<Option<NonZeroU32>, SegmentsError> {
+        self.merge_evict(start, ttl_bucket, hashtable)
     }
 
     /// Test-only shim exposing the private `finalize_drained` (sweep the
@@ -1334,16 +1416,17 @@ impl Segments {
                 SEGMENT_EVICT.increment();
 
                 if let Some(id) = self.least_valuable_seg(ttl_buckets) {
-                    // Resolve the segment's bucket (seg_ttl read before the
-                    // claim) and lock it. LOCK: bucket-chain — the drain
-                    // (finalize_drained unlink/splice) + bucket head fixup are
-                    // serialized on this bucket. Capture links UNDER the lock so
-                    // the head fixup is consistent with the drain. Resolving the
-                    // bucket before clear_segment sidesteps the M1 ttl re-stamp.
+                    // LOCK: bucket-chain — the drain (finalize_drained
+                    // unlink/splice) + bucket head fixup are serialized on the
+                    // segment's bucket. Capture links UNDER the lock so the
+                    // head fixup is consistent with the drain.
+                    let Some((ttl_bucket, _chain)) = self.lock_sealed_in_bucket(id, ttl_buckets)
+                    else {
+                        #[cfg(feature = "metrics")]
+                        EVICT_TIME.add(now.elapsed().as_nanos() as _);
+                        return Err(SegmentsError::EvictFailure);
+                    };
                     let id_idx = id.get() as usize - 1;
-                    let seg_ttl = self.headers[id_idx].ttl();
-                    let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
-                    let _chain = ttl_bucket.chain_lock();
                     let meta = self.headers[id_idx].metadata(crate::sync::Ordering::Acquire);
 
                     let outcome = self.clear_segment(id, hashtable, false);
@@ -1496,15 +1579,13 @@ impl Segments {
             // If the segment is now empty and evictable, free it
             // immediately via the drain/condemn protocol.
             if segment.live_items() == 0 && segment.can_evict() {
-                // Resolve the segment's bucket (seg_ttl read before the claim)
-                // and lock it. LOCK: bucket-chain — the empty-segment drain
+                // LOCK: bucket-chain — the empty-segment drain
                 // (finalize_drained unlink/splice) + head fixup are serialized
-                // on this bucket; resolving the bucket before clear_segment
-                // sidesteps the M1 ttl re-stamp. Capture links under the lock.
-                let id_idx = seg_id.get() as usize - 1;
-                let seg_ttl = self.headers[id_idx].ttl();
-                let ttl_bucket = ttl_buckets.get_bucket(seg_ttl);
-                let _chain = ttl_bucket.chain_lock();
+                // on the segment's bucket. Capture links under the lock.
+                let Some((ttl_bucket, _chain)) = self.lock_sealed_in_bucket(seg_id, ttl_buckets)
+                else {
+                    return Ok(());
+                };
                 let meta = segment.header_metadata();
 
                 if self.clear_segment(seg_id, hashtable, false).is_ok() && meta.prev.is_none() {
@@ -1615,8 +1696,8 @@ impl Segments {
 
     /// Merge a chain of segments starting at `start`, pruning low-frequency
     /// items and copying the survivors into a fresh spare segment. The spare
-    /// is reserved from the held-back spare queue and head-inserted into
-    /// `ttl_bucket` exactly once; every candidate's survivors are appended to
+    /// is reserved from the held-back spare queue and linked into
+    /// `ttl_bucket` in place of `start`, once; every candidate's survivors are appended to
     /// it (reader-safe — bytes are never relocated in place) and the candidate
     /// is then drained via `clear_segment`. Returns the next segment id to
     /// merge from (if any).
@@ -1644,28 +1725,11 @@ impl Segments {
             None => return self.merge_evict_fallback_drop(start, ttl_bucket, hashtable),
         };
 
-        // Configure the spare and head-insert it as `Relinking` exactly ONCE:
-        // readable (so relinked survivors stay reachable) but NOT evictable, so
-        // a concurrent evictor can neither select nor claim_for_drain the spare
-        // while we fill it (C1). It is never the write tail (the tail is Live).
-        // Because the spare is never drained, the bucket head points at it for
-        // the entire candidate loop below — draining a candidate only unlinks
-        // it from the middle of the chain (its neighbours are patched by
-        // finalize_drained's recycle/condemn), so no per-candidate head fixup
-        // is required here. `publish_dest_sealed` seals it after the loop.
-        let src_ttl = self.headers[start.get() as usize - 1].ttl();
-        {
-            let sidx = spare_id.get() as usize - 1;
-            self.headers[sidx].set_ttl(src_ttl);
-            self.headers[sidx].set_pool(SegmentPool::Main);
-            self.headers[sidx].mark_merged();
-        }
-
         // LOCK: bucket-chain — serialize ALL chain-structure mutation of this
-        // bucket (the spare head-insert below + each drained candidate's
+        // bucket (linking the spare in s0's place + each drained candidate's
         // finalize_drained unlink/splice) against concurrent evictors,
         // reservers (try_expand), and drains. Held across the copy loop
-        // (coarse) so a single guard covers both the head-insert and every
+        // (coarse) so a single guard covers both the spare's link and every
         // finalize unlink — recycle/condemn/unlink take NO lock themselves, so
         // there is no re-entrant same-bucket re-lock. The reserve hot path
         // (try_alloc_item) never takes this lock; only the infrequent
@@ -1675,12 +1739,25 @@ impl Segments {
 
         // Claim s0 before the spare goes in its place: until it is ours, a
         // concurrent drain can unlink and recycle it, and splicing next to a
-        // recycled segment would corrupt the chain. Losing the claim means
+        // recycled segment would corrupt the chain. `start` was read before
+        // the lock (the merge cursor or the bucket head) and may have left this
+        // bucket since, so check membership first. Losing the claim means
         // there is nothing to merge here; the spare goes back unpublished.
-        if !self.headers[start.get() as usize - 1].can_evict() || !self.claim_for_drain(start) {
+        if !self.is_sealed_member(start, ttl_bucket)
+            || !self.headers[start.get() as usize - 1].can_evict()
+            || !self.claim_for_drain(start)
+        {
             self.release_unused(spare_id);
             return Err(SegmentsError::NoEvictableSegments);
         }
+        // Configure the spare and link it in s0's place as `Relinking`, once:
+        // readable (so relinked survivors stay reachable) but NOT evictable, so
+        // a concurrent evictor can neither select nor claim_for_drain the spare
+        // while we fill it. It is never the write tail (the tail is Live).
+        // Every candidate follows the spare, so finalize_drained's unlink
+        // always has a predecessor to patch and the loop never fixes the
+        // bucket head. `publish_dest_sealed` seals the spare after the loop.
+        self.configure_spare(spare_id, start);
         self.inherit_created(spare_id, start);
         self.link_dest_before(spare_id, start, ttl_bucket);
 
@@ -1783,8 +1860,8 @@ impl Segments {
             // recycle-or-condemn — NO second Sealed->Draining CAS). An unpinned
             // candidate is recycled, replenishing the spare via return_segment;
             // a pinned candidate is condemned to its last reader. Either way it
-            // leaves the chain, and finalize's unlink patches the neighbours,
-            // so the spare remains the bucket head.
+            // leaves the chain, and finalize's unlink patches the neighbours;
+            // the spare, which precedes every candidate, is never unlinked.
             let _ = self.finalize_drained(cand_id, hashtable, false);
             merged += 1;
         }
@@ -1798,11 +1875,21 @@ impl Segments {
         Ok(next_id)
     }
 
-    /// Graceful degradation when no spare is available: drop the chain head
-    /// whole via the drain machinery, freeing one segment (which also
-    /// replenishes the spare via `return_segment` on the next unpinned
-    /// recycle). No spare was head-inserted, so this path DOES fix the bucket
-    /// head when the dropped segment was itself the head.
+    /// Give a claimed merge's spare the TTL of `start`, the segment it
+    /// replaces, and mark it as a main-pool merge product. Called after the
+    /// claim, so the TTL is that of a segment in the locked bucket.
+    fn configure_spare(&self, spare_id: NonZeroU32, start: NonZeroU32) {
+        let spare = &self.headers[spare_id.get() as usize - 1];
+        spare.set_ttl(self.headers[start.get() as usize - 1].ttl());
+        spare.set_pool(SegmentPool::Main);
+        spare.mark_merged();
+    }
+
+    /// Graceful degradation when no spare is available: drop `start` whole
+    /// via the drain machinery, freeing one segment (which also replenishes
+    /// the spare via `return_segment` on the next unpinned recycle). No spare
+    /// was linked in, so this path DOES fix the bucket head when the dropped
+    /// segment was itself the head.
     fn merge_evict_fallback_drop(
         &self,
         start: NonZeroU32,
@@ -1815,6 +1902,11 @@ impl Segments {
         // acquired the chain_lock, so there is no double-lock. Capture the
         // links under the lock so the head fixup is consistent with the drain.
         let _chain = ttl_bucket.chain_lock();
+        // `start` was read before the lock and may have left this bucket (see
+        // merge_evict).
+        if !self.is_sealed_member(start, ttl_bucket) {
+            return Err(SegmentsError::NoEvictableSegments);
+        }
         let meta = self.headers[start.get() as usize - 1].metadata(Ordering::Acquire);
         let next = meta.next;
         match self.clear_segment(start, hashtable, false) {
@@ -1873,31 +1965,24 @@ impl Segments {
             None => return Ok(None),
         };
 
-        // Configure the spare and head-insert it as `Relinking` exactly ONCE:
-        // same chain-head invariant as merge_evict (see its comment) — readable
-        // but not evictable while we fill it, so a concurrent evictor cannot
-        // select or claim_for_drain the spare (C1); `publish_dest_sealed` seals
-        // it after the loop. The spare is never drained, so no per-candidate
-        // head fixup is needed.
-        let src_ttl = self.headers[start.get() as usize - 1].ttl();
-        {
-            let sidx = spare_id.get() as usize - 1;
-            self.headers[sidx].set_ttl(src_ttl);
-            self.headers[sidx].set_pool(SegmentPool::Main);
-            self.headers[sidx].mark_merged();
-        }
-
         // LOCK: bucket-chain — same rationale as merge_evict: one guard covers
-        // the spare head-insert and every candidate's finalize unlink/splice,
+        // the spare's link and every candidate's finalize unlink/splice,
         // serialized per bucket. Acquired after reserve_spare (the no-spare
         // path returns earlier without the lock). Held across the copy loop.
         let _chain = ttl_bucket.chain_lock();
 
-        // Claim s0 before the spare goes in its place (see merge_evict).
-        if !self.headers[start.get() as usize - 1].can_evict() || !self.claim_for_drain(start) {
+        // Claim s0 before the spare goes in its place. `start` was read before
+        // the lock and may have left this bucket (see merge_evict).
+        if !self.is_sealed_member(start, ttl_bucket)
+            || !self.headers[start.get() as usize - 1].can_evict()
+            || !self.claim_for_drain(start)
+        {
             self.release_unused(spare_id);
             return Err(SegmentsError::NoEvictableSegments);
         }
+        // Configure the spare and link it in s0's place as `Relinking`, once
+        // (see merge_evict); `publish_dest_sealed` seals it after the loop.
+        self.configure_spare(spare_id, start);
         self.inherit_created(spare_id, start);
         self.link_dest_before(spare_id, start, ttl_bucket);
 
@@ -1969,8 +2054,8 @@ impl Segments {
             // recycle-or-condemn — NO second Sealed->Draining CAS). An unpinned
             // candidate is recycled, replenishing the spare via return_segment;
             // a pinned candidate is condemned to its last reader. Either way it
-            // leaves the chain, and finalize's unlink patches the neighbours,
-            // so the spare remains the bucket head.
+            // leaves the chain, and finalize's unlink patches the neighbours;
+            // the spare, which precedes every candidate, is never unlinked.
             let _ = self.finalize_drained(cand_id, hashtable, false);
             merged += 1;
         }
@@ -2043,20 +2128,18 @@ impl Segments {
         ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
-        // Resolve the source's bucket (source and promotion target share
-        // src_ttl's bucket — Bs == Bt) and lock it BEFORE claiming the source.
-        // LOCK: bucket-chain — one guard covers the source claim, the target
-        // head-insert, the source finalize unlink/splice, and the head fixup;
-        // Bs == Bt so no two bucket locks are ever held at once. Held across the
+        // Lock the source's bucket BEFORE claiming the source (source and
+        // promotion target share the bucket — Bs == Bt). LOCK: bucket-chain —
+        // one guard covers the source claim, the target's link in the source's
+        // place, the source finalize unlink/splice, and the head fixup; Bs ==
+        // Bt so no two bucket locks are ever held at once. Held across the
         // promote copy (coarse, single guard); claim_for_drain / finalize
         // primitives take no lock, so no re-entrant same-bucket re-lock.
-        // Resolving the bucket from the pre-claim ttl is safe: on a lost claim
-        // nothing is mutated (no target reserved yet), and if the source's ttl
-        // changed under us the claim CAS simply fails.
+        let Some((ttl_bucket, _chain)) = self.lock_sealed_in_bucket(seg_id, ttl_buckets) else {
+            return Err(SegmentsError::EvictFailure);
+        };
         let id_idx = seg_id.get() as usize - 1;
         let src_ttl = self.headers[id_idx].ttl();
-        let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
-        let _chain = ttl_bucket.chain_lock();
 
         // Drain-first: claim the source's Sealed->Draining CAS BEFORE promoting
         // items out of it (s3fifo_promote_from calls remove_item_at on src).
@@ -2310,16 +2393,17 @@ impl Segments {
         ttl_buckets: &TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
-        // LOCK: bucket-chain — same structure as s3fifo_evict_admission: resolve
-        // the source's bucket (Bs == Bt, both src_ttl's bucket) and lock it
-        // BEFORE claiming the source; the guard covers the source claim, the
-        // target head-insert, the source finalize unlink/splice, and the head
-        // fixup. No two bucket locks held at once. Held across the promote copy
-        // (coarse, single guard).
+        // LOCK: bucket-chain — same structure as s3fifo_evict_admission: lock
+        // the source's bucket (Bs == Bt) BEFORE claiming the source; the guard
+        // covers the source claim, the target's link in the source's place, the
+        // source finalize unlink/splice, and the head fixup. No two bucket
+        // locks held at once.
+        // Held across the promote copy (coarse, single guard).
+        let Some((ttl_bucket, _chain)) = self.lock_sealed_in_bucket(seg_id, ttl_buckets) else {
+            return Err(SegmentsError::EvictFailure);
+        };
         let id_idx = seg_id.get() as usize - 1;
         let src_ttl = self.headers[id_idx].ttl();
-        let ttl_bucket = ttl_buckets.get_bucket(src_ttl);
-        let _chain = ttl_bucket.chain_lock();
 
         // Drain-first: claim the source's Sealed->Draining CAS UNDER the
         // chain_lock (symmetric with every other evict/drain path — see

@@ -132,10 +132,19 @@ impl TtlBucket {
         self.nseg.load(Ordering::Relaxed)
     }
 
+    /// Whether a segment with TTL `ttl` belongs to this bucket. A segment in
+    /// this bucket's chain carries exactly the bucket's TTL: `try_expand`
+    /// stamps it, and a copy destination takes its source's. Every bucket
+    /// `get_bucket` returns has a distinct `ttl`, so the TTL identifies the
+    /// bucket.
+    pub(crate) fn holds_ttl(&self, ttl: Duration) -> bool {
+        ttl.as_secs() == self.ttl as u32
+    }
+
     /// Next segment to merge (for merge eviction policy).
-    /// Relaxed: a soft merge-resume hint; concurrent `&self` evictors may race
-    /// it harmlessly — the `Sealed->Draining` claim CAS, not this field, guards
-    /// candidate mutation (spec §1: redundant selection is harmless).
+    /// Relaxed: a soft merge-resume hint. A stale value is harmless because
+    /// `merge_evict` checks `start`'s bucket membership under the chain lock
+    /// before the `Sealed -> Draining` claim.
     pub fn next_to_merge(&self) -> Option<NonZeroU32> {
         NonZeroU32::new(self.next_to_merge.load(Ordering::Relaxed))
     }
@@ -328,7 +337,8 @@ impl TtlBucket {
         // link the new segment + set_tail/set_head) mutates this bucket's chain
         // structure and must serialize against concurrent eviction/drain
         // surgery on the same bucket. Held across the election so a merge's
-        // head-insert or a drain's unlink cannot interleave with the seal. The
+        // link of a copy destination or a drain's unlink cannot interleave
+        // with the seal. The
         // reserve hot path (`try_alloc_item`) never reaches here. Under this
         // lock at most one expander runs at a time, so the loser's spin-wait
         // for the winner's tail publish is always immediately satisfied (the

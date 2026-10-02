@@ -26,6 +26,8 @@ pub(crate) use guard::SegmentGuard;
 pub(crate) use header::{AcquireOutcome, SegmentHeader, SegmentPool};
 pub(crate) use remover_pin::RemoverPin;
 pub(crate) use segment::Segment;
+#[cfg(all(test, not(model_checking)))]
+pub(crate) use segments::chain_lock_hook;
 pub(crate) use segments::{AllocOutcome, ClearOutcome, Segments};
 pub(crate) use state::State;
 pub(crate) use writer_pin::WriterPin;

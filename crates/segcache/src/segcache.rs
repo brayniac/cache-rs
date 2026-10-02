@@ -958,16 +958,20 @@ impl Segcache {
             {
                 Ok(mut reserved_item) => {
                     reserved_item.define(key, value, optional);
-                    // Set the segment pool for S3-FIFO (only transitions
-                    // Main→Admission need a counter update; fresh segments
-                    // default to Main)
-                    if let Ok(seg) = self.segments.segment(reserved_item.seg()) {
-                        if target_pool == SegmentPool::Admission
-                            && seg.pool() != SegmentPool::Admission
-                        {
-                            seg.set_pool(target_pool);
-                            self.segments.incr_pool(SegmentPool::Admission);
-                        }
+                    // Label the segment admission-pool for S3-FIFO. Fresh
+                    // segments are labelled Main, and several inserts can
+                    // land in the same one, so only the insert whose CAS
+                    // changes the label counts it. This runs while
+                    // `reserved_item` holds the segment's writer pin;
+                    // `recycle` and `condemn` run only after the drain claim
+                    // sees no writers, so they read this label.
+                    if target_pool == SegmentPool::Admission
+                        && self
+                            .segments
+                            .header(reserved_item.seg())
+                            .cas_pool(SegmentPool::Main, SegmentPool::Admission)
+                    {
+                        self.segments.incr_pool(SegmentPool::Admission);
                     }
                     return Ok(reserved_item);
                 }

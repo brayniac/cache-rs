@@ -251,11 +251,17 @@ fn s3fifo_main_eviction_does_not_claim_a_segment_reused_in_another_bucket() {
     // Label `x` main-pool so eviction finds no admission candidate and takes
     // the main-pool path. The hook restores the label before `x` is freed, so
     // the admission count stays balanced.
-    cache.segments.header(x).set_pool(SegmentPool::Main);
+    cache
+        .segments
+        .header(x)
+        .set_pool_for_test(SegmentPool::Main);
     let a_head = cache.segments.header(x).next_seg();
     let hooked = Rc::clone(&cache);
     chain_lock_hook::on_before_lock(move || {
-        hooked.segments.header(x).set_pool(SegmentPool::Admission);
+        hooked
+            .segments
+            .header(x)
+            .set_pool_for_test(SegmentPool::Admission);
         reuse_in_b(&hooked, x, 0);
     });
 

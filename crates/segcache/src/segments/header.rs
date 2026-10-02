@@ -1026,9 +1026,27 @@ impl SegmentHeader {
         SegmentPool::from_u8(self.pool.load(Ordering::Relaxed))
     }
 
+    /// Label the segment `Main`. Used when a segment leaves service or is
+    /// taken as a copy destination; the caller adjusts the admission count.
     #[inline]
-    pub fn set_pool(&self, pool: SegmentPool) {
+    pub fn reset_pool(&self) {
+        self.pool.store(SegmentPool::Main as u8, Ordering::Relaxed);
+    }
+
+    /// Set the pool label without counting it.
+    #[cfg(all(test, not(model_checking)))]
+    pub fn set_pool_for_test(&self, pool: SegmentPool) {
         self.pool.store(pool as u8, Ordering::Relaxed);
+    }
+
+    /// Change the pool label from `from` to `to`. Returns `true` only for the
+    /// call that changed the label, so of several threads making the same
+    /// transition at most one sees `true`.
+    #[inline]
+    pub fn cas_pool(&self, from: SegmentPool, to: SegmentPool) -> bool {
+        self.pool
+            .compare_exchange(from as u8, to as u8, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 }
 

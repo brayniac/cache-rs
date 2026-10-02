@@ -247,7 +247,14 @@ impl Segments {
         }
     }
 
-    /// Track a segment transitioning to the given pool.
+    /// Number of segments counted in the admission pool.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) fn admission_count_for_test(&self) -> u32 {
+        self.admission_count.load(Ordering::Relaxed)
+    }
+
+    /// Count a segment the caller moved into `pool`. Only `Admission` is
+    /// counted; call once per successful `cas_pool(Main, Admission)`.
     pub(crate) fn incr_pool(&self, pool: SegmentPool) {
         if pool == SegmentPool::Admission {
             self.admission_count.fetch_add(1, Ordering::Relaxed);
@@ -903,7 +910,7 @@ impl Segments {
             let prev = self.admission_count.fetch_sub(1, Ordering::Relaxed);
             debug_assert!(prev > 0, "admission_count underflowed in recycle");
         }
-        self.headers[id_idx].set_pool(SegmentPool::Main);
+        self.headers[id_idx].reset_pool();
 
         // Reset the write statistics while the segment is still exclusively
         // ours (Draining, reader count observed zero): removals that
@@ -1283,7 +1290,7 @@ impl Segments {
             let prev_count = self.admission_count.fetch_sub(1, Ordering::Relaxed);
             debug_assert!(prev_count > 0, "admission_count underflowed in condemn");
         }
-        self.headers[id_idx].set_pool(SegmentPool::Main);
+        self.headers[id_idx].reset_pool();
 
         let condemned = self.headers[id_idx].cas_condemn();
         debug_assert!(condemned, "condemned a segment that was not Draining");
@@ -1881,7 +1888,7 @@ impl Segments {
     fn configure_spare(&self, spare_id: NonZeroU32, start: NonZeroU32) {
         let spare = &self.headers[spare_id.get() as usize - 1];
         spare.set_ttl(self.headers[start.get() as usize - 1].ttl());
-        spare.set_pool(SegmentPool::Main);
+        spare.reset_pool();
         spare.mark_merged();
     }
 
@@ -2164,7 +2171,7 @@ impl Segments {
         let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
-            self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
+            self.headers[tid.get() as usize - 1].reset_pool();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
             // The target replaces the source: its creation time, and its place
             // in the chain. Published as `Relinking`: readable (promoted
@@ -2419,7 +2426,7 @@ impl Segments {
         let target_id = self.reserve_free();
 
         if let Some(tid) = target_id {
-            self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
+            self.headers[tid.get() as usize - 1].reset_pool();
             self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
             // In the source's place, with its creation time, as `Relinking`,
             // then seal after the fill (see s3fifo_evict_admission).

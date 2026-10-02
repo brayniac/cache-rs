@@ -10,9 +10,9 @@ use core::num::NonZeroU32;
 use crossbeam_utils::Backoff;
 use std::cmp::min;
 
-/// Eviction passes that free no segment `reserve_and_define` tolerates before
-/// returning `NoFreeSegments`; also the attempt cap for the `cas` and
-/// `try_into_numeric` freshness retries.
+/// Number of eviction passes that free no segment after which
+/// `reserve_and_define` returns `NoFreeSegments`; also the attempt cap for the
+/// `cas` and `try_into_numeric` freshness retries.
 const RESERVE_RETRIES: usize = 3;
 
 /// How many post-pin revalidation mismatches `get_pinned` tolerates before it
@@ -932,8 +932,8 @@ impl Segcache {
 
         // For S3-FIFO: route the item by ghost-queue membership (a recently
         // evicted key skips the admission pool), then ensure the target pool
-        // has room by evicting from it if it's at capacity — this enforces
-        // the small/main ratio computed at construction time.
+        // has room by evicting from it if it's at capacity — this keeps the
+        // admission pool near the cap computed at construction time.
         let mut target_pool = SegmentPool::Main;
         if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. }) {
             let hash = {
@@ -987,7 +987,7 @@ impl Segcache {
                     // or another, including one another reserve has since
                     // taken. Otherwise wait for the evictions counted as
                     // running (see `wait_for_running_evictions`), and spend a
-                    // retry if none of them freed one. A pass that only
+                    // retry if no segment was freed by the time they finish. A pass that only
                     // refills the merge spare frees nothing to the free
                     // queue. The number of passes is not bounded while other
                     // threads keep freeing segments.

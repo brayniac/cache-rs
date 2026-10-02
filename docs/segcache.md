@@ -146,7 +146,7 @@ The `S3Fifo` policy ([detailed description](s3fifo.md)) — referred to as **S3-
 - **Main pool**: Proven items. Eviction uses CLOCK-style second chance — items with `freq > 0` are copied to a fresh main segment, items with `freq == 0` are dropped.
 - **Ghost queue**: A fixed-size set of key hashes. When a newly inserted key matches a ghost entry, it bypasses admission and goes directly to main.
 
-The pool split is configured via `admission_ratio` (0.0–1.0, default 0.10). The exact number of admission-pool segments is computed at construction time (`round(total_segments * admission_ratio)`) and enforced as a hard cap on every insert via an O(1) counter check.
+The pool split is configured via `admission_ratio` (0.0–1.0, default 0.10). The exact number of admission-pool segments is computed at construction time (`round(total_segments * admission_ratio)`) and checked on every admission insert via an O(1) counter; the cap is soft (see s3fifo.md).
 
 The pool distinction is a single byte in the segment header (using existing padding). The promotion/retention copying reuses the same `relink_item` + `copy_nonoverlapping` machinery that `Merge` uses for segment merging.
 

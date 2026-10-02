@@ -11,8 +11,8 @@ use crate::segments::SegmentHeader;
 ///
 /// The guard completes that handoff: when the LAST pin drops on a
 /// condemned segment, the guard's drop transitions it AwaitingRelease ->
-/// Free and returns it to the free queue directly — no `&mut Segments`
-/// pass required. The transition CAS guarantees exactly-one-free among the
+/// Free and returns it to the free queue directly, counting it
+/// (`FreeQueue::push_freed`) — no `&mut Segments` pass required. The transition CAS guarantees exactly-one-free among the
 /// three claimants: a racing last-guard drop, the condemner's recheck, and
 /// the backout of an acquire that failed after its increment.
 ///
@@ -82,8 +82,8 @@ impl Drop for SegmentGuard {
             // helper: this guard only holds a raw pointer to the free
             // queue (see the struct doc), not `&Segments`, so it cannot
             // see or update the spare queue/count. A segment freed here
-            // always lands in the free queue; the held-back spare
-            // self-heals on the next unpinned `recycle`/`condemn` return.
+            // always lands in the free queue; the spare queue is refilled by
+            // the next `return_segment` call.
             unsafe { (*self.free_queue).push_freed(header.id().get()) };
 
             #[cfg(feature = "metrics")]

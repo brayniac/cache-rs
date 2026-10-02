@@ -53,6 +53,20 @@ fn fill(cache: &Segcache, segments: usize) -> Vec<core::num::NonZeroU32> {
     chain
 }
 
+/// Wait until an `evict` call has started since `baseline` was read, which
+/// is the writer's own, so a test frees segments only after the writer has
+/// started waiting.
+fn wait_for_writer_eviction(cache: &Segcache, baseline: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while cache.segments.evicts_started_for_test() <= baseline {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never reached eviction"
+        );
+        std::thread::yield_now();
+    }
+}
+
 // Another eviction holds every evictable segment, so this thread's own
 // eviction finds nothing. The insert must wait, and must go ahead as soon as
 // a segment is freed, while that eviction is still running.
@@ -70,6 +84,7 @@ fn insert_waits_for_a_running_eviction_instead_of_failing() {
         assert!(cache.segments.claim_for_drain_for_test(s));
     }
 
+    let baseline = cache.segments.evicts_started_for_test();
     let (tx, rx) = mpsc::channel();
     let writer = {
         let cache = Arc::clone(&cache);
@@ -80,6 +95,7 @@ fn insert_waits_for_a_running_eviction_instead_of_failing() {
 
     // Nothing can be evicted or freed until the running eviction drains its
     // segments, so the insert must still be waiting.
+    wait_for_writer_eviction(&cache, baseline);
     match rx.recv_timeout(Duration::from_secs(1)) {
         Err(mpsc::RecvTimeoutError::Timeout) => {}
         other => panic!("insert returned while an eviction was running: {other:?}"),
@@ -123,7 +139,11 @@ fn insert_counts_a_segment_freed_by_its_last_reader() {
 
     // A reader pins the first Sealed segment.
     let held = cache.get(key(0).as_bytes()).expect("hit");
-    assert_eq!(chain[0], sealed[0]);
+    assert_eq!(
+        cache.segments.header(sealed[0]).ref_count(),
+        1,
+        "the reader must pin the first Sealed segment"
+    );
 
     let running = cache.segments.begin_evict_for_test();
     for &s in sealed {
@@ -153,6 +173,7 @@ fn insert_counts_a_segment_freed_by_its_last_reader() {
     let taken = cache.segments.reserve_free().expect("the freed segment");
     assert_eq!(cache.segments.free_only(), 0);
 
+    let baseline = cache.segments.evicts_started_for_test();
     let (tx, rx) = mpsc::channel();
     let writer = {
         let cache = Arc::clone(&cache);
@@ -160,6 +181,7 @@ fn insert_counts_a_segment_freed_by_its_last_reader() {
             let _ = tx.send(cache.insert(b"new0000", VALUE, None, TTL));
         })
     };
+    wait_for_writer_eviction(&cache, baseline);
     match rx.recv_timeout(Duration::from_secs(1)) {
         Err(mpsc::RecvTimeoutError::Timeout) => {}
         other => panic!("insert returned while nothing was free: {other:?}"),

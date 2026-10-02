@@ -361,9 +361,15 @@ impl Segments {
         EvictFinished(&self.evicts_finished)
     }
 
-    /// Number of segments freed onto the free queue since construction,
-    /// by a drain or by the last reader of a condemned segment. Compare two
-    /// readings to tell whether any segment was freed in between.
+    /// Number of `evict` calls started since construction.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) fn evicts_started_for_test(&self) -> u64 {
+        self.evicts_started.load(Ordering::Relaxed)
+    }
+
+    /// Number of segments `FreeQueue::push_freed` has added since
+    /// construction (see `FreeQueue`). Compare two readings to tell whether
+    /// any segment was freed in between.
     pub(crate) fn freed_count(&self) -> u64 {
         self.free_queue.freed()
     }
@@ -604,8 +610,9 @@ impl Segments {
             }
         }
         // SAFETY: the acquire above succeeded, and both `headers` (a
-        // boxed slice owned by `self`) and the boxed Injector outlive
-        // any guard reachable through the public API.
+        // boxed slice owned by `self`) and the boxed `FreeQueue` are owned
+        // by `self` and never moved; the guard must be dropped before
+        // `Segments`.
         let guard = unsafe { SegmentGuard::new(header, &*self.free_queue) };
 
         // Incarnation check UNDER the guard (see above). Returning here drops
@@ -1374,9 +1381,9 @@ impl Segments {
     }
 
     /// Perform eviction based on the configured eviction policy. Returns `Ok`
-    /// when the pass drained at least one segment. The segment may have gone
-    /// to the merge spare rather than the free queue, or been taken by
-    /// another reserve, so `Ok` does not mean `reserve_free` will succeed.
+    /// when the policy made progress. `Ok` does not mean `reserve_free` will
+    /// succeed; `reserve_and_define` ignores the result and compares
+    /// `freed_count` instead.
     pub fn evict(
         &self,
         ttl_buckets: &TtlBuckets,

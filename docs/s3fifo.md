@@ -46,13 +46,13 @@ For a 64 MB heap with 1 MB segments (64 segments) and `admission_ratio: 0.10`:
 - Admission pool: 6 segments (6 MB)
 - Main pool: 58 segments (58 MB)
 
-At insert time, an admission-routed insert evicts first when the admission pool is at the cap. Concurrent inserts can exceed the cap. An `admission_count` counter makes the check O(1): it is incremented by the insert whose CAS changes a segment's label from Main to Admission, and decremented by `recycle` or `condemn` when an Admission-labelled segment leaves service (eviction, expiry or `clear()`).
+At insert time, an admission-routed insert evicts first when the admission pool is at the cap. The count can exceed the cap: the check and the label are separate steps, and the insert proceeds even if its eviction frees nothing. An `admission_count` counter makes the check O(1): it is incremented by the insert whose CAS changes a segment's label from Main to Admission, and decremented by `recycle` or `condemn` when an Admission-labelled segment leaves service (eviction, expiry or `clear()`).
 
 ### Admission: Ghost-Guided Routing
 
 On every `insert()`, segcache hashes the key and checks the ghost queue:
 
-- **Ghost hit**: Item is written to a main-pool segment. The ghost entry is removed. This key was recently evicted from the admission pool with `freq == 0` but has reappeared — it deserves a second chance in main.
+- **Ghost hit**: Item is written to the TTL bucket's tail segment, and the insert does not label it Admission. The ghost entry is removed. This key was recently evicted from the admission pool with `freq == 0` but has reappeared — it deserves a second chance in main.
 - **Ghost miss**: The item is written to the TTL bucket's tail segment, which is then labelled Admission; if the count is at the cap, the insert evicts first. It must prove itself by being accessed before its segment is evicted.
 
 The pool label is set on the segment header. Segments within the same TTL bucket may have different pool labels — the pool is per-segment, not per-bucket.
@@ -77,7 +77,7 @@ When no admission-pool segments are available for eviction (all have been draine
 2. Every item in the evicted segment is scanned:
    - **`freq > 0`**: Item is copied to the fresh segment (second chance). Frequency is not explicitly reset here — the hash table's frequency smoothing handles decay over time.
    - **`freq == 0`**: Item is dropped permanently. No ghost entry.
-3. The evicted segment is cleared and returned to the free queue
+3. The evicted segment is cleared and leaves service through `recycle` or `condemn`
 
 ### Frequency Counters
 
@@ -121,7 +121,7 @@ The API is identical to any other eviction policy. Only the builder's `.eviction
 |-----------|---------|-------------|
 | `admission_ratio` | 0.10 | Fraction of segments for the admission pool (0.0–1.0). Lower values filter more aggressively but give items less time to prove themselves. Higher values provide more probation capacity for bursty workloads. |
 
-The pool sizes are fixed at construction. At runtime, the `admission_count` counter enforces the cap in O(1) per insert — no scanning.
+The pool sizes are fixed at construction. At runtime, the `admission_count` counter is checked against the cap in O(1) per insert — no scanning.
 
 ## When to Use S3-Segcache
 

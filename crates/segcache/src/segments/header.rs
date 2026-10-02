@@ -1026,8 +1026,9 @@ impl SegmentHeader {
         SegmentPool::from_u8(self.pool.load(Ordering::Relaxed))
     }
 
-    /// Label the segment `Main`. Used when a segment leaves service or is
-    /// taken as a copy destination; the caller adjusts the admission count.
+    /// Label the segment `Main`. `recycle` and `condemn` call this after
+    /// decrementing `admission_count` for an Admission-labelled segment; copy
+    /// destinations call it on a segment just taken from a free queue.
     #[inline]
     pub fn reset_pool(&self) {
         self.pool.store(SegmentPool::Main as u8, Ordering::Relaxed);

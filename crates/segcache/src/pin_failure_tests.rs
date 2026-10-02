@@ -623,19 +623,8 @@ fn same_key_write_completes_when_parked_drain_progresses<T, P, E, F>(
 /// a fixed sleep that is too short would let the writer complete before it
 /// ever reached the window, and the test would pass having proved nothing.
 ///
-/// **The signal changed with #100.** It used to be the free-segment count
-/// falling: each rollback/restart burned a fresh reservation, so three
-/// segments disappearing was evidence the writer had gone round the loop
-/// several times. That burn was the bug — a 64-segment cache was fully
-/// consumed in ~4 ms of it, and the insert failed with `NoFreeSegments`
-/// instead of merely being slow. The writer now WAITS after rolling back, so
-/// the free count no longer moves and cannot be the signal.
-///
-/// `insert_drain_waits` replaces it, and is strictly better: it counts entries
-/// into `wait_out_unverifiable`, which IS "the writer is parked on this
-/// drain", where the segment count was only ever a proxy for it. One entry is
-/// therefore enough evidence, where three burned segments were needed to be
-/// convincing.
+/// The window closes once `insert_drain_waits` is non-zero: the writer has
+/// rolled back and entered `wait_out_unverifiable` against the parked drain.
 #[test]
 fn same_key_insert_completes_when_parked_drain_progresses() {
     same_key_write_completes_when_parked_drain_progresses(
@@ -1084,23 +1073,10 @@ fn acked_delete_is_not_lost_when_the_recheck_cannot_verify() {
     assert!(cache.get(&victim).is_none(), "the victim must stay deleted");
 }
 
-/// **Regression (#100): a blocked `insert` must not eat the free pool.**
-///
-/// `insert`'s replace arm cannot wait while it is blocked — it holds the
-/// `WriterPin` inside its own reservation, and a drain may be waiting on
-/// exactly that pin (#54) — so it rolls the reservation back and restarts.
-/// Correct, and the only safe move. The cost is that *every restart burns a
-/// fresh reservation*, so a blocked insert consumed segment space in a loop
-/// for as long as the blocker lasted and then failed with `NoFreeSegments` —
-/// an error, for a set that should merely have been slow.
-///
-/// The fix is that after the rollback it holds NOTHING, which is the same
-/// position `delete`/`cas`/`numeric_update`/`try_into_numeric` are in when
-/// they snooze on `Unknown`. So it waits there instead of re-reserving.
-///
-/// Before the fix this test fails in milliseconds on the pool assertion
-/// (`a blocked insert consumed N segments`); a 64-segment cache is fully
-/// consumed in ~4 ms of looping.
+/// A blocked `insert` rolls back its reservation and waits; it does not take
+/// a new reservation per retry (#100). With a drain parked on the key's
+/// segment for 500 ms, the free pool must not shrink. Without the wait, 61 of
+/// 61 free segments are consumed in that window.
 #[test]
 fn insert_waits_instead_of_burning_the_pool_while_a_drain_blocks_it() {
     let cache = Arc::new(small_merge_cache(64));
@@ -1120,30 +1096,32 @@ fn insert_waits_instead_of_burning_the_pool_while_a_drain_blocks_it() {
         })
     };
 
-    // Wait for the writer to reach a decision point, whichever way it goes.
-    // Deliberately NOT just "wait for a recorded wait": before the fix no wait
-    // is ever recorded, and a test that only watches for one would hang rather
-    // than fail. Watching the pool as well makes it fail fast and on the
-    // property, which is what a regression test owes.
-    // Watch for a fixed window rather than for a single event. The pre-fix
-    // failure is not "does it eventually park" but "how much does it consume
-    // while it is blocked" — measured at 61 of 61 segments in 500 ms — so the
-    // test has to give it room to misbehave and then look at the damage. A
-    // window also makes the assertion below independent of the wait counter,
-    // which is what let this test be written red before the wait existed.
-    let observe_until = std::time::Instant::now() + Duration::from_millis(500);
+    // Start the window once the writer has either parked or begun consuming
+    // segments, so a slow-to-schedule writer cannot fail the parking check.
+    // Watching the pool as well as the counter makes a writer that never
+    // waits fail here instead of hanging.
+    let burned = || free_before.saturating_sub(cache.segments_for_test().free_only());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let backoff = Backoff::new();
+    while cache.insert_drain_waits.load(AtomicOrdering::Relaxed) == 0 && burned() <= 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer neither parked nor consumed a segment within 10 s"
+        );
+        backoff.snooze();
+    }
+
+    // The test measures how many segments the writer consumes during a fixed
+    // window. The writer reserves once and rolls back, which returns the
+    // reservation, so 0 is typical and 1 is allowed.
+    let observe_until = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < observe_until {
         backoff.snooze();
     }
 
-    // One reservation is expected and fine: the writer reserves once, discovers
-    // it cannot verify the key's candidate, and rolls back. What must not
-    // happen is that it does so again and again. Pre-fix this reads 61 (the
-    // whole pool) after the same 500 ms.
-    let burned = free_before.saturating_sub(cache.segments_for_test().free_only());
+    let burned = burned();
     assert!(
-        burned <= 2,
+        burned <= 1,
         "a blocked insert consumed {burned} segments in 500ms: it is \
          re-reserving and discarding once per retry instead of waiting, which \
          turns a transient drain into `NoFreeSegments`"
@@ -1174,21 +1152,15 @@ fn insert_waits_instead_of_burning_the_pool_while_a_drain_blocks_it() {
     assert_eq!(item.value(), Value::Bytes(b"Wparke2"));
 }
 
-/// #100's widened-trigger case: `clear()` churn concurrent with inserts of
-/// keys that have nothing to do with the segments being drained.
+/// Inserts of distinct keys succeed while another thread runs `clear()` in a
+/// loop: none returns `NoFreeSegments`.
 ///
-/// The pinned verify (#91) made `Lookup::Unknown` reachable from a **foreign**
-/// entry — a different key that merely shares the 12-bit tag (~1 in 4096 per
-/// examined slot) and whose segment is `Draining`. So an insert of an
-/// unrelated key can be blocked by an unrelated drain, which is a much broader
-/// trigger set than the pre-#91 "the key's own entry is being drained".
-///
-/// Unlike `insert_waits_instead_of_burning_the_pool_while_a_drain_blocks_it`,
-/// this is a SMOKE test, not a deterministic reproducer: a real `clear()`
-/// finishes quickly, so the pre-fix burn window is short and this would not
-/// reliably go red before the fix. Its job is to guard the user-visible
-/// symptom — a set that should merely have been slow coming back as
-/// `NoFreeSegments` — against future regressions on the widened path.
+/// This is a smoke test of inserts against clear churn. It does not reach
+/// `wait_out_unverifiable`: that needs a tag-colliding entry (about 1 in 4096
+/// per examined slot) in a segment that is `Draining` at the moment of the
+/// lookup, and a `clear()` drains each segment too quickly for that to occur
+/// in practice. `insert_waits_instead_of_burning_the_pool_while_a_drain_blocks_it`
+/// covers the wait.
 #[test]
 fn clear_churn_does_not_starve_inserts_of_unrelated_keys() {
     let cache = Arc::new(small_merge_cache(64));
@@ -1213,8 +1185,8 @@ fn clear_churn_does_not_starve_inserts_of_unrelated_keys() {
         let cache = Arc::clone(&cache);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            // Distinct keys, so nothing here is the drain's own key: any block
-            // is a foreign tag collision, which is exactly the widened path.
+            // Distinct keys, so no insert replaces an entry in a segment being
+            // cleared except through a tag collision.
             for i in 0..20_000u32 {
                 let key = format!("u{i:06}");
                 match cache.insert(key.as_bytes(), b"Vuniqu0", None, ttl) {
@@ -1248,49 +1220,57 @@ fn clear_churn_does_not_starve_inserts_of_unrelated_keys() {
     );
 }
 
-/// An insert blocked by a drain stops waiting when the drain finishes, even
-/// if the segment is then condemned to a reader. A condemned segment keeps its
-/// generation and refuses new pins until its last reader drops its `Item`, so
-/// a wait for "readable again or stale" lasts as long as that reader, which
-/// can be the inserting thread itself.
+/// An insert blocked by a drain completes once the drain finishes, while the
+/// inserting thread itself still holds an `Item` from the segment the drain
+/// condemned. A condemned segment keeps its generation and refuses new pins
+/// until its last reader drops its `Item`, so a wait on the segment becoming
+/// readable or stale would never end here.
 #[test]
 fn insert_stops_waiting_when_the_drain_condemns_the_segment() {
     let cache = Arc::new(small_merge_cache(64));
     let (_loc, seg_id) = insert_and_seal(&cache, b"parked3", b"Vparke3");
 
-    // A reader holds an Item, and so a SegmentGuard, into the segment.
-    let held = cache.get(b"parked3").expect("hit");
-
-    assert!(cache.segments_for_test().claim_for_drain_for_test(seg_id));
-
+    let (held_tx, held_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
     let (tx, rx) = mpsc::channel();
-    let writer = {
+    // Not joined on failure: without the fix this thread waits on its own
+    // Item forever.
+    let _writer = {
         let cache = Arc::clone(&cache);
         std::thread::spawn(move || {
+            let held = cache.get(b"parked3").expect("hit");
+            let _ = held_tx.send(());
+            let _ = go_rx.recv();
             let ttl = Duration::from_secs(3600);
             let _ = tx.send(cache.insert(b"parked3", b"Wparke3", None, ttl));
+            drop(held);
         })
     };
+
+    held_rx.recv().expect("writer pinned the segment");
+    assert!(cache.segments_for_test().claim_for_drain_for_test(seg_id));
+    go_tx.send(()).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let backoff = Backoff::new();
     while cache.insert_drain_waits.load(AtomicOrdering::Relaxed) == 0 {
-        std::thread::yield_now();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer never reached `wait_out_unverifiable`"
+        );
+        backoff.snooze();
     }
 
     // The drain finishes: it sweeps the entry and condemns the segment to the
-    // held reader.
+    // writer's Item.
     assert_eq!(
         cache
             .segments_for_test()
             .finalize_drained_for_test(seg_id, &cache.hashtable),
         ClearOutcome::Deferred
     );
-    assert_eq!(
-        cache.segments_for_test().header(seg_id).state(),
-        State::AwaitingRelease
-    );
 
     let result = rx.recv_timeout(Duration::from_secs(5));
-    drop(held);
-    writer.join().unwrap();
     assert!(
         matches!(result, Ok(Ok(()))),
         "insert was still waiting 5 s after the drain finished: {result:?}"

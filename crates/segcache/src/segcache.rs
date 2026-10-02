@@ -151,14 +151,12 @@ pub struct Segcache {
     pub(crate) hashtable: MultiChoiceHashtable,
     pub(crate) segments: Segments,
     pub(crate) ttl_buckets: TtlBuckets,
-    /// Test-only tally of how many times `insert` has parked waiting for a
-    /// candidate slot it could not verify (see the `Lookup::Unknown` arm).
+    /// Test-only count of calls to `wait_out_unverifiable`.
     ///
-    /// PER-CACHE and shared, unlike the thread-local `stale_incarnation_charges`.
-    /// Both properties are load-bearing: the parked-drain tests observe the
-    /// waiting writer FROM ANOTHER THREAD — being blocked is the very thing
-    /// they detect — and a process-global counter would let two tests running
-    /// concurrently satisfy each other's waits and pass vacuously.
+    /// Per-cache, unlike the thread-local `stale_incarnation_charges`, because
+    /// the tests read it from a thread other than the waiting writer; a
+    /// process-global counter would let two concurrently running tests
+    /// satisfy each other's waits.
     #[cfg(all(test, not(model_checking)))]
     pub(crate) insert_drain_waits: std::sync::atomic::AtomicUsize,
 }
@@ -513,8 +511,9 @@ impl Segcache {
     /// (`cas`, `numeric_update`, `try_into_numeric`) do NOT share this bound and
     /// do not triage the two failures at all — they retry both unboundedly. That
     /// is sound for the reason above and NOT parity with this function; each says
-    /// so at its own snooze. `insert` is the exception that cannot wait at all —
-    /// see its `Insert::Unknown` arm.
+    /// so at its own snooze. `insert` cannot wait while it holds its
+    /// reservation; it rolls back first and then waits in
+    /// `wait_out_unverifiable`.
     ///
     /// It shares `attempts` — and therefore `REVALIDATE_RETRIES` — with
     /// `follow_republished` rather than carrying `RESERVE_RETRIES`. The two
@@ -611,7 +610,6 @@ impl Segcache {
         // The whole reserve→publish operation restarts (fresh reservation)
         // when publishing would deadlock against a drain of the reservation's
         // own segment — see the replace arm's pin-failure handler below.
-        //
         'operation: loop {
             // `Value` is a borrowed enum without `Copy`; re-borrow it for this
             // attempt so a restart can consume it again.
@@ -834,43 +832,39 @@ impl Segcache {
     }
 
     /// A candidate slot named a location this thread could not verify, and its
-    /// reservation has just been rolled back — so it now holds NOTHING. Wait
-    /// for the blocker to clear before reserving again.
+    /// reservation has just been rolled back, so it holds no writer or remover
+    /// pin. Wait for the drain that blocked it before reserving again.
     ///
-    /// # Why the wait goes here and not one line earlier
+    /// # Why the wait comes after the rollback
     ///
-    /// `insert` cannot wait while it is BLOCKED: it holds the `WriterPin`
-    /// inside its reservation, and the drain that owns the unverifiable
-    /// candidate may be waiting on exactly that pin, so spinning in place
-    /// wedges both threads (#54). Rolling back is the only safe move.
+    /// `insert` cannot wait while it holds its reservation: the reservation
+    /// carries a `WriterPin`, and the drain that owns the unverifiable
+    /// candidate may be waiting on that pin, so waiting in place deadlocks
+    /// both threads (#54).
     ///
-    /// But rolling back and IMMEDIATELY re-reserving is what #100 was: every
-    /// restart burns a fresh reservation, a 64-segment cache empties in ~4 ms
-    /// of that, and a transient drain comes out as `NoFreeSegments` — an error,
-    /// for a set that should merely have been slow. `Backoff::snooze` does not
-    /// fix it either; it saturates to a bare `yield_now`, so the burn continues
-    /// at roughly one reservation per yield.
+    /// Re-reserving immediately after the rollback takes a fresh reservation
+    /// per retry. Against a parked drain that consumed every free segment and
+    /// returned `NoFreeSegments`.
     ///
-    /// After `rollback_reservation` the thread is in precisely the position
-    /// `delete`, `cas`, `numeric_update` and `try_into_numeric` are in when
-    /// they snooze on `Unknown`: holding nothing, blocking nobody. So it waits
-    /// the way they do, and the `Unknown` policy becomes uniform across every
-    /// write path — *release what you hold, then wait.*
+    /// `delete`, `cas`, `numeric_update` and `try_into_numeric` hold no pin
+    /// when they see `Unknown`, and retry the lookup after a snooze. `insert`
+    /// reaches the same position only after the rollback, and polls the
+    /// candidate's segment state instead.
     ///
     /// # Termination
     ///
     /// Waits while the candidate's segment is `Draining` under the same
-    /// incarnation, which is bounded by the drain, which is bounded
-    /// straight-line work. When the drain finishes, the segment is `Free`
-    /// (`resolve` says `None` once the generation is bumped) or condemned to
-    /// its readers (`AwaitingRelease`). Either way the drain has swept or
-    /// relinked the candidate's hashtable entry, so a fresh lookup resolves
-    /// the key at its new location or reports it absent.
+    /// incarnation. A drain waits only on writer and remover pins, and this
+    /// thread holds neither after the rollback, so the wait ends when the
+    /// drain does. When the drain finishes, the segment is `Free` (`resolve`
+    /// says `None` once the generation is bumped) or condemned to its readers
+    /// (`AwaitingRelease`). Either way the drain has swept or relinked the
+    /// candidate's hashtable entry, so a fresh lookup resolves the key at its
+    /// new location or reports it absent.
     ///
-    /// The wait does not extend to an `AwaitingRelease` segment becoming
-    /// readable again or stale. It keeps its generation and refuses new pins
-    /// until its last reader drops its `Item`, and that reader can be the
-    /// thread waiting here.
+    /// An `AwaitingRelease` segment ends the wait. It keeps its generation and
+    /// refuses new pins until its last reader drops its `Item`, and that
+    /// reader can be the waiting thread.
     #[cold]
     #[inline(never)]
     fn wait_out_unverifiable(&self, location: Location) {

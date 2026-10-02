@@ -151,6 +151,14 @@ pub struct Segcache {
     pub(crate) hashtable: MultiChoiceHashtable,
     pub(crate) segments: Segments,
     pub(crate) ttl_buckets: TtlBuckets,
+    /// Test-only count of calls to `wait_out_unverifiable`.
+    ///
+    /// Per-cache, unlike the thread-local `stale_incarnation_charges`, because
+    /// the tests read it from a thread other than the waiting writer; a
+    /// process-global counter would let two concurrently running tests
+    /// satisfy each other's waits.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) insert_drain_waits: std::sync::atomic::AtomicUsize,
 }
 
 // Compile-time guard: Segcache must be Send + Sync so Arc<Segcache> can be
@@ -503,8 +511,9 @@ impl Segcache {
     /// (`cas`, `numeric_update`, `try_into_numeric`) do NOT share this bound and
     /// do not triage the two failures at all — they retry both unboundedly. That
     /// is sound for the reason above and NOT parity with this function; each says
-    /// so at its own snooze. `insert` is the exception that cannot wait at all —
-    /// see its `Insert::Unknown` arm.
+    /// so at its own snooze. `insert` cannot wait while it holds its
+    /// reservation; it rolls back first and then waits in
+    /// `wait_out_unverifiable`.
     ///
     /// It shares `attempts` — and therefore `REVALIDATE_RETRIES` — with
     /// `follow_republished` rather than carrying `RESERVE_RETRIES`. The two
@@ -601,16 +610,6 @@ impl Segcache {
         // The whole reserve→publish operation restarts (fresh reservation)
         // when publishing would deadlock against a drain of the reservation's
         // own segment — see the replace arm's pin-failure handler below.
-        //
-        // Backs off ACROSS restarts, not within one: each restart burns a
-        // fresh reservation, so a tight rollback/restart loop against a drain
-        // that has not moved yet consumes the free pool in milliseconds and
-        // turns a transient drain into `NoFreeSegments`. The per-attempt
-        // `backoff` below cannot serve — it is reset every iteration — and
-        // spinning in place instead of rolling back is precisely the deadlock
-        // this loop exists to avoid (the drain may be waiting on the WriterPin
-        // inside our own reservation).
-        let restart_backoff = Backoff::new();
         'operation: loop {
             // `Value` is a borrowed enum without `Copy`; re-borrow it for this
             // attempt so a restart can consume it again.
@@ -670,9 +669,9 @@ impl Segcache {
                     // Treating `Unknown` as absent is the failure to avoid:
                     // insert would take the fresh-key arm below and publish a
                     // DUPLICATE entry for a key that already has one (#46).
-                    Lookup::Unknown(_location) => {
+                    Lookup::Unknown(location) => {
                         self.rollback_reservation(reserved, new_location);
-                        restart_backoff.snooze();
+                        self.wait_out_unverifiable(location);
                         continue 'operation;
                     }
                     Lookup::Found((old_location, slot)) => {
@@ -786,9 +785,9 @@ impl Segcache {
                             // above, for the same reason: the upsert could not
                             // establish whether the key already has an entry,
                             // and publishing on a guess duplicates it.
-                            Ok(Insert::Unknown(_location)) => {
+                            Ok(Insert::Unknown(location)) => {
                                 self.rollback_reservation(reserved, new_location);
-                                restart_backoff.snooze();
+                                self.wait_out_unverifiable(location);
                                 continue 'operation;
                             }
                             Ok(Insert::Created) => {
@@ -829,6 +828,57 @@ impl Segcache {
             // Defensive fallback for the "invalid old location" break above.
             self.rollback_reservation(reserved, new_location);
             return Err(SegcacheError::HashTableInsertEx);
+        }
+    }
+
+    /// A candidate slot named a location this thread could not verify, and its
+    /// reservation has just been rolled back, so it holds no writer or remover
+    /// pin. Wait for the drain that blocked it before reserving again.
+    ///
+    /// # Why the wait comes after the rollback
+    ///
+    /// `insert` cannot wait while it holds its reservation: the reservation
+    /// carries a `WriterPin`, and the drain that owns the unverifiable
+    /// candidate may be waiting on that pin, so waiting in place deadlocks
+    /// both threads (#54).
+    ///
+    /// Re-reserving immediately after the rollback takes a fresh reservation
+    /// per retry. Against a parked drain that consumed every free segment and
+    /// returned `NoFreeSegments`.
+    ///
+    /// `delete`, `cas`, `numeric_update` and `try_into_numeric` hold no pin
+    /// when they see `Unknown`, and retry the lookup after a snooze. `insert`
+    /// reaches the same position only after the rollback, and polls the
+    /// candidate's segment state instead.
+    ///
+    /// # Termination
+    ///
+    /// Waits while the candidate's segment is `Draining` under the same
+    /// incarnation. A drain waits only on writer and remover pins, and this
+    /// thread holds neither after the rollback, so the wait ends when the
+    /// drain does. When the drain finishes, the segment is `Free` (`resolve`
+    /// says `None` once the generation is bumped) or condemned to its readers
+    /// (`AwaitingRelease`). Either way the drain has swept or relinked the
+    /// candidate's hashtable entry, so a fresh lookup resolves the key at its
+    /// new location or reports it absent.
+    ///
+    /// An `AwaitingRelease` segment ends the wait. It keeps its generation and
+    /// refuses new pins until its last reader drops its `Item`, and that
+    /// reader can be the waiting thread.
+    #[cold]
+    #[inline(never)]
+    fn wait_out_unverifiable(&self, location: Location) {
+        #[cfg(all(test, not(model_checking)))]
+        self.insert_drain_waits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let backoff = Backoff::new();
+        while self
+            .segments
+            .resolve(location)
+            .is_some_and(|(seg_id, _)| self.segments.header(seg_id).state() == State::Draining)
+        {
+            backoff.snooze();
         }
     }
 

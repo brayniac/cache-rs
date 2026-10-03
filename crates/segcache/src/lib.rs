@@ -85,6 +85,9 @@ mod admission_count_tests;
 #[cfg(all(test, not(model_checking)))]
 mod reserve_retry_tests;
 
+#[cfg(all(test, not(model_checking)))]
+mod random_fifo_tests;
+
 // publicly exported items from submodules
 pub use crate::segcache::Segcache;
 pub use builder::Builder;

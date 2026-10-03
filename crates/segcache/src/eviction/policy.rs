@@ -16,10 +16,12 @@ pub enum Policy {
     /// but blind to item value — equivalent to random slab eviction.
     Random,
 
-    /// Select a random *occupied* segment, find the TTL bucket it
-    /// belongs to, and evict that bucket's head (oldest) segment. This
-    /// weights eviction toward TTL ranges that consume the most memory
-    /// while preserving the overall TTL distribution of the cache.
+    /// Select a random occupied segment, find the TTL bucket it belongs
+    /// to, and evict that bucket's oldest evictable segment. A bucket in
+    /// which every segment is the write tail, reader-pinned, or being
+    /// drained or relinked is skipped for another. This weights
+    /// eviction toward TTL ranges that consume the most memory while
+    /// preserving the overall TTL distribution of the cache.
     RandomFifo,
 
     /// Evict the oldest segment across all TTL buckets, measured by the

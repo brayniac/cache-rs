@@ -11,7 +11,7 @@ forward; one refuses to evict at all.
 |---|---|---|
 | `None` | nothing — inserts fail when the heap is full | — |
 | `Random` | a uniformly random evictable segment | none — whole segment dropped |
-| `RandomFifo` | a random readable segment's TTL bucket, then that bucket's head — weighting eviction toward the TTL tiers that hold the most memory | none |
+| `RandomFifo` | a random readable segment's TTL bucket, then that bucket's oldest evictable segment, skipping buckets with none — weighting eviction toward the TTL tiers that hold the most memory | none |
 | `Fifo` | the globally oldest segment, aged by `max(create_at, merge_at)` | none |
 | `Cte` | the segment expiring soonest: `min(create_at + ttl)` | none |
 | `Util` | the segment with the fewest live bytes (most dead space) | none |

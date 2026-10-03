@@ -54,8 +54,8 @@ const CLAIMS: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/segcache/src/segments/segments.rs",
-        "return ttl_bucket.head();",
-        "RandomFifo evicts the sampled bucket's head",
+        "let mut seg = ttl_buckets.buckets[bucket].head();",
+        "RandomFifo walks the sampled bucket from its head to the oldest evictable segment",
     ),
     (
         "crates/segcache/src/segments/segments.rs",
@@ -676,7 +676,7 @@ fn fig_policies(commit: &str) -> (String, usize) {
         c,
         342.0,
         "RandomFifo",
-        "random readable seg -> its bucket's head",
+        "random readable seg -> its bucket's oldest evictable",
     );
     divider(&mut f, 430.0);
     note(&mut f, 20.0, 452.0, "Shared, before any policy runs:  expire() frees whole expired segments first — eviction is the fallback.", 11.5);

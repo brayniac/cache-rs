@@ -118,7 +118,7 @@ Eight policies, set at construction time. The storage layer is identical for all
 |--------|-------------------|---------------------|
 | `None` | — (inserts fail when full) | No |
 | `Random` | Random segment | No |
-| `RandomFifo` | Random TTL bucket → oldest segment | No |
+| `RandomFifo` | Random TTL bucket → oldest evictable segment | No |
 | `Fifo` | Globally oldest segment | No |
 | `Cte` | Segment closest to expiration | No |
 | `Util` | Segment with fewest live bytes | No |

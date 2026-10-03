@@ -1542,19 +1542,40 @@ impl Segments {
                 None
             }
             Policy::RandomFifo => {
-                // Pick a random accessible segment and look up the head of the
-                // corresponding TtlBucket. This is equivalent to a weighted
-                // random over buckets by segment count.
+                // Probe linearly from a random index for a readable segment
+                // and return the oldest evictable segment of its TTL bucket.
+                // This weights buckets roughly by readable segment count; a
+                // skipped bucket's share goes to the bucket of the next
+                // readable index. A bucket in which every segment is the
+                // write tail, reader-pinned, or being drained or relinked is
+                // skipped; each bucket is examined once. The chain is read without its lock, so the
+                // walk is capped at `cap` steps, and `evict` checks the result
+                // under the lock before claiming it.
                 let mut start: u32 = self.evict.lock().unwrap().random();
 
                 start %= self.cap;
 
+                let mut examined = [0u64; crate::ttl_buckets::TOTAL_BUCKETS.div_ceil(64)];
                 for i in 0..self.cap {
                     let idx = (start + i) % self.cap;
-                    if self.headers[idx as usize].state().is_readable() {
-                        let ttl = self.headers[idx as usize].ttl();
-                        let ttl_bucket = ttl_buckets.get_bucket(ttl);
-                        return ttl_bucket.head();
+                    if !self.headers[idx as usize].state().is_readable() {
+                        continue;
+                    }
+                    let bucket = ttl_buckets.get_bucket_index(self.headers[idx as usize].ttl());
+                    let (word, bit) = (bucket / 64, 1u64 << (bucket % 64));
+                    if examined[word] & bit != 0 {
+                        continue;
+                    }
+                    examined[word] |= bit;
+
+                    let mut seg = ttl_buckets.buckets[bucket].head();
+                    for _ in 0..self.cap {
+                        let Some(id) = seg else { break };
+                        let header = &self.headers[id.get() as usize - 1];
+                        if header.can_evict() {
+                            return Some(id);
+                        }
+                        seg = header.next_seg();
                     }
                 }
 

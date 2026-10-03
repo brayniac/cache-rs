@@ -18,3 +18,4 @@ mod concurrency_tests;
 pub use error::TtlBucketsError;
 pub use ttl_bucket::TtlBucket;
 pub use ttl_buckets::TtlBuckets;
+pub(crate) use ttl_buckets::TOTAL_BUCKETS;

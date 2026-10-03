@@ -21,7 +21,7 @@ use std::time::Instant as StdInstant;
 
 const BUCKETS_PER_TIER: usize = 256;
 const TIER_COUNT: usize = 4;
-const TOTAL_BUCKETS: usize = BUCKETS_PER_TIER * TIER_COUNT;
+pub(crate) const TOTAL_BUCKETS: usize = BUCKETS_PER_TIER * TIER_COUNT;
 
 // Tier widths as bit shifts (each tier is 4x wider than the previous).
 const TIER_1_SHIFT: usize = 3; //   8s

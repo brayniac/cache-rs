@@ -42,7 +42,7 @@ All policies operate at segment granularity. When memory runs out, the policy se
 |--------|-----------|-----------|
 | `None` | — | Inserts fail when full |
 | `Random` | Random segment | All items dropped |
-| `RandomFifo` | Random TTL bucket → oldest segment | All items dropped |
+| `RandomFifo` | Random TTL bucket → oldest evictable segment | All items dropped |
 | `Fifo` | Globally oldest segment | All items dropped |
 | `Cte` | Segment closest to expiration | All items dropped |
 | `Util` | Segment with fewest live bytes | All items dropped |

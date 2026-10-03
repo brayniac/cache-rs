@@ -29,17 +29,17 @@ const CLAIMS: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/segcache/src/eviction/mod.rs",
-        "max(lhs.create_at(), lhs.merge_at())",
+        "max(h.create_at(), h.merge_at())",
         "Fifo age = later of create and last merge",
     ),
     (
         "crates/segcache/src/eviction/mod.rs",
-        "lhs.create_at() + lhs.ttl()",
+        "|h| h.create_at() + h.ttl()",
         "Cte ranks by absolute expiry time",
     ),
     (
         "crates/segcache/src/eviction/mod.rs",
-        "lhs.live_bytes().cmp(&rhs.live_bytes())",
+        "|h| h.live_bytes()",
         "Util ranks by live bytes",
     ),
     (
@@ -65,7 +65,7 @@ const CLAIMS: &[(&str, &str, &str)] = &[
     (
         "crates/segcache/src/segments/segments.rs",
         "merge_evict_fallback_drop(start, ttl_bucket, hashtable)",
-        "no spare -> drop the chain head whole",
+        "no spare -> drop the start segment whole",
     ),
     (
         "crates/segcache/src/segments/segments.rs",
@@ -737,7 +737,7 @@ fn fig_merge(commit: &str) -> (String, usize) {
     f.text(
         220.0,
         176.0,
-        "1  reserve spare + head-insert",
+        "1  reserve spare + link in s0's place",
         TextOpts {
             size: 10.5,
             ..Default::default()
@@ -923,14 +923,14 @@ fn fig_merge(commit: &str) -> (String, usize) {
     f.text(
         580.0,
         370.0,
-        "6  publish spare: Relinking -> Sealed - it remains the bucket head",
+        "6  publish spare: Relinking -> Sealed - it stays in s0's place",
         TextOpts {
             size: 11.0,
             ..Default::default()
         },
     );
     divider(&mut f, 404.0);
-    note(&mut f, 20.0, 426.0, "start: random TTL bucket -> its next_to_merge cursor · needs >= 3 evictable chained segments · no spare -> fallback: drop chain head whole", 11.0);
+    note(&mut f, 20.0, 426.0, "start: random TTL bucket -> its next_to_merge cursor · needs >= 3 evictable chained segments · no spare -> fallback: drop the start segment whole", 11.0);
     note(&mut f, 20.0, 446.0, "stops when: max segments merged · spare reaches stop_ratio · candidate unevictable · drain claim lost", 11.0);
     note(&mut f, 20.0, 466.0, "compaction sub-mode (from remove_at, occupancy < 1/compact): same copy machinery, no pruning, skips instead of dropping when no spare", 11.0);
     stamp(&mut f, 488.0, commit);

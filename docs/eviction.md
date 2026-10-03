@@ -40,13 +40,14 @@ to the free pool.
 
 ## Merge eviction — prune, compact, recycle
 
-![Merge eviction: spare head-insert, per-candidate claim, prune, copy
-survivors, recycle](diagrams/eviction-merge.svg)
+![Merge eviction: spare linked in the start segment's place, per-candidate
+claim, prune, copy survivors, recycle](diagrams/eviction-merge.svg)
 
 The segcache-paper policy, in six steps:
 
-1. A spare segment is reserved and head-inserted into the TTL bucket in
-   *Relinking* state — readable (so relinked survivors stay reachable) but not
+1. A spare segment is reserved, the start segment s0 is claimed, and the
+   spare is linked in s0's place in *Relinking* state, taking s0's creation
+   time — readable (so relinked survivors stay reachable) but not
    evictable, so a concurrent evictor can neither select nor claim it.
 2. Each chain candidate is claimed *Sealed → Draining* before any mutation —
    the uniform per-segment claim shared by every mutator.
@@ -58,12 +59,12 @@ The segcache-paper policy, in six steps:
 5. The drained candidate is finalized: unlinked from the chain and recycled to
    the free pool (a reader-pinned candidate is condemned to its last reader
    instead).
-6. The filled spare is published *Relinking → Sealed* and remains the bucket
-   head.
+6. The filled spare is published *Relinking → Sealed* and stays in s0's
+   place.
 
 Entry and bounds: eviction starts at a random TTL bucket's `next_to_merge`
 cursor and needs a chain of at least 3 evictable segments; with no spare
-available it degrades to dropping the chain head whole. A pass stops when it
+available it degrades to dropping the start segment whole. A pass stops when it
 has merged the maximum segment count, the spare reaches `stop_ratio`, a
 candidate is unevictable, or a drain claim is lost. A compaction sub-mode
 (triggered from `remove_at` when occupancy falls below `1/compact`) uses the
@@ -93,7 +94,7 @@ The three figures are **generated — do not edit**:
 place. The generator (`crates/segcache/examples/eviction_diagrams.rs`) asserts 22 source claims plus one ordering claim (admission-pool
 eviction precedes main) against `crates/segcache` and aborts on drift; all
 drawn geometry is bounds-checked into each figure's viewBox. Current render
-derived at commit `073cce5` with `crates/segcache` clean. Freshness is manual
+derived at commit `f4ed6ea` with `crates/segcache` clean. Freshness is manual
 for now — regenerate after eviction-code changes; a CI check that regenerates
 and diffs the committed SVGs is a natural follow-up since emission is
 deterministic.

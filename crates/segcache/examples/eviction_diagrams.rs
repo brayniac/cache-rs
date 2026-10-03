@@ -29,17 +29,17 @@ const CLAIMS: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/segcache/src/eviction/mod.rs",
-        "max(h.create_at(), h.merge_at())",
+        "Policy::Fifo => self.rank_by(headers, |h| max(h.create_at(), h.merge_at()))",
         "Fifo age = later of create and last merge",
     ),
     (
         "crates/segcache/src/eviction/mod.rs",
-        "|h| h.create_at() + h.ttl()",
+        "Policy::Cte => self.rank_by(headers, |h| h.create_at() + h.ttl())",
         "Cte ranks by absolute expiry time",
     ),
     (
         "crates/segcache/src/eviction/mod.rs",
-        "|h| h.live_bytes()",
+        "Policy::Util => self.rank_by(headers, |h| h.live_bytes())",
         "Util ranks by live bytes",
     ),
     (
@@ -55,7 +55,17 @@ const CLAIMS: &[(&str, &str, &str)] = &[
     (
         "crates/segcache/src/segments/segments.rs",
         "let mut seg = ttl_buckets.buckets[bucket].head();",
-        "RandomFifo walks the sampled bucket from its head to the oldest evictable segment",
+        "RandomFifo starts at the sampled bucket's head",
+    ),
+    (
+        "crates/segcache/src/segments/segments.rs",
+        "if header.can_evict() {",
+        "RandomFifo returns the first evictable segment it reaches",
+    ),
+    (
+        "crates/segcache/src/segments/segments.rs",
+        "seg = header.next_seg();",
+        "RandomFifo walks the chain past segments it cannot evict",
     ),
     (
         "crates/segcache/src/segments/segments.rs",
@@ -693,7 +703,7 @@ fn fig_merge(commit: &str) -> (String, usize) {
     f.text(
         192.0,
         44.0,
-        "bucket head",
+        "prev segment (or bucket head)",
         TextOpts {
             size: 10.5,
             anchor: "end",
@@ -737,7 +747,7 @@ fn fig_merge(commit: &str) -> (String, usize) {
     f.text(
         220.0,
         176.0,
-        "1  reserve spare + link in s0's place",
+        "1  reserve spare, claim s0, link spare in s0's place",
         TextOpts {
             size: 10.5,
             ..Default::default()
@@ -758,7 +768,7 @@ fn fig_merge(commit: &str) -> (String, usize) {
         f.text(
             x + 70.0,
             106.0,
-            &format!("candidate {}", ["A", "B", "C"][i]),
+            ["s0 (start)", "candidate B", "candidate C"][i],
             TextOpts {
                 weight: Some(600),
                 ..Default::default()
@@ -783,15 +793,17 @@ fn fig_merge(commit: &str) -> (String, usize) {
                 );
             }
         }
-        f.text(
-            x + 70.0,
-            176.0,
-            "2  claim Sealed -> Draining",
-            TextOpts {
-                size: 10.5,
-                ..Default::default()
-            },
-        );
+        if i > 0 {
+            f.text(
+                x + 70.0,
+                176.0,
+                "2  claim Sealed -> Draining",
+                TextOpts {
+                    size: 10.5,
+                    ..Default::default()
+                },
+            );
+        }
     }
     for (x1, x2) in [
         (290.0, 330.0),
@@ -904,7 +916,7 @@ fn fig_merge(commit: &str) -> (String, usize) {
     f.text(
         580.0,
         320.0,
-        "5  finalize drained candidate -> unlink from chain -> recycle to free pool",
+        "5  finalize drained candidate -> unlink from chain -> recycle (spare queue first)",
         TextOpts {
             size: 11.5,
             ..Default::default()
@@ -930,7 +942,7 @@ fn fig_merge(commit: &str) -> (String, usize) {
         },
     );
     divider(&mut f, 404.0);
-    note(&mut f, 20.0, 426.0, "start: random TTL bucket -> its next_to_merge cursor · needs >= 3 evictable chained segments · no spare -> fallback: drop the start segment whole", 11.0);
+    note(&mut f, 20.0, 426.0, "start: next_to_merge cursor (or head) of a random segment's TTL bucket · needs >= 3 evictable chained segments · no spare -> fallback: drop the start segment whole", 11.0);
     note(&mut f, 20.0, 446.0, "stops when: max segments merged · spare reaches stop_ratio · candidate unevictable · drain claim lost", 11.0);
     note(&mut f, 20.0, 466.0, "compaction sub-mode (from remove_at, occupancy < 1/compact): same copy machinery, no pruning, skips instead of dropping when no spare", 11.0);
     stamp(&mut f, 488.0, commit);
@@ -1098,7 +1110,7 @@ fn fig_s3fifo(commit: &str) -> (String, usize) {
     f.text(
         560.0,
         292.0,
-        "ghost hit: skip admission, insert to main",
+        "ghost hit: write without the Admission label",
         TextOpts {
             size: 10.5,
             ..Default::default()
@@ -1136,12 +1148,12 @@ fn fig_s3fifo(commit: &str) -> (String, usize) {
         },
     );
     f.text(755.0, 355.0, "fresh main segment", bold(12.0));
-    f.text(755.0, 372.0, "second chance for freq > 0", faint(10.0));
+    f.text(755.0, 372.0, "second chance, freq - 1", faint(10.0));
     f.line(720.0, 160.0, 720.0, 330.0, keep);
     f.text(
         733.0,
         250.0,
-        "freq > 0: copy",
+        "freq > 0: copy, freq - 1",
         TextOpts {
             size: 10.5,
             color: KEEP,
@@ -1150,10 +1162,21 @@ fn fig_s3fifo(commit: &str) -> (String, usize) {
         },
     );
     f.line(830.0, 160.0, 830.0, 240.0, drop);
-    drop_text(205.0, "freq == 0:", &mut f);
-    drop_text(220.0, "dropped", &mut f);
+    for (y, s) in [(205.0, "freq == 0:"), (220.0, "dropped")] {
+        f.text(
+            843.0,
+            y,
+            s,
+            TextOpts {
+                size: 10.5,
+                color: DROP,
+                anchor: "start",
+                ..Default::default()
+            },
+        );
+    }
     divider(&mut f, 410.0);
-    note(&mut f, 20.0, 432.0, "One-hit wonders die in admission; a ghost hit is the proof of a second request, earning direct main placement.", 11.0);
+    note(&mut f, 20.0, 432.0, "Untouched items are dropped from admission; a ghost-hit insert writes to the tail without labelling it Admission.", 11.0);
     note(&mut f, 20.0, 452.0, "Promotion and second-chance copies reuse the merge relink machinery: copy bytes, then Release-CAS the hashtable location.", 11.0);
     stamp(&mut f, 464.0, commit);
     f.done()

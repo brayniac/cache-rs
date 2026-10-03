@@ -1545,12 +1545,12 @@ impl Segments {
                 // Probe linearly from a random index for a readable segment
                 // and return the oldest evictable segment of its TTL bucket.
                 // This weights buckets roughly by readable segment count; a
-                // skipped bucket's share goes to the bucket of the next
-                // readable index. A bucket in which every segment is the
-                // write tail, reader-pinned, or being drained or relinked is
-                // skipped; each bucket is examined once. The chain is read without its lock, so the
-                // walk is capped at `cap` steps, and `evict` checks the result
-                // under the lock before claiming it.
+                // skipped bucket's share goes to the next unexamined bucket
+                // in index order. A bucket with no Sealed, unpinned segment
+                // is skipped; each bucket is examined once. The chain is read
+                // without its lock, so the walk is capped at `cap` steps, and
+                // `evict` checks the result under the lock before claiming
+                // it.
                 let mut start: u32 = self.evict.lock().unwrap().random();
 
                 start %= self.cap;

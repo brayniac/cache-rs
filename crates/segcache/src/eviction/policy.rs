@@ -17,9 +17,8 @@ pub enum Policy {
     Random,
 
     /// Select a random occupied segment, find the TTL bucket it belongs
-    /// to, and evict that bucket's oldest evictable segment. A bucket in
-    /// which every segment is the write tail, reader-pinned, or being
-    /// drained or relinked is skipped for another. This weights
+    /// to, and evict that bucket's oldest evictable segment. A bucket with
+    /// no Sealed, unpinned segment is skipped for another. This weights
     /// eviction toward TTL ranges that consume the most memory while
     /// preserving the overall TTL distribution of the cache.
     RandomFifo,

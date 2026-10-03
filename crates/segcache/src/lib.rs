@@ -79,6 +79,12 @@ mod s3fifo_clock_tests;
 #[cfg(all(test, not(model_checking)))]
 mod bucket_membership_tests;
 
+#[cfg(all(test, not(model_checking)))]
+mod admission_count_tests;
+
+#[cfg(all(test, not(model_checking)))]
+mod reserve_retry_tests;
+
 // publicly exported items from submodules
 pub use crate::segcache::Segcache;
 pub use builder::Builder;

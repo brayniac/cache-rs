@@ -70,6 +70,7 @@ impl SegmentQueue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.0.lock().unwrap().len()
     }

@@ -11,8 +11,8 @@ use crate::segments::SegmentHeader;
 ///
 /// The guard completes that handoff: when the LAST pin drops on a
 /// condemned segment, the guard's drop transitions it AwaitingRelease ->
-/// Free and returns it to the free queue directly — no `&mut Segments`
-/// pass required. The transition CAS guarantees exactly-one-free among the
+/// Free and returns it to the free queue directly, counting it
+/// (`FreeQueue::push_freed`) — no `&mut Segments` pass required. The transition CAS guarantees exactly-one-free among the
 /// three claimants: a racing last-guard drop, the condemner's recheck, and
 /// the backout of an acquire that failed after its increment.
 ///
@@ -21,7 +21,7 @@ use crate::segments::SegmentHeader;
 /// is the same contract `RawItem` already has with the segment data.
 pub(crate) struct SegmentGuard {
     header: *const SegmentHeader,
-    free_queue: *const crate::sync::SegmentQueue,
+    free_queue: *const crate::segments::FreeQueue,
 }
 
 impl SegmentGuard {
@@ -33,11 +33,11 @@ impl SegmentGuard {
     ///   `AcquireOutcome::Acquired` on `header`, and ownership of that pin
     ///   transfers to this guard.
     /// - `header` must point into the `Segments` headers allocation and
-    ///   `free_queue` at the `Segments`-owned boxed Injector; both must
+    ///   `free_queue` at the `Segments`-owned boxed `FreeQueue`; both must
     ///   outlive the guard.
     pub(crate) unsafe fn new(
         header: *const SegmentHeader,
-        free_queue: *const crate::sync::SegmentQueue,
+        free_queue: *const crate::segments::FreeQueue,
     ) -> Self {
         Self { header, free_queue }
     }
@@ -82,9 +82,9 @@ impl Drop for SegmentGuard {
             // helper: this guard only holds a raw pointer to the free
             // queue (see the struct doc), not `&Segments`, so it cannot
             // see or update the spare queue/count. A segment freed here
-            // always lands in the free queue; the held-back spare
-            // self-heals on the next unpinned `recycle`/`condemn` return.
-            unsafe { (*self.free_queue).push(header.id().get()) };
+            // always lands in the free queue; the spare queue is refilled by
+            // the next `return_segment` call.
+            unsafe { (*self.free_queue).push_freed(header.id().get()) };
 
             #[cfg(feature = "metrics")]
             {

@@ -2,6 +2,7 @@
 
 mod builder;
 mod error;
+mod free_queue;
 mod guard;
 mod header;
 mod remover_pin;
@@ -22,6 +23,7 @@ mod shuttle_eviction_tests;
 
 pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;
+pub(crate) use free_queue::FreeQueue;
 pub(crate) use guard::SegmentGuard;
 pub(crate) use header::{AcquireOutcome, SegmentHeader, SegmentPool};
 pub(crate) use remover_pin::RemoverPin;

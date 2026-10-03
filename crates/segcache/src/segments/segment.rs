@@ -3,7 +3,7 @@
 //! A `Segment` provides operations on a single segment's data, delegating
 //! metadata access to the atomic fields in [`SegmentHeader`].
 
-use super::{SegmentHeader, SegmentPool, SegmentsError};
+use super::{SegmentHeader, SegmentsError};
 use crate::hashtable::RelinkFreq;
 use crate::*;
 use core::num::NonZeroU32;
@@ -313,16 +313,6 @@ impl<'a> Segment<'a> {
     #[inline]
     pub fn create_at(&self) -> Instant {
         self.header.create_at()
-    }
-
-    #[inline]
-    pub fn pool(&self) -> SegmentPool {
-        self.header.pool()
-    }
-
-    #[inline]
-    pub fn set_pool(&self, pool: SegmentPool) {
-        self.header.set_pool(pool);
     }
 
     // -- Item operations --

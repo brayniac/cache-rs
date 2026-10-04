@@ -1098,43 +1098,7 @@ fn insert_waits_instead_of_burning_the_pool_while_a_drain_blocks_it() {
         })
     };
 
-    // Start the window once the writer has either parked or begun consuming
-    // segments, so a slow-to-schedule writer cannot fail the parking check.
-    // Watching the pool as well as the counter makes a writer that never
-    // waits fail here instead of hanging.
-    let burned = || free_before.saturating_sub(cache.segments_for_test().free_only());
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let backoff = Backoff::new();
-    while cache.insert_waits.load(AtomicOrdering::Relaxed) == 0 && burned() <= 1 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "writer neither parked nor consumed a segment within 10 s"
-        );
-        backoff.snooze();
-    }
-
-    // The test measures how many segments the writer consumes during a fixed
-    // window. The writer reserves once and rolls back, which returns the
-    // reservation, so 0 is typical and 1 is allowed.
-    let observe_until = std::time::Instant::now() + Duration::from_millis(500);
-    while std::time::Instant::now() < observe_until {
-        backoff.snooze();
-    }
-
-    let burned = burned();
-    assert!(
-        burned <= 1,
-        "a blocked insert consumed {burned} segments in 500ms: it is \
-         re-reserving and discarding once per retry instead of waiting, which \
-         turns a transient drain into `NoFreeSegments`"
-    );
-    assert!(
-        cache
-            .insert_waits
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0,
-        "the writer never parked, so this test proved nothing about waiting"
-    );
+    assert_insert_waits_without_burning(&cache, free_before, &rx);
 
     // Let the drain finish; the insert must then complete.
     assert_eq!(
@@ -1295,9 +1259,9 @@ fn insert_waits_for_a_relinking_destination_instead_of_burning_the_pool() {
     let (_loc, seg_id) = insert_and_seal(&cache, b"parked4", b"Vparke4");
 
     // Stand in for a merge or promotion filling this segment: readable, so
-    // the writer's lookup finds the entry, but not removable. A real fill
-    // also holds its bucket's chain lock, which stops a same-bucket insert
-    // from growing the chain; this models a fill in another TTL bucket.
+    // the writer's lookup finds the entry, but not removable. The test holds
+    // no chain lock, so the insert can extend its bucket's chain, as it could
+    // if the fill were in another TTL bucket.
     // `insert_waits_for_a_real_merge_fill_instead_of_burning_the_pool` runs
     // one.
     cache
@@ -1360,7 +1324,7 @@ fn assert_insert_waits_without_burning(
         burned <= 1,
         "a blocked insert consumed {burned} segments in 500ms: it is \
          re-reserving and discarding once per retry instead of waiting for \
-         the destination to be published"
+         the segment to leave `Draining` or `Relinking`"
     );
     assert!(
         cache.insert_waits.load(AtomicOrdering::Relaxed) > 0,
@@ -1368,12 +1332,12 @@ fn assert_insert_waits_without_burning(
     );
     assert!(
         rx.try_recv().is_err(),
-        "the insert must still be waiting while the destination is Relinking"
+        "the insert must still be waiting while the segment is unremovable"
     );
 }
 
-/// A real merge copies the key's entry into its spare and then waits to claim
-/// the next candidate, which the test holds with a remover pin, so the spare
+/// A real merge copies the key's entry into its spare, then claims the next
+/// candidate and waits for the remover pin the test holds on it, so the spare
 /// stays `Relinking`. An insert of that key with a TTL in another bucket
 /// waits for the merge to publish the spare instead of re-reserving.
 #[test]
@@ -1427,26 +1391,28 @@ fn insert_waits_for_a_real_merge_fill_instead_of_burning_the_pool() {
         })
     };
 
-    // Wait until the key lives in a Relinking segment: the merge's spare.
+    // Wait until the merge has claimed s1, reading the header only: a
+    // hashtable lookup takes a reader pin on s0, and the merge skips a pinned
+    // segment. s1 is claimed only after s0 has been copied into the spare.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let verifier = cache.segments_for_test().verifier();
-        let seg = cache
-            .hashtable
-            .lookup_no_freq_update(b"merged0", &verifier)
-            .found()
-            .and_then(|f| NonZeroU32::new(unpack_location(f.location).0));
-        if let Some(seg) = seg {
-            if seg != s0 && cache.segments_for_test().header(seg).state() == State::Relinking {
-                break;
-            }
-        }
+    while cache.segments_for_test().header(s1).state() != State::Draining {
         assert!(
-            std::time::Instant::now() < deadline,
-            "the merge never relinked the key into its spare"
+            std::time::Instant::now() < deadline && !merger.is_finished(),
+            "the merge never parked claiming s1"
         );
         std::thread::yield_now();
     }
+    let verifier = cache.segments_for_test().verifier();
+    let seg = cache
+        .hashtable
+        .lookup_no_freq_update(b"merged0", &verifier)
+        .found()
+        .and_then(|f| NonZeroU32::new(unpack_location(f.location).0))
+        .expect("the key resolves");
+    assert!(
+        seg != s0 && cache.segments_for_test().header(seg).state() == State::Relinking,
+        "the merge did not relink the key into its spare"
+    );
 
     let free_before = cache.segments_for_test().free_only();
     let (tx, rx) = mpsc::channel();

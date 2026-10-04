@@ -703,8 +703,8 @@ impl Segcache {
                         // `Sealed`: a drain has claimed it (`Draining`, then
                         // `AwaitingRelease` or `Free`; the drain owns the
                         // item's removal), or it is a copy destination still
-                        // being filled (`Relinking`). How to wait depends on WHICH segment
-                        // it is:
+                        // being filled (`Relinking`). How to wait depends on
+                        // which segment it is:
                         //
                         // - `old_seg_id == new_seg` (common: the old value and
                         //   our new reservation co-locate in the Live tail —
@@ -878,17 +878,15 @@ impl Segcache {
     /// A drain waits on the writer and remover pins of the segment it claimed.
     /// A merge fill waits on the same pins of each candidate it claims, and on
     /// leaf locks (the eviction-policy mutex, an item's version lock). An
-    /// S3-FIFO fill claims its source before the destination is `Relinking`
-    /// and waits on nothing after that. After the rollback this thread holds
-    /// no writer or remover pin and no lock, so the wait ends when the drain
-    /// or the fill does. When a
-    /// drain finishes, the segment is `Free` (`resolve` says `None` once the
-    /// generation is bumped) or condemned to its readers (`AwaitingRelease`);
-    /// either way the drain has swept or relinked the entry. When a fill
-    /// finishes, the destination is `Sealed`, which `try_pin_remover`
-    /// accepts.
-    /// A fresh lookup then resolves the key at its current location or
-    /// reports it absent.
+    /// S3-FIFO fill claims its source before the destination is `Relinking`;
+    /// after that it waits only on an item's version lock. After the rollback
+    /// this thread holds no writer or remover pin and no lock, so the wait
+    /// ends when the drain or the fill does. When a drain finishes, the segment
+    /// is `Free` (`resolve` says `None` once the generation is bumped) or
+    /// condemned to its readers (`AwaitingRelease`); either way the drain has
+    /// swept or relinked the entry. When a fill finishes, the destination is
+    /// `Sealed`, which `try_pin_remover` accepts. A fresh lookup then resolves
+    /// the key at its current location or reports it absent.
     ///
     /// An `AwaitingRelease` segment ends the wait. It keeps its generation and
     /// refuses new pins until its last reader drops its `Item`, and that

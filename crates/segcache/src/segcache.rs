@@ -154,14 +154,14 @@ pub struct Segcache {
     pub(crate) hashtable: MultiChoiceHashtable,
     pub(crate) segments: Segments,
     pub(crate) ttl_buckets: TtlBuckets,
-    /// Test-only count of calls to `wait_out_unverifiable`.
+    /// Test-only count of calls to `wait_while_draining_or_filling`.
     ///
     /// Per-cache, unlike the thread-local `stale_incarnation_charges`, because
     /// the tests read it from a thread other than the waiting writer; a
     /// process-global counter would let two concurrently running tests
     /// satisfy each other's waits.
     #[cfg(all(test, not(model_checking)))]
-    pub(crate) insert_drain_waits: std::sync::atomic::AtomicUsize,
+    pub(crate) insert_waits: std::sync::atomic::AtomicUsize,
 }
 
 // Compile-time guard: Segcache must be Send + Sync so Arc<Segcache> can be
@@ -516,7 +516,7 @@ impl Segcache {
     /// is sound for the reason above and NOT parity with this function; each says
     /// so at its own snooze. `insert` cannot wait while it holds its
     /// reservation; it rolls back first and then waits in
-    /// `wait_out_unverifiable`.
+    /// `wait_while_draining_or_filling`.
     ///
     /// It shares `attempts` — and therefore `REVALIDATE_RETRIES` — with
     /// `follow_republished` rather than carrying `RESERVE_RETRIES`. The two
@@ -610,9 +610,10 @@ impl Segcache {
 
         let ttl = Self::coarse_ttl(ttl);
 
-        // The whole reserve→publish operation restarts (fresh reservation)
-        // when publishing would deadlock against a drain of the reservation's
-        // own segment — see the replace arm's pin-failure handler below.
+        // The whole reserve→publish operation rolls back, waits in
+        // `wait_while_draining_or_filling`, and restarts with a fresh
+        // reservation when the key's current entry cannot be verified or
+        // pinned; see the arms below.
         'operation: loop {
             // `Value` is a borrowed enum without `Copy`; re-borrow it for this
             // attempt so a restart can consume it again.
@@ -666,15 +667,16 @@ impl Segcache {
                     // unpinnable, i.e. a drain owns it, and that drain may be
                     // waiting on `active_writers` — the WriterPin inside our
                     // own reservation. Spinning in place cannot resolve;
-                    // rolling back drops the pin, unblocks the drain, and the
-                    // retry reserves in a fresh tail.
+                    // rolling back drops the pin and unblocks the drain; the
+                    // thread then waits for the drain to finish and reserves
+                    // again.
                     //
                     // Treating `Unknown` as absent is the failure to avoid:
                     // insert would take the fresh-key arm below and publish a
                     // DUPLICATE entry for a key that already has one (#46).
                     Lookup::Unknown(location) => {
                         self.rollback_reservation(reserved, new_location);
-                        self.wait_out_unverifiable(location);
+                        self.wait_while_draining_or_filling(location);
                         continue 'operation;
                     }
                     Lookup::Found((old_location, slot)) => {
@@ -697,9 +699,12 @@ impl Segcache {
                         };
 
                         // Pin the OLD item's segment BEFORE unlinking it (item
-                        // 7f). If a drain has already claimed the segment, the
-                        // drain owns the item's removal; how to wait for it
-                        // depends on WHICH segment it is:
+                        // 7f). The pin fails unless the segment is `Live` or
+                        // `Sealed`: a drain has claimed it (`Draining`, then
+                        // `AwaitingRelease` or `Free`; the drain owns the
+                        // item's removal), or it is a copy destination still
+                        // being filled (`Relinking`). How to wait depends on
+                        // which segment it is:
                         //
                         // - `old_seg_id == new_seg` (common: the old value and
                         //   our new reservation co-locate in the Live tail —
@@ -712,9 +717,10 @@ impl Segcache {
                         //   (and the drainer holds the bucket `chain_lock`,
                         //   wedging every writer of the TTL bucket). Roll the
                         //   reservation back — dropping the WriterPin unblocks
-                        //   the drain — and restart the whole operation; the
-                        //   retry reserves in a fresh tail because this segment
-                        //   is no longer writable.
+                        //   the drain — wait for the drain to finish, and
+                        //   restart the whole operation; the retry reserves in
+                        //   a fresh tail because this segment is no longer
+                        //   writable.
                         //
                         // - `old_seg_id != new_seg`: that drain is not waiting
                         //   on OUR pin and normally finishes on its own, so a
@@ -723,11 +729,17 @@ impl Segcache {
                         //   waiting on ANOTHER writer's pin whose owner is
                         //   symmetrically blocked on a drain of OUR segment (a
                         //   cross-thread cycle), so the spin is bounded: once
-                        //   the backoff is exhausted, roll back and restart
-                        //   here too — releasing our pin breaks any such cycle.
+                        //   the backoff is exhausted, roll back — releasing our
+                        //   pin breaks any such cycle — then wait for the drain
+                        //   or fill to finish and restart. If the segment is a
+                        //   `Relinking` destination, the merge filling it may
+                        //   claim our reservation's segment (sealed since we
+                        //   reserved) and wait on our `WriterPin`; the same
+                        //   bounded spin, rollback and wait handle that case.
                         let Some(pin) = self.segments.try_pin_remover(old_seg_id) else {
                             if old_seg_id == new_seg || backoff.is_completed() {
                                 self.rollback_reservation(reserved, new_location);
+                                self.wait_while_draining_or_filling(old_location);
                                 continue 'operation;
                             }
                             backoff.snooze();
@@ -790,7 +802,7 @@ impl Segcache {
                             // and publishing on a guess duplicates it.
                             Ok(Insert::Unknown(location)) => {
                                 self.rollback_reservation(reserved, new_location);
-                                self.wait_out_unverifiable(location);
+                                self.wait_while_draining_or_filling(location);
                                 continue 'operation;
                             }
                             Ok(Insert::Created) => {
@@ -834,53 +846,65 @@ impl Segcache {
         }
     }
 
-    /// A candidate slot named a location this thread could not verify, and its
-    /// reservation has just been rolled back, so it holds no writer or remover
-    /// pin. Wait for the drain that blocked it before reserving again.
+    /// Wait while the segment `location` points into is `Draining` or
+    /// `Relinking` under the same incarnation. `insert` calls this after
+    /// rolling back its reservation, so it holds no writer or remover pin, in
+    /// two cases:
+    ///
+    /// - a candidate slot named a location it could not verify (`Unknown`):
+    ///   its segment was not readable, usually because a drain owns it, or the
+    ///   location's incarnation is gone;
+    /// - the key's current entry is in a segment it cannot take a remover pin
+    ///   on: a drain claimed it, or it is a merge or S3-FIFO copy destination
+    ///   still being filled.
     ///
     /// # Why the wait comes after the rollback
     ///
     /// `insert` cannot wait while it holds its reservation: the reservation
-    /// carries a `WriterPin`, and the drain that owns the unverifiable
-    /// candidate may be waiting on that pin, so waiting in place deadlocks
-    /// both threads (#54).
+    /// carries a `WriterPin`, and the drain, or the owner of the fill, may be
+    /// waiting on that pin, so waiting in place deadlocks both threads (#54).
     ///
     /// Re-reserving immediately after the rollback takes a fresh reservation
-    /// per retry. Against a parked drain that consumed every free segment and
-    /// returned `NoFreeSegments`.
+    /// per retry, and against a drain or fill that has not finished, that
+    /// empties the free pool and `insert` returns `NoFreeSegments`.
     ///
     /// `delete`, `cas`, `numeric_update` and `try_into_numeric` hold no pin
     /// when they see `Unknown`, and retry the lookup after a snooze. `insert`
     /// reaches the same position only after the rollback, and polls the
-    /// candidate's segment state instead.
+    /// segment's state instead.
     ///
     /// # Termination
     ///
-    /// Waits while the candidate's segment is `Draining` under the same
-    /// incarnation. A drain waits only on writer and remover pins, and this
-    /// thread holds neither after the rollback, so the wait ends when the
-    /// drain does. When the drain finishes, the segment is `Free` (`resolve`
-    /// says `None` once the generation is bumped) or condemned to its readers
-    /// (`AwaitingRelease`). Either way the drain has swept or relinked the
-    /// candidate's hashtable entry, so a fresh lookup resolves the key at its
-    /// new location or reports it absent.
+    /// A drain waits on the writer and remover pins of the segment it claimed.
+    /// A merge fill waits on the same pins of each candidate it claims, and on
+    /// leaf locks (the eviction-policy mutex, an item's version lock). An
+    /// S3-FIFO fill claims its source before the destination is `Relinking`;
+    /// after that it waits only on an item's version lock. After the rollback
+    /// this thread holds no writer or remover pin and no lock, so the wait
+    /// ends when the drain or the fill does. When a drain finishes, the segment
+    /// is `Free` (`resolve` says `None` once the generation is bumped) or
+    /// condemned to its readers (`AwaitingRelease`); either way the drain has
+    /// swept or relinked the entry. When a fill finishes, the destination is
+    /// `Sealed`, which `try_pin_remover` accepts. A fresh lookup then resolves
+    /// the key at its current location or reports it absent.
     ///
     /// An `AwaitingRelease` segment ends the wait. It keeps its generation and
     /// refuses new pins until its last reader drops its `Item`, and that
     /// reader can be the waiting thread.
     #[cold]
     #[inline(never)]
-    fn wait_out_unverifiable(&self, location: Location) {
+    fn wait_while_draining_or_filling(&self, location: Location) {
         #[cfg(all(test, not(model_checking)))]
-        self.insert_drain_waits
+        self.insert_waits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let backoff = Backoff::new();
-        while self
-            .segments
-            .resolve(location)
-            .is_some_and(|(seg_id, _)| self.segments.header(seg_id).state() == State::Draining)
-        {
+        while self.segments.resolve(location).is_some_and(|(seg_id, _)| {
+            matches!(
+                self.segments.header(seg_id).state(),
+                State::Draining | State::Relinking
+            )
+        }) {
             backoff.snooze();
         }
     }

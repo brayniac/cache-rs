@@ -194,7 +194,7 @@ impl Builder {
             segments,
             ttl_buckets,
             #[cfg(all(test, not(model_checking)))]
-            insert_drain_waits: std::sync::atomic::AtomicUsize::new(0),
+            insert_waits: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 }

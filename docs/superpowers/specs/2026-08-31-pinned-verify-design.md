@@ -265,8 +265,10 @@ reservation per yield, and a parked drain still emptied a 64-segment pool
 the rollback, not instead of it: once `rollback_reservation` has released the
 `WriterPin`, the thread holds nothing and blocks nobody, which is exactly the
 position every other write path is in when it snoozes on `Unknown`. `insert`
-now waits there (`Segcache::wait_out_unverifiable`) while the candidate's
-segment is `Draining` under the same incarnation. The other write paths retry
+now waits there (`Segcache::wait_while_draining_or_filling`) while the
+segment is `Draining` or `Relinking` under the same incarnation (a candidate's
+segment is only ever `Draining`; `Relinking` is for an insert whose remover
+pin fails on a copy destination). The other write paths retry
 the lookup after a snooze; `insert` polls the segment state instead.
 
 ### 6.3 The `after_lookup` fault hook moved into the verifier
